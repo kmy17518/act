@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
+import time
 
 import av
 import numpy as np
@@ -57,7 +58,7 @@ def _matrix(column):
 
 class B1KDataset(torch.utils.data.Dataset):
     def __init__(self, dataset_path, task_names=None, chunk_size=100, image_size=(240, 240),
-                 cache_row_groups=2, video_cache_size=3, timestamp_tolerance=0.008):
+                 cache_row_groups=2, video_cache_size=3, timestamp_tolerance=0.008, profile_reads=False):
         self.root = Path(dataset_path).resolve()
         self.info = json.loads((self.root / 'meta/info.json').read_text())
         if self.info.get('codebase_version') != 'v3.0':
@@ -72,6 +73,7 @@ class B1KDataset(torch.utils.data.Dataset):
         self.cache_row_groups = cache_row_groups
         self.video_cache_size = video_cache_size
         self.timestamp_tolerance = timestamp_tolerance
+        self.profile_reads = profile_reads
         self.stats = None
         tasks = pq.read_table(self.root / 'meta/tasks.parquet').to_pylist()
         names = {int(row['task_index']): row.get('task', row.get('__index_level_0__')) for row in tasks}
@@ -236,7 +238,9 @@ class B1KDataset(torch.utils.data.Dataset):
         ep = self.by_id[episode_id]
         if not 0 <= frame < ep['length']:
             raise IndexError(f'Frame {frame} outside episode {episode_id}')
+        read_start = time.perf_counter() if self.profile_reads else 0
         table = self._read_rows(ep, frame, self.chunk_size)
+        video_start = time.perf_counter() if self.profile_reads else 0
         timestamp = float(table['timestamp'][0].as_py())
         images = []
         for key in VIDEO_KEYS:
@@ -245,6 +249,9 @@ class B1KDataset(torch.utils.data.Dataset):
             if target < offset - self.timestamp_tolerance or target >= ep[f'videos/{key}/to_timestamp']:
                 raise ValueError(f'Timestamp {target} outside episode {episode_id} camera {key}')
             images.append(self._decode(self.video_path(ep, key), target))
+        if self.profile_reads:
+            self._read_timings = {'data/parquet_s': video_start - read_start,
+                                  'data/video_decode_s': time.perf_counter() - video_start}
         actions = np.zeros((self.chunk_size, 23), dtype=np.float32)
         actions[:table.num_rows] = _matrix(table['action'])
         is_pad = np.arange(self.chunk_size) >= table.num_rows
@@ -265,8 +272,12 @@ class B1KDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         if index < 0 or index >= len(self):
             raise IndexError(index)
+        begin = time.perf_counter() if self.profile_reads else 0
         pos = int(np.searchsorted(self.ends, index, side='right'))
-        return self.sample_at(self.episodes[pos]['episode_index'], int(index - self.starts[pos]))
+        sample = self.sample_at(self.episodes[pos]['episode_index'], int(index - self.starts[pos]))
+        if self.profile_reads:
+            return (*sample, {**self._read_timings, 'data/sample_s': time.perf_counter() - begin})
+        return sample
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -312,6 +323,8 @@ class B1KDataset(torch.utils.data.Dataset):
             LOGGER.info('Statistics: %d frames after %s', count, path.name)
             if max_frames is not None and count >= max_frames:
                 break
+        if max_frames is None and count != len(self):
+            raise ValueError(f'Full statistics read {count} frames but selected metadata declares {len(self)}')
         if count < 2:
             raise ValueError('At least two frames required for sample-standard-deviation normalization')
         std = np.maximum(np.sqrt(m2 / (count - 1)), 0.01)
@@ -321,6 +334,20 @@ class B1KDataset(torch.utils.data.Dataset):
                 'action_std': std[25:].astype(np.float32).tolist(),
                 'count': count, 'std_correction': 1, 'std_floor': 0.01,
                 'approximate': count != len(self), 'fingerprint': self.fingerprint()}
+
+
+class SplitBatchSampler:
+    """Dispatch slices of each optimizer batch to independent loader workers."""
+    def __init__(self, sampler, loader_batch_size):
+        self.sampler, self.loader_batch_size = sampler, loader_batch_size
+
+    def __iter__(self):
+        for batch in self.sampler:
+            for start in range(0, len(batch), self.loader_batch_size):
+                yield batch[start:start + self.loader_batch_size]
+
+    def __len__(self):
+        return len(self.sampler) * ((self.sampler.batch_size + self.loader_batch_size - 1) // self.loader_batch_size)
 
 
 class StepBatchSampler:

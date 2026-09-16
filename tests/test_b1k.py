@@ -3,7 +3,9 @@
 import asyncio
 import json
 import msgpack
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+import sys
+from types import SimpleNamespace
 
 import av
 import h5py
@@ -16,9 +18,11 @@ import websockets.asyncio.client
 import websockets.asyncio.server
 
 from b1k_dataset import (B1KDataset, OBS_KEYS, STATE_INDICES, VIDEO_KEYS, StepBatchSampler,
-                         preprocess_image, preprocess_state)
+                         SplitBatchSampler, preprocess_image, preprocess_state)
 from b1k_server import B1KServer, Session, packb, unpackb
-from b1k_training import load_checkpoint, make_policy, parser, train
+from b1k_training import (atomic_save, committed_checkpoints, configure_cpu_threads, load_checkpoint,
+                          make_policy, optimizer_batches, parser, prune_checkpoints, run_lock,
+                          save_eval_checkpoint, save_full_checkpoint, train, wandb_run)
 from detr.main import get_args_parser
 from detr.models.detr_vae import CNNMLP, DETRVAE
 from policy import CNNMLPPolicy
@@ -247,31 +251,82 @@ def test_real_act_numerical_loss_backward_and_padding():
     assert parser().get_default('hidden_dim') == 512
 
 
+@pytest.fixture
+def fake_wandb(monkeypatch):
+    sdk = MagicMock()
+    sdk.login.return_value = True
+    runs = []
+
+    def initialize(**kwargs):
+        run = SimpleNamespace(id=kwargs['id'], project=kwargs['project'], entity=kwargs['entity'] or 'test-entity',
+                              name=kwargs['name'], settings=SimpleNamespace(mode=kwargs['mode']),
+                              config=MagicMock(), define_metric=MagicMock(), log=MagicMock(), finish=MagicMock())
+        runs.append(run)
+        return run
+
+    sdk.init.side_effect = initialize
+    monkeypatch.setitem(sys.modules, 'wandb', sdk)
+    monkeypatch.setenv('WANDB_API_KEY', 'mock-api-key')
+    return sdk, runs
+
+
 @pytest.mark.parametrize('policy_class', ['ACT', 'CNNMLP'])
-def test_checkpoint_resume_matches_uninterrupted_and_serves_without_dataset(tiny_root, tmp_path, policy_class):
+def test_checkpoint_resume_matches_uninterrupted_and_serves_without_dataset(tiny_root, tmp_path, policy_class,
+                                                                          fake_wandb):
     common = ['--dataset-path', str(tiny_root), '--batch-size', '2', '--num-workers', '0',
               '--device', 'cpu', '--chunk-size', '4', '--image-size', '32', '32', '--hidden-dim', '32',
               '--dim-feedforward', '64', '--enc-layers', '1', '--dec-layers', '1', '--nheads', '4',
-              '--no-pretrained-backbone', '--save-every', '1', '--dropout', '0.1', '--policy-class', policy_class]
+              '--no-pretrained-backbone', '--save-every', '1', '--dropout', '0.1', '--policy-class', policy_class,
+              '--save-total-limit', '2', '--export-every', '1']
     if policy_class == 'CNNMLP':
         common += ['--image-size', '416', '416', '--batch-size', '1']
     full = tmp_path / 'full'
     split = tmp_path / 'split'
     train(parser().parse_args(common + ['--output-dir', str(full), '--max-steps', '3']))
+    common += ['--wandb-mode', 'online', '--wandb-project', 'test-project', '--wandb-entity', 'test-entity',
+               '--loader-batch-size', '1']
     train(parser().parse_args(common + ['--output-dir', str(split), '--max-steps', '2']))
     resumed_path = train(parser().parse_args(common + ['--output-dir', str(split), '--max-steps', '3',
                            '--resume', str(split / 'step_00000002.pt')]))
     resumed = load_checkpoint(resumed_path)
     expected = load_checkpoint(full / 'step_00000003.pt')
+    sdk, runs = fake_wandb
+    assert len(runs) == 2 and runs[0].id == runs[1].id == resumed['wandb']['id']
+    assert sdk.init.call_args.kwargs['resume'] == 'must'
+    assert [call.kwargs['step'] for run in runs for call in run.log.call_args_list] == [1, 2, 3]
+    assert all(run.finish.call_count == 1 for run in runs)
     for key in expected['model']:
         torch.testing.assert_close(expected['model'][key], resumed['model'][key], atol=0, rtol=0)
     assert resumed['step'] == 3 and resumed['optimizer']['state']
+    assert [p.name for p in committed_checkpoints(split)] == ['step_00000002.pt', 'step_00000003.pt']
+    assert len(committed_checkpoints(split / 'export_queue/eval')) == 3
+    assert [p.name for p in committed_checkpoints(split / 'export_queue/full')] == ['step_00000003.pt']
+    assert (split / 'export_queue/full/step_00000003.pt').stat().st_ino == resumed_path.stat().st_ino
+    exported_path = split / 'export_queue/eval/step_00000003.pt'
+    exported = load_checkpoint(exported_path)
+    assert exported['checkpoint_type'] == 'eval'
+    assert not {'optimizer', 'torch_rng', 'cuda_rng'} & exported.keys()
+    for key in ('model_config', 'adapter_config', 'normalization', 'task_map', 'step'):
+        assert exported[key] == resumed[key]
+    for key, tensor in exported['model'].items():
+        assert tensor.device.type == 'cpu'
+        torch.testing.assert_close(tensor, resumed['model'][key], atol=0, rtol=0)
+    with pytest.raises(ValueError, match='eval-only.*full'):
+        train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'bad-resume'), '--max-steps', '4',
+                                           '--resume', str(exported_path)]))
+    records = [json.loads(line) for line in (split / 'metrics.jsonl').read_text().splitlines()]
+    assert [record['step'] for record in records] == [1, 2, 3]
+    assert all(record['timing/data_wait_s'] >= 0 and record['data/parquet_s'] > 0
+               and record['data/video_decode_s'] > 0 and record['gpu/allocated_bytes'] == 0 for record in records)
     with pytest.raises(FileExistsError):
         train(parser().parse_args(common + ['--output-dir', str(full), '--max-steps', '3']))
+    with pytest.raises(FileExistsError, match='existing snapshots'):
+        train(parser().parse_args(common + ['--output-dir', str(full), '--max-steps', '4',
+                                           '--resume', str(full / 'step_00000002.pt')]))
     tiny_root.rename(tmp_path / 'dataset_hidden')
     from b1k_server import ACTPredictor
-    predictor = ACTPredictor(resumed, 'cpu')
-    session = Session(predictor, resumed, 2 if policy_class == 'ACT' else 1)
+    predictor = ACTPredictor(exported, 'cpu')
+    session = Session(predictor, exported, 2 if policy_class == 'ACT' else 1)
     assert session.act(observation()).shape == (1, 23)
     assert resumed['model_config']['policy_class'] == policy_class
     if policy_class == 'CNNMLP':
@@ -285,6 +340,175 @@ def test_checkpoint_resume_matches_uninterrupted_and_serves_without_dataset(tiny
         old_predictor = ACTPredictor(legacy, 'cpu')
         old_action = Session(old_predictor, legacy, 2).act(observation())
         np.testing.assert_array_equal(old_action, Session(predictor, expected, 2).act(observation()))
+
+
+def test_atomic_checkpoints_retention_and_failed_save(tmp_path, monkeypatch):
+    output = tmp_path / 'checkpoints'
+    output.mkdir()
+    stale = output / 'step_00000000.tmp'
+    stale.write_bytes(b'incomplete')
+    (output / 'step_unknown.pt').write_bytes(b'unrelated')
+    eval_queue = output / 'export_queue/eval'
+    eval_queue.mkdir(parents=True)
+    atomic_save({'step': 1}, eval_queue / 'step_00000001.pt')
+    for step in range(1, 6):
+        latest = save_full_checkpoint({'step': step}, output, save_total_limit=3, export_queue=True)
+    assert [p.name for p in committed_checkpoints(output)] == [f'step_{step:08d}.pt' for step in (3, 4, 5)]
+    assert (output / 'latest.pt').resolve() == latest
+    assert (output / 'export_queue/full' / latest.name).stat().st_ino == latest.stat().st_ino
+    assert len(committed_checkpoints(output / 'export_queue/full')) == 1
+    assert stale.exists() and (output / 'step_unknown.pt').exists()
+    assert (eval_queue / 'step_00000001.pt').exists()
+    with pytest.raises(FileExistsError):
+        save_full_checkpoint({'step': 5}, output, save_total_limit=3, export_queue=True)
+    before = [p.name for p in committed_checkpoints(output)]
+    real_save = torch.save
+
+    def fail_save(value, stream):
+        stream.write(b'partial')
+        raise OSError('simulated interrupted save')
+
+    monkeypatch.setattr(torch, 'save', fail_save)
+    with pytest.raises(OSError, match='interrupted'):
+        save_full_checkpoint({'step': 6}, output, save_total_limit=1, export_queue=True)
+    assert [p.name for p in committed_checkpoints(output)] == before
+    assert not (output / 'step_00000006.pt').exists()
+    assert not list(output.glob('.*.tmp'))
+    assert (output / 'latest.pt').resolve() == latest
+    monkeypatch.setattr(torch, 'save', real_save)
+    prune_checkpoints(output, 0)
+    assert [p.name for p in committed_checkpoints(output)] == before
+
+
+def test_run_lock_is_exclusive_and_released_after_failure(tmp_path):
+    with pytest.raises(ValueError, match='test'):
+        with run_lock(tmp_path):
+            with pytest.raises(RuntimeError, match='Another trainer holds'):
+                with run_lock(tmp_path):
+                    pytest.fail('A second trainer acquired the lock')
+            raise ValueError('test')
+    with run_lock(tmp_path):
+        assert (tmp_path / 'run.lock').exists()
+
+
+def test_wandb_modes_fail_closed_and_preserve_identity(tmp_path, fake_wandb, monkeypatch):
+    sdk, runs = fake_wandb
+    args = parser().parse_args(['--dataset-path', '/unused', '--output-dir', str(tmp_path)])
+    with wandb_run(args, tmp_path, None) as (run, identity):
+        assert run is identity is None
+    sdk.init.assert_not_called()
+    args.wandb_mode = 'online'
+    monkeypatch.delenv('WANDB_API_KEY')
+    with pytest.raises(RuntimeError, match='WANDB_API_KEY'):
+        with wandb_run(args, tmp_path, None):
+            pass
+    monkeypatch.setenv('WANDB_API_KEY', 'mock-api-key')
+    sdk.login.return_value = False
+    with pytest.raises(RuntimeError, match='authentication failed'):
+        with wandb_run(args, tmp_path, None):
+            pass
+    sdk.init.assert_not_called()
+    sdk.login.return_value = True
+    with wandb_run(args, tmp_path, None) as (_, saved):
+        assert saved['mode'] == 'online'
+    sdk.login.assert_called_with(verify=True)
+    assert json.loads((tmp_path / 'wandb.json').read_text()) == saved
+    copied = tmp_path / 'resumed'
+    with wandb_run(args, copied, {'wandb': saved}) as (_, resumed):
+        assert resumed == saved
+    assert sdk.init.call_args.kwargs['resume'] == 'must'
+    args.wandb_id = 'different'
+    with pytest.raises(ValueError, match='preserve W&B identity'):
+        with wandb_run(args, copied, {'wandb': saved}):
+            pass
+    args.wandb_id = None
+    args.wandb_mode = 'offline'
+    sdk.login.reset_mock()
+    with wandb_run(args, copied, {'wandb': saved}) as (_, offline):
+        assert offline['id'] == saved['id']
+    sdk.login.assert_not_called()
+    args.wandb_mode = 'online'
+    sdk.init.side_effect = None
+    sdk.init.return_value = runs[-1]
+    with pytest.raises(RuntimeError, match='non-online'):
+        with wandb_run(args, copied, {'wandb': offline}):
+            pass
+    runs[-1].finish.assert_called_with(exit_code=1)
+
+
+def test_data_timing_worker_caps_and_prefetch(tiny_root, monkeypatch):
+    from functools import partial
+    dataset = B1KDataset(tiny_root, chunk_size=4, image_size=(16, 16), profile_reads=True)
+    dataset.stats = dataset.compute_stats()
+    loader = torch.utils.data.DataLoader(dataset, batch_size=2, num_workers=1, prefetch_factor=2,
+                multiprocessing_context='spawn', worker_init_fn=partial(configure_cpu_threads,
+                torch_threads=1, arrow_threads=1, opencv_threads=1))
+    batches = list(loader)
+    assert len(batches) == 5
+    assert all(batch[4]['data/sample_s'].min() > 0 for batch in batches)
+    cv2 = MagicMock()
+    monkeypatch.setitem(sys.modules, 'cv2', cv2)
+    configure_cpu_threads(torch_threads=1, arrow_threads=1, opencv_threads=1)
+    assert torch.get_num_threads() == pa.cpu_count() == pa.io_thread_count() == 1
+    cv2.setNumThreads.assert_called_once_with(1)
+    dataset.close()
+
+
+def test_split_loader_reassembles_identical_order_and_resume(tiny_root):
+    dataset = B1KDataset(tiny_root, chunk_size=4, image_size=(16, 16), profile_reads=True)
+    dataset.stats = dataset.compute_stats()
+    whole_sampler = StepBatchSampler(dataset, 5, 0, 3, 17)
+    split_sampler = SplitBatchSampler(whole_sampler, 2)
+    assert len(split_sampler) == 9
+    assert [index for batch in whole_sampler for index in batch] == [index for batch in split_sampler for index in batch]
+    reference = list(torch.utils.data.DataLoader(dataset, batch_sampler=whole_sampler))
+    sliced = torch.utils.data.DataLoader(dataset, batch_sampler=split_sampler)
+    actual = list(optimizer_batches(sliced, 5, 2))
+    resumed_sampler = SplitBatchSampler(StepBatchSampler(dataset, 5, 1, 3, 17), 2)
+    resumed = list(optimizer_batches(torch.utils.data.DataLoader(dataset, batch_sampler=resumed_sampler), 5, 2))
+    for expected, batch in zip(reference, actual):
+        for tensor, other in zip(expected[:4], batch[:4]):
+            torch.testing.assert_close(tensor, other, atol=0, rtol=0)
+    for expected, batch in zip(actual[1:], resumed):
+        for tensor, other in zip(expected[:4], batch[:4]):
+            torch.testing.assert_close(tensor, other, atol=0, rtol=0)
+    dataset.close()
+
+
+def test_save_first_step_and_exact_statistics_guard(tiny_root, tmp_path, monkeypatch):
+    class TinyPolicy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(()))
+
+        def configure_optimizers(self):
+            return torch.optim.AdamW(self.parameters())
+
+        def forward(self, qpos, images, actions, is_pad):
+            return {'loss': self.weight.square()}
+
+    monkeypatch.setattr('b1k_training.make_policy', lambda *args, **kwargs: TinyPolicy())
+    common = ['--dataset-path', str(tiny_root), '--device', 'cpu', '--num-workers', '0',
+              '--batch-size', '2', '--image-size', '16', '16', '--save-first-step', '--save-every', '10',
+              '--export-every', '2', '--save-total-limit', '3', '--max-steps', '3']
+    output = tmp_path / 'first-step'
+    train(parser().parse_args(common + ['--output-dir', str(output)]))
+    assert [p.name for p in committed_checkpoints(output)] == ['step_00000001.pt', 'step_00000003.pt']
+    assert [p.name for p in committed_checkpoints(output / 'export_queue/eval')] == ['step_00000002.pt']
+    exported = load_checkpoint(output / 'export_queue/eval/step_00000002.pt')
+    metadata = {key: exported[key] for key in ('model_config', 'adapter_config', 'task_map', 'normalization')}
+    policy = TinyPolicy()
+    policy.load_state_dict(exported['model'])
+    save_eval_checkpoint(metadata, policy, 2, output)
+    with torch.no_grad():
+        policy.weight.add_(1)
+    with pytest.raises(FileExistsError, match='eval export differs'):
+        save_eval_checkpoint(metadata, policy, 2, output)
+    smoke = tmp_path / 'smoke'
+    path = train(parser().parse_args(common + ['--output-dir', str(smoke), '--stats-max-frames', '2']))
+    assert load_checkpoint(path)['normalization']['approximate']
+    with pytest.raises(ValueError, match='Full-task statistics required'):
+        train(parser().parse_args(common + ['--output-dir', str(smoke), '--resume', str(path), '--max-steps', '4']))
 
 
 @pytest.mark.parametrize('position', ['sine', 'learned'])
