@@ -28,6 +28,8 @@ def get_args_parser():
                         help="If true, we replace stride with dilation in the last convolutional block (DC5)")
     parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned'),
                         help="Type of positional embedding to use on top of the image features")
+    parser.add_argument('--state_dim', default=14, type=int)
+    parser.add_argument('--action_dim', default=14, type=int)
     parser.add_argument('--camera_names', default=[], type=list, # will be overridden
                         help="A list of camera names")
 
@@ -69,13 +71,16 @@ def get_args_parser():
 
 def build_ACT_model_and_optimizer(args_override):
     parser = argparse.ArgumentParser('DETR training and evaluation script', parents=[get_args_parser()])
-    args = parser.parse_args()
+    if args_override.get('programmatic', False):
+        args = argparse.Namespace(**{a.dest: a.default for a in parser._actions})
+    else:
+        args = parser.parse_args()
 
     for k, v in args_override.items():
         setattr(args, k, v)
 
     model = build_ACT_model(args)
-    model.cuda()
+    model.to(args_override.get('device', 'cuda'))
 
     param_dicts = [
         {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
@@ -92,13 +97,16 @@ def build_ACT_model_and_optimizer(args_override):
 
 def build_CNNMLP_model_and_optimizer(args_override):
     parser = argparse.ArgumentParser('DETR training and evaluation script', parents=[get_args_parser()])
-    args = parser.parse_args()
+    if args_override.get('programmatic', False):
+        args = argparse.Namespace(**{a.dest: a.default for a in parser._actions})
+    else:
+        args = parser.parse_args()
 
     for k, v in args_override.items():
         setattr(args, k, v)
 
     model = build_CNNMLP_model(args)
-    model.cuda()
+    model.to(args_override.get('device', 'cuda'))
 
     param_dicts = [
         {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},

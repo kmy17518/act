@@ -1,0 +1,10 @@
+# Install torch and torchvision separately for the target CUDA version.
+numpy==1.26.4
+av==16.1.0
+pyarrow==23.0.1
+websockets==16.1.1
+msgpack==1.2.2
+h5py>=3.11,<4
+pytest>=8,<10
+ipython>=8,<9
+packaging>=24

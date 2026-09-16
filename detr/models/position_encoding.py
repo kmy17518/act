@@ -6,7 +6,7 @@ import math
 import torch
 from torch import nn
 
-from util.misc import NestedTensor
+from ..util.misc import NestedTensor
 
 import IPython
 e = IPython.embed
@@ -67,7 +67,7 @@ class PositionEmbeddingLearned(nn.Module):
         nn.init.uniform_(self.col_embed.weight)
 
     def forward(self, tensor_list: NestedTensor):
-        x = tensor_list.tensors
+        x = tensor_list if isinstance(tensor_list, torch.Tensor) else tensor_list.tensors
         h, w = x.shape[-2:]
         i = torch.arange(w, device=x.device)
         j = torch.arange(h, device=x.device)
