@@ -27,7 +27,9 @@ CUDA_VISIBLE_DEVICES='' /tmp/dev/baselines/act/.venv/bin/python \
   /tmp/dev/scripts/act-dp-language-status.py
 ```
 
-The launch recipe is prepared; live qualification and launch status are recorded below once verified. Local qualification and monitoring artifacts use `/tmp/dev/audits/act-dp-language-20260916/`. Tmux survives client disconnects, not machine/container termination.
+Qualification passed **16 fresh-data optimizer steps at batch 1,560**, then a full-checkpoint resume through **step 20 with Hugging Face/transformers offline**. Exact statistics covered all **429,928 frames / 200 episodes**. Peak allocated memory was **253.39 GiB**; median steady training compute was **2.573 s/step**, plus data wait. Three local full checkpoints and two eval exports were verified. Real step-16 eval serving passed eight websocket action requests covering reset, replanning, batching and separate clients with dataset/CLIP access denied. All 100 task-name and description embeddings matched the DP implementation exactly; the five long descriptions were chunked without truncation.
+
+The 300,000-step trainer was launched on **2026-09-16 at 18:11 UTC** from commit `8deea34` using the new identities above. It is a fresh run, not the qualification checkpoint. Training is **in progress**, not complete; no simulator success rate is claimed. Local qualification and monitoring artifacts use `/tmp/dev/audits/act-dp-language-20260916/`. Tmux survives client disconnects, not machine/container termination.
 
 ## Original unconditioned run
 
