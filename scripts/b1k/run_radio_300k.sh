@@ -9,6 +9,7 @@ if [[ -n "$(nvidia-smi --id "$CUDA_VISIBLE_DEVICES" --query-compute-apps=pid --f
     exit 1
 fi
 export OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 ARROW_NUM_THREADS=1
+export PYTORCH_ALLOC_CONF=expandable_segments:True
 export WANDB_BASE_URL=https://api.wandb.ai WANDB_MODE=online
 RUN=outputs/turning-on-radio-act-bs1560-300k-20260916
 LOG=/tmp/dev/logs/act-radio-300k-20260916.log
