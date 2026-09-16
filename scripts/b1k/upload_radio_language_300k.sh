@@ -15,6 +15,10 @@ if [[ -e "$STATUS" ]]; then
 fi
 trap 'rc=$?; printf "%s\n" "$rc" >"$STATUS.tmp"; mv "$STATUS.tmp" "$STATUS"' EXIT
 exec >>"$LOG" 2>&1
+if [[ ! -e "$RUN/latest.pt" ]]; then
+    printf 'Start the trainer and wait for its first checkpoint before starting the uploader.\n' >&2
+    exit 1
+fi
 read -r trainer_commit <"$RUN/trainer_commit.txt"
 taskset -c 120-121 .venv/bin/python -u scripts/b1k/upload_checkpoints.py \
     --run-dir "$RUN" \

@@ -13,6 +13,7 @@ from websockets.exceptions import ConnectionClosed
 
 from b1k_dataset import OBS_KEYS, preprocess_image, preprocess_state
 from b1k_training import load_checkpoint, make_policy, policy_class
+from b1k_language import language_embedding_table, language_for_qpos
 
 
 LOGGER = logging.getLogger(__name__)
@@ -51,13 +52,19 @@ class PolicyPredictor:
     def __init__(self, checkpoint, device='cuda'):
         self.checkpoint = checkpoint
         self.device = torch.device(device)
+        embeddings = language_embedding_table(checkpoint['model_config'], checkpoint['task_map'],
+                                               checkpoint.get('language_cache'))
+        self.language_embeddings = embeddings.to(self.device) if embeddings is not None else None
         self.policy = make_policy(checkpoint['model_config'], self.device, restoring=True)
         self.policy.load_state_dict(checkpoint['model'])
         self.policy.eval()
 
     @torch.inference_mode()
     def __call__(self, qpos, images):
-        actions = self.policy(qpos.to(self.device), images.to(self.device)).cpu().numpy()
+        qpos, images = qpos.to(self.device), images.to(self.device)
+        lang_emb = language_for_qpos(qpos, self.language_embeddings)
+        kwargs = {'lang_emb': lang_emb} if lang_emb is not None else {}
+        actions = self.policy(qpos, images, **kwargs).cpu().numpy()
         stats = self.checkpoint['normalization']
         return (actions * np.asarray(stats['action_std'], dtype=np.float32) +
                 np.asarray(stats['action_mean'], dtype=np.float32)).astype(np.float32)
@@ -201,7 +208,9 @@ class B1KServer:
                          'execution_mode': mode, 'temporal_agg': temporal_agg,
                          'temporal_agg_decay': 0.01 if temporal_agg else None,
                          'task_map': {str(k): v for k, v in checkpoint['task_map'].items()}, 'proprio_dim': 61,
-                         'observation_keys': OBS_KEYS, 'checkpoint_step': checkpoint['step']}
+                         'observation_keys': OBS_KEYS, 'checkpoint_step': checkpoint['step'],
+                         'language_conditioning': checkpoint['model_config'].get('language_conditioning', 'none'),
+                         'prompt_source': checkpoint['model_config'].get('prompt_source', 'task_name')}
 
     async def handler(self, websocket):
         session = Session(self.predictor, self.checkpoint, self.action_horizon, self.task_name, self.temporal_agg)

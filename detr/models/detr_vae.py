@@ -76,7 +76,7 @@ class DETRVAE(nn.Module):
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding
         self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent
 
-    def forward(self, qpos, image, env_state, actions=None, is_pad=None):
+    def forward(self, qpos, image, env_state, actions=None, is_pad=None, lang_emb=None):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
@@ -119,7 +119,7 @@ class DETRVAE(nn.Module):
             all_cam_features = []
             all_cam_pos = []
             for cam_id, cam_name in enumerate(self.camera_names):
-                features, pos = self.backbones[0](image[:, cam_id]) # HARDCODED
+                features, pos = self.backbones[0](image[:, cam_id], lang_emb=lang_emb) # HARDCODED
                 features = features[0] # take the last layer feature
                 pos = pos[0]
                 all_cam_features.append(self.input_proj(features))
@@ -267,6 +267,8 @@ def build(args):
     return model
 
 def build_cnnmlp(args):
+    if getattr(args, 'language_conditioning', 'none') != 'none':
+        raise ValueError('CLIP FiLM language conditioning is only supported for ACT, not CNNMLP')
     state_dim = getattr(args, 'state_dim', 14)
 
     # From state

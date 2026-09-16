@@ -9,7 +9,7 @@ Legacy HDF5 entrypoints, 14-dimensional defaults, CNNMLP parameter names (includ
 
 ## Install
 
-Python 3.10 is verified. Keep environments and caches local; no simulator, LeRobot conversion, or Hugging Face download is required.
+Python 3.10 is verified. Keep environments and caches local; no simulator or LeRobot conversion is required. Unconditioned training needs no Hugging Face model; fresh optional CLIP conditioning requires the pinned text-model/tokenizer cache or its initial download.
 
 ```bash
 source /tmp/dev/env.sh
@@ -52,6 +52,35 @@ Normalization streams selected state/action columns once per packed file, with f
 ACT samples an episode uniformly, then a starting frame uniformly. A deterministic step-indexed sampler avoids a full-frame permutation and supports resume with any worker count. Unlike the upstream one-pass-without-replacement episode epoch, this step-based sampler draws episodes with replacement. Actions start at the same row as the observation, stop at that episode's boundary, and are zero-padded **before normalization** to `--chunk-size`; `is_pad` masks padding. Only this chunk is allocated rather than upstream HDF5's full episode-sized target (the upstream policy truncates it to the same chunk).
 
 **HDF5 alignment difference:** upstream `EpisodicDataset` uses `actions[max(0,t-1):]` for `sim=False` to compensate its real recording latency. LeRobot rows are already aligned: this adapter deliberately uses `actions[t:]`, matching the upstream `sim=True` sample convention. Applying the HDF5 real-data shift here would misalign actions. Boundary tests explicitly compare both conventions. The loss retains upstream masked mean L1 (mean over all batch/chunk/action elements, not just valid elements) plus KL; no new loss normalization or default gradient clipping is introduced.
+
+## Optional ACT CLIP + FiLM language baseline
+
+Add `--language-conditioning clip_film --prompt-source task_name` to the existing ACT training command. `--language-conditioning none` is the default; omitted language fields in old checkpoints also mean `none`. `--prompt-source task_name|task_description` defaults to `task_name`, matching the GR00T/OpenPI switch. CNNMLP rejects language conditioning explicitly. All existing action/state/one-hot behavior and architecture options remain unchanged: this adds language to the visual ResNet, not to the state vector or action targets. This is the RoboCasa365-style language-conditioning baseline applied to the existing BEHAVIOR adapter, not a RoboCasa dataset loader.
+
+- **`task_name`:** use the exact raw selected `task_map` string (for example `turning_on_radio`), without replacing underscores or rewriting capitalization. This mode does not read or require `meta/tasks.jsonl`.
+- **`task_description`:** read selected tasks from `meta/tasks.jsonl`, matching both integer `task_index` and exact `task_name` to the selected task map; the `task` field is the exact instruction. Missing/empty selected instructions, duplicate selected records, conflicting IDs/names, and malformed JSON fail. Unselected tasks need no instructions. Different legitimate tasks may share identical description text. Whitespace in the original prompt is preserved in checkpoint provenance.
+- **Encoder:** frozen, eval-mode `transformers.CLIPTextModelWithProjection`, `openai/clip-vit-large-patch14`, pinned revision `32bd64288804d66eefd0ccbe215aa642df71cc41`. Use its **768-dimensional unnormalized `text_embeds`**, not hidden-state pooling or cosine-normalized features. Transformers is imported lazily only to initialize a fresh conditioned run. It is never loaded in dataset workers, per-sample reads, optimizer steps, checkpoint resume, or serving. Fresh initialization encodes each selected task once on CPU and releases the encoder after caching the vectors.
+- **Long-prompt policy:** tokenize the entire content without truncation. Up to 75 content tokens (77 including BOS/EOS) uses standard CLIP tokenization and projected output exactly. Longer prompts are split in token order into nonoverlapping chunks of at most 75 content tokens; each independently gets BOS/EOS and an attention mask, with padding masked out. Average the projected chunk embeddings equally, with **no normalization**. This retains all content rather than silently truncating descriptions. The recorded policy is `mean_projected_75_token_chunks`.
+- **FiLM:** after each of all eight ResNet18 residual blocks, apply a trainable `Linear(768, 2*C)`, split **beta first, gamma second**, then `ReLU((1 + gamma) * x + beta)`. FiLM and the original backbone are shared across cameras. `ACTPolicy(..., lang_emb=...)` explicitly passes `(B,768)` vectors through DETRVAE and the backbone; there are no mutable language hooks or global inference contexts.
+- **Memory:** conditioned training automatically activation-checkpoints each residual-block/FiLM pair with `use_reentrant=False`. The frozen BatchNorm path is deterministic for recomputation. This trades compute for activation memory without changing the physical optimizer batch, FP32 arithmetic, precision flags, or gradient accumulation. The `none` path is unchanged. Qualify the intended full batch on the reserved GPU; no maximum batch is implied by CPU tests.
+
+Both standalone full and eval checkpoints embed `language_cache`: version, model, immutable revision, prompt source, embedding dimension, normalization flag, long-prompt policy, and `tasks[task_id]` records containing exact `task_name`, `prompt`, and 768 finite float values. `model_config` records `language_conditioning` and `prompt_source`; `run.json` also includes the cache. The cache is validated against the model/task map and included in eval-export collision checks. Nonfinite/wrong-shape vectors and incompatible model/revision/source metadata fail rather than silently falling back.
+
+Resume adopts saved language options when omitted; explicit contradictory `--language-conditioning` or `--prompt-source` fails. Cached embeddings are reused, never recomputed. Description resume checks exact selected prompts if `meta/tasks.jsonl` is present, but does not require that sidecar or any CLIP model/cache/download. Training resume still requires its original sample dataset and fingerprint as before. Serving requires **only the standalone checkpoint**, no dataset, sidecar, transformers installation, or pretrained weights. Existing task IDs select the cached vectors using the same sorted one-hot mapping as training; unknown tasks remain rejected. WebSocket metadata includes `language_conditioning` and `prompt_source`; serving has no prompt override.
+
+Language validation commands (CPU only):
+
+```bash
+source /tmp/dev/env.sh
+cd /tmp/dev/baselines/act
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  .venv/bin/python -m pytest -q tests/test_b1k.py tests/test_b1k_language.py tests/test_b1k_checkpoint_upload.py
+# Optional: requires the pinned CLIP files already cached; never downloads in this check.
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 ACT_TEST_REAL_CLIP=1 \
+  .venv/bin/python -m pytest -q tests/test_b1k_language.py -k real_clip
+```
+
+The fake-encoder tests exercise both prompt sources, selected-task validation, frozen one-time encoding, long-description masks/averaging, finite cache validation, FiLM language sensitivity/nonzero gradients, bit-exact checkpointed versus direct gradients, unchanged no-language keys/numerics, bit-exact train/resume with worker-sliced batches, and standalone full/eval WebSocket serving with transformers disabled and the dataset hidden. The real-CLIP check independently compares short prompts with standard projected CLIP output and long prompts with independently encoded chunks. September 16 validation: **87 passed, 2 skipped** in 54.12 seconds; the skips are opt-in real CLIP and live private Hugging Face upload. The separate cached real-CLIP check passed (**1 passed**, 4.74 seconds) with `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, using transformers 4.57.6 on Python 3.10. Evidence: `/tmp/act-language-offline-tests.log` / `.xml` and `/tmp/act-language-real-clip.log` / `.xml`. No simulator success or convergence is asserted by these checks.
 
 ## Train and resume
 

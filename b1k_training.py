@@ -20,6 +20,8 @@ from torch.utils.data import DataLoader
 
 from b1k_dataset import B1KDataset, CAMERAS, OBS_KEYS, STATE_INDICES, VIDEO_KEYS, SplitBatchSampler, StepBatchSampler
 from policy import ACTPolicy, CNNMLPPolicy
+from b1k_language import (build_language_cache, language_embedding_table, language_for_qpos,
+                          language_mode, validate_resume_prompts)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -40,6 +42,7 @@ def load_checkpoint(path):
     name = policy_class(checkpoint['model_config'])
     if name == 'CNNMLP' and checkpoint['model_config'].get('image_size', [480, 640]) != adapter['image_size']:
         raise ValueError('CNNMLP checkpoint model/adapter image sizes differ')
+    language_embedding_table(checkpoint['model_config'], checkpoint['task_map'], checkpoint.get('language_cache'))
     return checkpoint
 
 
@@ -47,6 +50,7 @@ def policy_class(model_config):
     name = model_config.get('policy_class', 'ACT')
     if name not in ('ACT', 'CNNMLP'):
         raise ValueError(f'Unsupported policy class {name}')
+    language_mode(model_config)
     if name == 'CNNMLP' and model_config.get('num_queries', 1) != 1:
         raise ValueError('CNNMLP predicts one action, not an action chunk')
     return name
@@ -152,7 +156,8 @@ def save_eval_checkpoint(run, policy, step, output):
                             ('step', 'model_config', 'adapter_config', 'task_map', 'normalization'))
         same_model = previous['model'].keys() == saved['model'].keys() and all(
             torch.equal(previous['model'][key], value) for key, value in saved['model'].items())
-        if not same_metadata or not same_model:
+        same_language = previous.get('language_cache') == saved.get('language_cache')
+        if not same_metadata or not same_model or not same_language:
             raise FileExistsError(f'Existing eval export differs at step {step}; use another output directory')
         return path
     atomic_save(saved, path)
@@ -256,6 +261,12 @@ def wandb_run(args, output, checkpoint):
         tracked.finish()
 
 
+class LanguageOption(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f'_{self.dest}_explicit', True)
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--dataset-path', '--dataset-root', dest='dataset_path', required=True)
@@ -274,6 +285,8 @@ def parser():
     p.add_argument('--resume', type=Path)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--policy-class', choices=['ACT', 'CNNMLP'], default='ACT')
+    p.add_argument('--language-conditioning', choices=['none', 'clip_film'], default='none', action=LanguageOption)
+    p.add_argument('--prompt-source', choices=['task_name', 'task_description'], default='task_name', action=LanguageOption)
     p.add_argument('--chunk-size', type=int, default=100, help='ACT prediction length; CNNMLP always uses one action')
     p.add_argument('--image-size', type=int, nargs=2, metavar=('HEIGHT', 'WIDTH'),
                    help='Default: ACT 240 240; CNNMLP 480 640 (original convolution/flatten path)')
@@ -343,6 +356,11 @@ def _train(args, output, root, resources):
         adapter = checkpoint['adapter_config']
         model_config = dict(checkpoint['model_config'])
         model_config.setdefault('policy_class', 'ACT')
+        for key, default in [('language_conditioning', 'none'), ('prompt_source', 'task_name')]:
+            saved_value = model_config.get(key, default)
+            if getattr(args, f'_{key}_explicit', False) and getattr(args, key) != saved_value:
+                raise ValueError(f'--{key.replace("_", "-")} differs from checkpoint')
+            setattr(args, key, saved_value)
         task_names = args.task_names or list(checkpoint['task_map'].values())
         args.seed = checkpoint['train_config']['seed']
     else:
@@ -368,6 +386,7 @@ def _train(args, output, root, resources):
                         'weight_decay': args.weight_decay, 'backbone': 'resnet18',
                         'pretrained_backbone': args.pretrained_backbone, 'camera_names': CAMERAS,
                         'position_embedding': args.position_embedding, 'pre_norm': args.pre_norm,
+                        'language_conditioning': args.language_conditioning, 'prompt_source': args.prompt_source,
                         'dilation': False, 'masks': False, 'action_dim': 23}
         if args.policy_class == 'CNNMLP':
             model_config['image_size'] = list(image_size)
@@ -384,6 +403,12 @@ def _train(args, output, root, resources):
     if checkpoint and dataset.task_map != checkpoint['task_map']:
         raise ValueError('Resume task map differs from checkpoint')
     model_config['state_dim'] = len(STATE_INDICES) + len(dataset.task_map)
+    language_cache = checkpoint.get('language_cache') if checkpoint else None
+    if checkpoint:
+        validate_resume_prompts(root, dataset.task_map, language_cache)
+    elif language_mode(model_config) == 'clip_film':
+        language_cache = build_language_cache(root, dataset.task_map, model_config['prompt_source'])
+    language_embeddings = language_embedding_table(model_config, dataset.task_map, language_cache)
     fingerprint = dataset.fingerprint()
     output.mkdir(parents=True, exist_ok=True)
     if checkpoint:
@@ -407,6 +432,8 @@ def _train(args, output, root, resources):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
+    if language_embeddings is not None:
+        language_embeddings = language_embeddings.to(device)
     policy = make_policy(model_config, device, restoring=checkpoint is not None)
     optimizer = policy.configure_optimizers()
     start = 0
@@ -419,10 +446,12 @@ def _train(args, output, root, resources):
             torch.cuda.set_rng_state(checkpoint['cuda_rng'], device)
     if args.max_steps <= start:
         raise ValueError(f'--max-steps must exceed resumed step {start}')
-    train_config = vars(args).copy()
+    train_config = {key: value for key, value in vars(args).items() if not key.startswith('_')}
     train_config['resume'] = str(args.resume) if args.resume else None
     run = {'model_config': model_config, 'adapter_config': adapter, 'train_config': train_config,
            'task_map': dataset.task_map, 'normalization': stats, 'wandb': wandb_identity}
+    if language_cache is not None:
+        run['language_cache'] = language_cache
     atomic_json(run, output / ('resume_run.json' if checkpoint else 'run.json'))
     if tracked:
         tracked.config.update(run, allow_val_change=True)
@@ -448,7 +477,9 @@ def _train(args, output, root, resources):
                 torch.cuda.reset_peak_memory_stats(device)
             optimizer.zero_grad(set_to_none=True)
             images, qpos, actions, is_pad = [x.to(device, non_blocking=True) for x in batch[:4]]
-            losses = policy(qpos, images, actions, is_pad)
+            lang_emb = language_for_qpos(qpos, language_embeddings)
+            kwargs = {'lang_emb': lang_emb} if lang_emb is not None else {}
+            losses = policy(qpos, images, actions, is_pad, **kwargs)
             if not torch.isfinite(losses['loss']):
                 raise FloatingPointError(f'Non-finite loss at step {step}')
             losses['loss'].backward()
@@ -487,7 +518,7 @@ def _train(args, output, root, resources):
             LOGGER.info('%s', json.dumps(record))
             if tracked:
                 tracked.log(record, step=step)
-            del images, qpos, actions, is_pad, losses, grad_norm, batch
+            del images, qpos, actions, is_pad, losses, grad_norm, batch, lang_emb, kwargs
             previous_end = time.monotonic()
     return path
 
