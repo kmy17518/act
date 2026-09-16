@@ -1,5 +1,36 @@
 # ACT radio training run — 2026-09-16
 
+## Task-name CLIP/FiLM run
+
+The language-conditioned reproduction uses the same radio subset, **300,000 steps**, physical batch **1,560**, FP32 optimizer, architecture, images, CPU affinity and checkpoint schedule below, with `--language-conditioning clip_film --prompt-source task_name`. The original one-hot task input remains. Frozen CLIP ViT-L/14 projected text embeddings condition every ResNet residual block through FiLM. Conditioned blocks use activation recomputation to accommodate the original physical batch; this is not gradient accumulation or mixed precision.
+
+The new run has separate local, Hugging Face and W&B identities; it never resumes or replaces the original run:
+
+- Run directory: `outputs/turning-on-radio-act-clipfilm-taskname-bs1560-300k-20260916/`.
+- Private Hugging Face destination: https://huggingface.co/kmy17518/b1k-act-turning-on-radio-clipfilm-taskname-20260916
+- W&B project is unchanged; new run: https://wandb.ai/kmy17518/b1k-challenge-2026-act/runs/actradioclipname16
+- W&B experiment: `turning-on-radio-act-clipfilm-taskname-bs1560-300k`.
+- GPU 2 on the current node: `GPU-fe99daa5-20f4-4f6f-9792-14a1fd4091a1` (the historical GPU UUID below belongs to the prior node).
+- Trainer log/exit: `/tmp/dev/logs/act-radio-clipfilm-taskname-300k-20260916.{log,exit}`.
+- Uploader log/exit: `/tmp/dev/logs/act-radio-clipfilm-taskname-upload-20260916.{log,exit}`.
+- Durable uploader journal: `/tmp/dev/hf-staging/act-radio-clipfilm-taskname-300k-20260916/`.
+
+Launch the trainer first, then the uploader once `trainer_commit.txt` exists. The new scripts reject occupied GPUs and existing exit files; preserve the journal and archive an old exit file before a deliberate restart. Shell exit traps also record startup failures.
+
+```bash
+source /tmp/dev/env.sh
+tmux -L b1k-act-dp-language new-session -d -s act-radio-language-train \
+  'bash /tmp/dev/baselines/act/scripts/b1k/run_radio_language_300k.sh'
+tmux -L b1k-act-dp-language new-session -d -s act-radio-language-upload \
+  'bash /tmp/dev/baselines/act/scripts/b1k/upload_radio_language_300k.sh'
+CUDA_VISIBLE_DEVICES='' /tmp/dev/baselines/act/.venv/bin/python \
+  /tmp/dev/scripts/act-dp-language-status.py
+```
+
+The launch recipe is prepared; live qualification and launch status are recorded below once verified. Local qualification and monitoring artifacts use `/tmp/dev/audits/act-dp-language-20260916/`. Tmux survives client disconnects, not machine/container termination.
+
+## Original unconditioned run
+
 ## Configuration
 
 - Dataset: `/tmp/dev/datasets/2026-challenge-demos`, **turning_on_radio only**, 200 episodes / 429,928 frames; exact full-task statistics.
