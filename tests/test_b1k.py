@@ -19,10 +19,12 @@ import websockets.asyncio.server
 
 from b1k_dataset import (B1KDataset, OBS_KEYS, STATE_INDICES, VIDEO_KEYS, StepBatchSampler,
                          SplitBatchSampler, preprocess_image, preprocess_state)
+from b1k_frame_cache import (FrameCacheReader, build_frame_cache, dequantize_images, entry_is_valid, quantize_image,
+                             selected_videos, verify_frame_cache)
 from b1k_server import B1KServer, Session, packb, unpackb
-from b1k_training import (atomic_save, committed_checkpoints, configure_cpu_threads, load_checkpoint,
-                          make_policy, optimizer_batches, parser, prune_checkpoints, run_lock,
-                          save_eval_checkpoint, save_full_checkpoint, train, wandb_run)
+from b1k_training import (atomic_save, committed_checkpoints, configure_cpu_threads, consume_batch, load_checkpoint,
+                          make_policy, match_optimizer_state_layout, optimizer_batches, parser, prepare_images,
+                          prune_checkpoints, run_lock, save_eval_checkpoint, save_full_checkpoint, train, wandb_run)
 from detr.main import get_args_parser
 from detr.models.detr_vae import CNNMLP, DETRVAE
 from policy import CNNMLPPolicy
@@ -472,6 +474,284 @@ def test_split_loader_reassembles_identical_order_and_resume(tiny_root):
     for expected, batch in zip(actual[1:], resumed):
         for tensor, other in zip(expected[:4], batch[:4]):
             torch.testing.assert_close(tensor, other, atol=0, rtol=0)
+    dataset.close()
+
+
+def test_frame_cache_matches_native_decoding_and_detects_stale_entries(tiny_root, tmp_path):
+    from functools import partial
+    cache = tmp_path / 'cache'
+    native = B1KDataset(tiny_root, chunk_size=4, image_size=(16, 16))
+    with pytest.raises(ValueError, match='read-only dataset'):
+        build_frame_cache(native, tiny_root / 'cache', log=lambda *_: None)
+    videos = build_frame_cache(native, cache, workers=2, log=lambda *_: None)
+    assert videos == selected_videos(native) and len(videos) == 3
+    assert verify_frame_cache(native, cache, samples=10, log=lambda *_: None) == 30
+    manifest = json.loads(next(cache.rglob('*.json')).read_text())
+    assert manifest['frames'] == 20 and manifest['image_size'] == [16, 16]
+    assert build_frame_cache(native, cache, log=lambda *_: None) == videos  # valid entries are reused
+    native.stats = native.compute_stats()
+    cached = B1KDataset(tiny_root, chunk_size=4, image_size=(16, 16), frame_cache=cache, profile_reads=True)
+    cached.stats = native.stats
+    assert cached._table['action'].shape == (10, 23) and cached._frame_rows.shape == (10, 3)
+    for index in range(len(native)):
+        expected, actual = native[index], cached[index]
+        assert actual[0].dtype == torch.uint8 and actual[0].shape == (3, 16, 16, 3)
+        images = dequantize_images(actual[0])
+        assert images.shape == expected[0].shape and images.stride()[-3] == 1  # channels-last per camera
+        assert (images - expected[0]).abs().max() <= 0.5 / 255 + 1e-6
+        assert torch.equal(actual[0], torch.stack([torch.from_numpy(quantize_image(image)) for image in expected[0]]))
+        for column in (1, 2, 3):
+            torch.testing.assert_close(expected[column], actual[column], atol=0, rtol=0)
+        assert actual[4]['data/video_decode_s'] == 0 and actual[4]['data/frame_cache_s'] > 0
+    # Camera offsets: cached frames are the same frames the native reader selects (raw pixels differ per camera).
+    raw, _, _, _, _ = native.raw_sample(99, 1)
+    assert [int(x[0, 0, 0]) for x in raw] == [100, 121, 142]
+    assert [int(cached.sample_at(99, 1)[0][c, 0, 0, 0]) for c in range(3)] == [100, 121, 142]
+    loader = torch.utils.data.DataLoader(cached, batch_size=4, num_workers=1, multiprocessing_context='spawn',
+                                         worker_init_fn=partial(configure_cpu_threads, torch_threads=1))
+    batches = list(loader)
+    assert sum(len(batch[0]) for batch in batches) == 10 and batches[0][0].dtype == torch.uint8
+    torch.testing.assert_close(torch.cat([batch[2] for batch in batches]), torch.stack([native[i][2] for i in range(10)]))
+    cached.close()
+    with pytest.raises(FileNotFoundError, match='No frame cache entry'):
+        B1KDataset(tiny_root, chunk_size=4, image_size=(16, 16), frame_cache=tmp_path / 'missing')
+    with pytest.raises(ValueError, match='Stale or mismatched'):
+        B1KDataset(tiny_root, chunk_size=4, image_size=(8, 8), frame_cache=cache)
+    video = videos[0]
+    import os
+    os.utime(video, ns=(video.stat().st_atime_ns, video.stat().st_mtime_ns + 1))
+    assert not entry_is_valid(cache / video.relative_to(tiny_root).with_suffix(''), video, (16, 16))
+    with pytest.raises(ValueError, match='Stale or mismatched'):
+        FrameCacheReader(cache, tiny_root, (16, 16)).open(video)
+    reader = FrameCacheReader(cache, tiny_root, (16, 16))
+    other = videos[1]
+    _, pts = reader.open(other)
+    np.testing.assert_array_equal(reader.positions(other, pts[[3, 0, 19]] + 0.004), [3, 0, 19])
+    with pytest.raises(ValueError, match='timestamp mismatch'):
+        reader.positions(other, [pts[3] + 0.05])
+    native.close()
+
+
+def test_frame_cache_training_matches_uninterrupted_and_records_provenance(tiny_root, tmp_path):
+    dataset = B1KDataset(tiny_root, chunk_size=4, image_size=(32, 32))
+    build_frame_cache(dataset, tmp_path / 'cache', log=lambda *_: None)
+    dataset.close()
+    common = ['--dataset-path', str(tiny_root), '--batch-size', '2', '--num-workers', '0', '--device', 'cpu',
+              '--chunk-size', '4', '--image-size', '32', '32', '--hidden-dim', '32', '--dim-feedforward', '64',
+              '--enc-layers', '1', '--dec-layers', '1', '--nheads', '4', '--no-pretrained-backbone', '--save-every', '1',
+              '--frame-cache', str(tmp_path / 'cache')]
+    full = tmp_path / 'full'
+    split = tmp_path / 'split'
+    train(parser().parse_args(common + ['--output-dir', str(full), '--max-steps', '3']))
+    common += ['--loader-batch-size', '1']
+    train(parser().parse_args(common + ['--output-dir', str(split), '--max-steps', '2']))
+    resumed_path = train(parser().parse_args(common + ['--output-dir', str(split), '--max-steps', '3',
+                                                       '--resume', str(split / 'step_00000002.pt')]))
+    resumed, expected = load_checkpoint(resumed_path), load_checkpoint(full / 'step_00000003.pt')
+    for key in expected['model']:
+        torch.testing.assert_close(expected['model'][key], resumed['model'][key], atol=0, rtol=0)
+    run = json.loads((full / 'run.json').read_text())
+    assert run['train_config']['frame_cache'] == str(tmp_path / 'cache')
+    assert run['adapter_config']['image_resize'] == 'bilinear_antialias'
+    records = [json.loads(line) for line in (full / 'metrics.jsonl').read_text().splitlines()]
+    assert [record['step'] for record in records] == [1, 2, 3]
+    assert all(record['data/video_decode_s'] == 0 and record['data/frame_cache_s'] > 0 and record['data/parquet_s'] > 0
+               and record['timing/data_wait_s'] >= 0 for record in records)
+    # The same steps without the cache differ only by the uint8 rounding of the frames.
+    plain = tmp_path / 'plain'
+    train(parser().parse_args([arg for arg in common if arg not in ('--frame-cache', str(tmp_path / 'cache'))]
+                              + ['--output-dir', str(plain), '--max-steps', '1', '--loader-batch-size', '2']))
+    first = [json.loads(line) for line in (plain / 'metrics.jsonl').read_text().splitlines()][0]
+    assert first['loss'] == pytest.approx(records[0]['loss'], rel=1e-2)
+
+
+def test_fused_attention_matches_explicit_attention_weights_path():
+    from detr.models.transformer import use_fused_attention
+    torch.set_num_threads(1)
+    torch.manual_seed(3)
+    policy = make_policy(small_model_config(), 'cpu')
+    layers = [module for module in policy.modules() if hasattr(module, 'attention')]
+    assert len(layers) == 3 and all(layer.attention == 'auto' for layer in layers)
+    assert not use_fused_attention('auto')  # fp32 without autocast keeps upstream's explicit attention
+    with torch.autocast('cpu', dtype=torch.bfloat16):
+        assert use_fused_attention('auto')
+    with pytest.raises(ValueError, match='attention mode'):
+        make_policy(small_model_config(), 'cpu', attention='other')
+    qpos, images = torch.randn(2, 27), torch.rand(2, 3, 3, 32, 32)
+    actions = torch.randn(2, 4, 23)
+    pad = torch.tensor([[False, False, True, True], [False, False, False, False]])
+    original = torch.nn.MultiheadAttention.forward
+    calls = []
+
+    def recording(self, *args, **kwargs):
+        calls.append(kwargs.get('need_weights'))
+        return original(self, *args, **kwargs)
+
+    def run(mode):
+        for layer in layers:
+            layer.attention = mode
+        calls.clear()
+        with patch.object(torch.nn.MultiheadAttention, 'forward', recording):
+            policy.zero_grad(set_to_none=True)
+            torch.manual_seed(5)
+            losses = policy(qpos, images, actions, pad)
+            losses['loss'].backward()
+        assert calls and all(call is (mode == 'explicit') for call in calls)
+        return ({k: v.detach().clone() for k, v in losses.items()},
+                [p.grad.clone() for p in policy.parameters() if p.grad is not None])
+    reference_losses, reference_grads = run('explicit')
+    losses, grads = run('fused')
+    for key in losses:
+        torch.testing.assert_close(losses[key], reference_losses[key], atol=1e-6, rtol=1e-6)
+    assert len(grads) == len(reference_grads)
+    for grad, reference in zip(grads, reference_grads):
+        torch.testing.assert_close(grad, reference, atol=1e-6, rtol=1e-5)
+    policy.eval()
+    with torch.no_grad():
+        for layer in layers:
+            layer.attention = 'explicit'
+        expected = policy(qpos, images)
+        for layer in layers:
+            layer.attention = 'fused'
+        torch.testing.assert_close(policy(qpos, images), expected, atol=1e-6, rtol=1e-6)
+
+
+def test_skipping_unused_decoder_layers_is_exact():
+    from b1k_training import unused_gradients
+    torch.set_num_threads(1)
+    config = dict(small_model_config(), dec_layers=3)
+    qpos, images = torch.randn(2, 27), torch.rand(2, 3, 3, 32, 32)
+    actions = torch.randn(2, 4, 23)
+    pad = torch.tensor([[False, False, True, True], [False, False, False, False]])
+    policies = {}
+    for skip in (False, True):
+        torch.manual_seed(11)
+        policies[skip] = make_policy(config, 'cpu', skip_unused_decoder_layers=skip)
+    upstream, skipped = policies[False], policies[True]
+    assert upstream.model.decoder_layers_used is None and skipped.model.decoder_layers_used == 1
+    assert list(upstream.state_dict()) == list(skipped.state_dict())
+    for key, value in upstream.state_dict().items():
+        torch.testing.assert_close(value, skipped.state_dict()[key], atol=0, rtol=0)
+    unused = skipped.model.unused_parameters()
+    assert len(unused) == len(list(skipped.model.transformer.decoder.layers[1:].parameters())) > 0
+    assert not upstream.model.unused_parameters()
+    # Predictions are identical; upstream autograd gives the skipped layers exactly-zero gradients.
+    for policy in policies.values():
+        policy.eval()
+    with torch.no_grad():
+        torch.testing.assert_close(upstream(qpos, images), skipped(qpos, images), atol=0, rtol=0)
+    for policy in policies.values():
+        policy.train()
+    reference = {}
+    for skip, policy in policies.items():
+        torch.manual_seed(4)
+        losses = policy(qpos, images, actions, pad)
+        losses['loss'].backward()
+        reference[skip] = losses
+    torch.testing.assert_close(reference[False]['loss'], reference[True]['loss'], atol=0, rtol=0)
+    unused_names = {name for name, p in skipped.model.named_parameters() if any(p is q for q in unused)}
+    assert all(name.startswith('transformer.decoder.layers.') and not name.startswith('transformer.decoder.layers.0.')
+               for name in unused_names)
+    for (name, expected), (_, actual) in zip(upstream.model.named_parameters(), skipped.model.named_parameters()):
+        if name in unused_names:
+            assert expected.grad is not None and not expected.grad.any() and actual.grad is None
+        elif expected.grad is None:
+            assert actual.grad is None
+        else:
+            torch.testing.assert_close(expected.grad, actual.grad, atol=0, rtol=0)
+    # Two optimizer steps with the training loop's zero-gradient substitution reproduce every parameter,
+    # including the weight-decayed unused layers, and the optimizer state.
+    optimizers = {skip: policy.configure_optimizers() for skip, policy in policies.items()}
+    substitutes = unused_gradients(skipped)
+    assert len(substitutes) == len(unused) and not unused_gradients(upstream)
+    for _ in range(2):
+        for skip, policy in policies.items():
+            optimizers[skip].zero_grad(set_to_none=True)
+            torch.manual_seed(6)
+            policy(qpos, images, actions, pad)['loss'].backward()
+            if skip:
+                for parameter, zeros in substitutes:
+                    parameter.grad = zeros
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), float('inf'), error_if_nonfinite=True)
+            optimizers[skip].step()
+    for key, value in upstream.state_dict().items():
+        torch.testing.assert_close(value, skipped.state_dict()[key], atol=0, rtol=0)
+    upstream_state, skipped_state = optimizers[False].state_dict()['state'], optimizers[True].state_dict()['state']
+    assert upstream_state.keys() == skipped_state.keys()
+    for index in upstream_state:
+        for key, value in upstream_state[index].items():
+            torch.testing.assert_close(value, skipped_state[index][key], atol=0, rtol=0)
+
+
+def test_image_layouts_optimizer_state_layout_and_batch_assembly(tiny_root):
+    frames = torch.randint(0, 256, (2, 3, 8, 8, 3), dtype=torch.uint8)
+    images = prepare_images(frames)
+    assert images.shape == (2, 3, 3, 8, 8) and images.dtype == torch.float32
+    torch.testing.assert_close(images, frames.permute(0, 1, 4, 2, 3).float() / 255)
+    assert images[:, 0].is_contiguous(memory_format=torch.channels_last) and not images.is_contiguous()
+    assert prepare_images(frames, channels_last=False).is_contiguous()
+    floats = torch.rand(2, 3, 3, 8, 8)
+    relaid = prepare_images(floats)
+    torch.testing.assert_close(relaid, floats)
+    assert relaid[:, 1].is_contiguous(memory_format=torch.channels_last)
+    assert prepare_images(floats, channels_last=False) is floats
+    with pytest.raises(ValueError, match='uint8'):
+        dequantize_images(floats)
+    conv = torch.nn.Conv2d(3, 4, 3)
+    optimizer = torch.optim.AdamW(conv.parameters(), lr=1e-3)
+    conv(torch.rand(1, 3, 8, 8)).sum().backward()
+    optimizer.step()
+    saved = {k: v.clone() for k, v in optimizer.state[conv.weight].items()}
+    conv.to(memory_format=torch.channels_last)
+    match_optimizer_state_layout(optimizer)
+    for key, value in optimizer.state[conv.weight].items():
+        torch.testing.assert_close(value, saved[key], atol=0, rtol=0)
+        if value.dim() == 4:
+            assert value.stride() == conv.weight.stride() and value.is_contiguous(memory_format=torch.channels_last)
+    dataset = B1KDataset(tiny_root, chunk_size=4, image_size=(16, 16), profile_reads=True)
+    dataset.stats = dataset.compute_stats()
+    sampler = SplitBatchSampler(StepBatchSampler(dataset, 5, 0, 2, 17), 2)
+    loader = torch.utils.data.DataLoader(dataset, batch_sampler=sampler)
+    device = torch.device('cpu')
+    batches = list(optimizer_batches(loader, 5, 2, device=device))
+    reference = list(optimizer_batches(torch.utils.data.DataLoader(dataset, batch_sampler=sampler), 5, 2))
+    assert len(batches) == 2
+    for batch, expected in zip(batches, reference):
+        consumed = consume_batch(batch, None, channels_last=True)
+        for tensor, other in zip(consumed[1:4], expected[1:4]):
+            torch.testing.assert_close(tensor, other, atol=0, rtol=0)
+        torch.testing.assert_close(consumed[0], expected[0], atol=0, rtol=0)
+        assert set(consumed[4]) == set(expected[4]) and len(consumed[4]['data/sample_s']) == 5
+    dataset.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA device required')
+def test_device_batch_assembly_on_side_stream_matches_host(tiny_root, tmp_path):
+    dataset = B1KDataset(tiny_root, chunk_size=4, image_size=(16, 16))
+    build_frame_cache(dataset, tmp_path / 'cache', log=lambda *_: None)
+    dataset.close()
+    dataset = B1KDataset(tiny_root, chunk_size=4, image_size=(16, 16), frame_cache=tmp_path / 'cache', profile_reads=True)
+    dataset.stats = dataset.compute_stats()
+    device = torch.device('cuda')
+    stream = torch.cuda.Stream(device)
+    for loader_batch in (2, None):
+        sampler = StepBatchSampler(dataset, 5, 0, 3, 17)
+        split = SplitBatchSampler(sampler, loader_batch) if loader_batch else sampler
+        loader = torch.utils.data.DataLoader(dataset, batch_sampler=split, pin_memory=True)
+        host = list(optimizer_batches(torch.utils.data.DataLoader(dataset, batch_sampler=split), 5, loader_batch))
+        batches = optimizer_batches(loader, 5, loader_batch, device=device, stream=stream)
+        upcoming = next(batches)
+        for expected in host:
+            batch = upcoming
+            upcoming = next(batches, None)  # prefetched while the previous batch is consumed
+            images, qpos, actions, is_pad, timings = consume_batch(batch, stream, channels_last=True)
+            assert images.device.type == 'cuda' and images[:, 0].is_contiguous(memory_format=torch.channels_last)
+            # uint8 / 255 may round differently by one ulp between the CUDA and CPU kernels
+            torch.testing.assert_close(images.cpu(), prepare_images(expected[0]), atol=1e-7, rtol=0)
+            for tensor, other in zip((qpos, actions, is_pad), expected[1:4]):
+                torch.testing.assert_close(tensor.cpu(), other, atol=0, rtol=0)
+            assert timings['data/sample_s'].shape == expected[4]['data/sample_s'].shape and timings['data/sample_s'].min() > 0
+        assert upcoming is None
     dataset.close()
 
 

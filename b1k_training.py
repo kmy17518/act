@@ -1,7 +1,7 @@
 """Step-based training and standalone checkpoints for upstream ACT and CNNMLP policies."""
 
 import argparse
-from contextlib import contextmanager, ExitStack
+from contextlib import contextmanager, ExitStack, nullcontext
 import fcntl
 from functools import partial
 import json
@@ -19,6 +19,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from b1k_dataset import B1KDataset, CAMERAS, OBS_KEYS, STATE_INDICES, VIDEO_KEYS, SplitBatchSampler, StepBatchSampler
+from b1k_frame_cache import dequantize_images
+from detr.models.transformer import use_fused_attention
 from policy import ACTPolicy, CNNMLPPolicy
 
 
@@ -52,12 +54,39 @@ def policy_class(model_config):
     return name
 
 
-def make_policy(model_config, device, restoring=False):
-    config = dict(model_config, programmatic=True, device=str(device))
+def make_policy(model_config, device, restoring=False, fused_optimizer=False, skip_unused_decoder_layers=True,
+                attention='auto'):
+    """Build the upstream policy.
+
+    `fused_optimizer`, `skip_unused_decoder_layers` and `attention` are runtime execution choices, not
+    saved model configuration. ACT consumes only the first stacked decoder output, so with the skip
+    enabled the remaining decoder layers are not executed; predictions and every gradient are unchanged
+    (see `unused_gradients` for the optimizer side). `attention` selects the nn.MultiheadAttention path
+    (`detr.models.transformer.use_fused_attention`).
+    """
+    config = dict(model_config, programmatic=True, device=str(device), fused_optimizer=fused_optimizer)
     if restoring:
         config['pretrained_backbone'] = False
     policy_type = ACTPolicy if policy_class(config) == 'ACT' else CNNMLPPolicy
-    return policy_type(config)
+    policy = policy_type(config)
+    if skip_unused_decoder_layers and hasattr(policy.model, 'decoder_layers_used'):
+        policy.model.decoder_layers_used = 1
+    use_fused_attention(attention)  # validate the mode
+    for module in policy.modules():
+        if hasattr(module, 'attention'):
+            module.attention = attention
+    return policy
+
+
+def unused_gradients(policy):
+    """Persistent zero gradients for parameters the forward pass never reaches.
+
+    Upstream autograd produces exactly-zero gradients for those parameters, and AdamW still applies
+    its decoupled weight decay to them. Assigning the same zeros after each backward keeps every
+    parameter and optimizer-state trajectory identical while their forward/backward work is skipped.
+    """
+    parameters = getattr(policy.model, 'unused_parameters', list)()
+    return [(parameter, torch.zeros_like(parameter)) for parameter in parameters]
 
 
 def _sync_directory(path):
@@ -159,9 +188,32 @@ def save_eval_checkpoint(run, policy, step, output):
     return path
 
 
-def optimizer_batches(loader, batch_size, loader_batch_size):
+def optimizer_batches(loader, batch_size, loader_batch_size, device=None, stream=None):
+    """Yield one ordered optimizer batch per step: (images, qpos, actions, is_pad, per-sample timings).
+
+    Worker slices are reassembled in sampler order. With a CUDA `device`, the four tensors are
+    allocated on the device and each pinned slice is copied straight into place (`stream`, when given,
+    carries the copies so they overlap the previous step's compute; consume with `consume_batch`).
+    Without a device the batch is assembled on the host exactly as before.
+    """
+    on_device = device is not None and torch.device(device).type == 'cuda'
+    context = torch.cuda.stream(stream) if on_device and stream is not None else nullcontext()
+
+    def allocate(first):
+        if on_device:
+            return torch.empty((batch_size, *first.shape[1:]), dtype=first.dtype, device=device)
+        return torch.empty((batch_size, *first.shape[1:]), dtype=first.dtype, pin_memory=loader.pin_memory)
+
     if not loader_batch_size or loader_batch_size >= batch_size:
-        yield from loader
+        for batch in loader:
+            if on_device:
+                with context:
+                    tensors = [value.to(device, non_blocking=True) for value in batch[:4]]
+                yield (*tensors, batch[4])
+                del tensors
+            else:
+                yield batch
+            del batch
         return
     slices = []
     parts = (batch_size + loader_batch_size - 1) // loader_batch_size
@@ -169,23 +221,68 @@ def optimizer_batches(loader, batch_size, loader_batch_size):
         slices.append(batch)
         if len(slices) == parts:
             tensors = []
-            for column in range(4):
-                first = slices[0][column]
-                merged = torch.empty((batch_size, *first.shape[1:]), dtype=first.dtype, pin_memory=loader.pin_memory)
-                offset = 0
-                for part in slices:
-                    value = part[column]
-                    merged[offset:offset + len(value)].copy_(value)
-                    offset += len(value)
-                if offset != batch_size:
-                    raise RuntimeError('Incorrect optimizer batch size from data loader')
-                tensors.append(merged)
+            with context:
+                for column in range(4):
+                    merged = allocate(slices[0][column])
+                    offset = 0
+                    for part in slices:
+                        value = part[column]
+                        merged[offset:offset + len(value)].copy_(value, non_blocking=on_device)
+                        offset += len(value)
+                    if offset != batch_size:
+                        raise RuntimeError('Incorrect optimizer batch size from data loader')
+                    tensors.append(merged)
             timings = {key: torch.cat([part[4][key] for part in slices]) for key in slices[0][4]}
             slices.clear()
             yield (*tensors, timings)
-            del tensors, timings, merged, first, value, part, batch
+            del tensors, timings, merged, value, part, batch
     if slices:
         raise RuntimeError('Incomplete optimizer batch from data loader')
+
+
+def compile_policy(policy, mode):
+    """torch.compile the network forward in place; parameters, state_dict keys and the optimizer are untouched."""
+    policy.model.forward = torch.compile(policy.model.forward, mode=mode)
+    return policy
+
+
+def match_optimizer_state_layout(optimizer):
+    """Give restored moment tensors the memory layout of their (possibly channels-last) parameters.
+
+    Restored states are plain contiguous tensors; fused/foreach kernels pair elements positionally, so
+    the layouts must agree. `empty_like` preserves the parameter's strides and `copy_` is a logical copy.
+    """
+    for group in optimizer.param_groups:
+        for parameter in group['params']:
+            for key, value in list(optimizer.state.get(parameter, {}).items()):
+                if torch.is_tensor(value) and value.shape == parameter.shape and value.stride() != parameter.stride():
+                    optimizer.state[parameter][key] = torch.empty_like(parameter).copy_(value)
+
+
+def prepare_images(images, channels_last=True):
+    """Loader images to the float (batch, camera, 3, H, W) tensor in [0, 1] the policies expect.
+
+    uint8 frame-cache batches arrive as (batch, camera, H, W, 3) and become float images whose
+    per-camera slices are dense channels-last blocks; float batches only get re-laid out the same
+    way when `channels_last` asks for it.
+    """
+    if images.dtype == torch.uint8:
+        images = dequantize_images(images)
+        return images if channels_last else images.contiguous()
+    if channels_last and images.dim() == 5:
+        return images.permute(1, 0, 3, 4, 2).contiguous().permute(1, 0, 4, 2, 3)
+    return images
+
+
+def consume_batch(batch, stream=None, channels_last=True):
+    """Hand a prefetched batch to the current stream and convert its images for the forward pass."""
+    images, qpos, actions, is_pad, timings = batch
+    if stream is not None:
+        current = torch.cuda.current_stream(images.device)
+        current.wait_stream(stream)
+        for tensor in (images, qpos, actions, is_pad):
+            tensor.record_stream(current)
+    return prepare_images(images, channels_last), qpos, actions, is_pad, timings
 
 
 def configure_cpu_threads(worker_id=None, torch_threads=1, arrow_threads=1, opencv_threads=1):
@@ -302,6 +399,28 @@ def parser():
     p.add_argument('--stats-max-frames', type=int, help='Smoke only: use first N selected frames, not full statistics')
     p.add_argument('--cache-row-groups', type=int, default=2)
     p.add_argument('--timestamp-tolerance', type=float, default=0.008)
+    p.add_argument('--frame-cache', type=Path, help='Root of the uint8 resized-frame cache built by '
+                   'scripts/b1k/build_frame_cache.py for this image size; default decodes video per sample')
+    p.add_argument('--matmul-precision', choices=['highest', 'high', 'medium'], default='highest',
+                   help='torch.set_float32_matmul_precision for fp32 matmuls; "high" enables TF32 tensor cores '
+                        '(convolutions already default to TF32 in PyTorch)')
+    p.add_argument('--autocast', choices=['none', 'bf16'], default='none',
+                   help='bf16 autocast for the forward pass on CUDA; weights, optimizer state, output heads, '
+                        'latent distribution and losses stay fp32')
+    p.add_argument('--channels-last', action=argparse.BooleanOptionalAction, default=True,
+                   help='Channels-last (NHWC) memory layout for the convolutional backbone (layout only)')
+    p.add_argument('--fused-optimizer', action=argparse.BooleanOptionalAction, default=True,
+                   help='Single-kernel fused AdamW on CUDA (same update rule)')
+    p.add_argument('--cudnn-benchmark', action=argparse.BooleanOptionalAction, default=True,
+                   help='Let cuDNN autotune convolution algorithms for the fixed batch shape')
+    p.add_argument('--compile', choices=['none', 'default', 'max-autotune-no-cudagraphs'], default='none',
+                   help='torch.compile the policy network (CUDA only)')
+    p.add_argument('--compute-unused-decoder-layers', action='store_true',
+                   help='Also run the ACT decoder layers whose outputs are discarded (upstream behavior); '
+                        'by default they are skipped and receive the same exactly-zero gradients')
+    p.add_argument('--attention', choices=['auto', 'fused', 'explicit'], default='auto',
+                   help='nn.MultiheadAttention path: explicit upstream matmul+softmax, fused scaled-dot-product '
+                        'kernels, or auto (fused only under autocast)')
     return p
 
 
@@ -379,7 +498,8 @@ def _train(args, output, root, resources):
                           arrow_threads=args.arrow_threads, opencv_threads=args.opencv_threads)
     dataset = B1KDataset(root, task_names, model_config['num_queries'], adapter['image_size'],
                          cache_row_groups=args.cache_row_groups, profile_reads=True,
-                         timestamp_tolerance=adapter['timestamp_tolerance'])
+                         timestamp_tolerance=adapter['timestamp_tolerance'],
+                         frame_cache=args.frame_cache.resolve() if args.frame_cache else None)
     resources.callback(dataset.close)
     if checkpoint and dataset.task_map != checkpoint['task_map']:
         raise ValueError('Resume task map differs from checkpoint')
@@ -407,12 +527,22 @@ def _train(args, output, root, resources):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
-    policy = make_policy(model_config, device, restoring=checkpoint is not None)
+    cuda = device.type == 'cuda'
+    torch.set_float32_matmul_precision(args.matmul_precision)
+    if cuda:
+        torch.backends.cudnn.benchmark = args.cudnn_benchmark
+    policy = make_policy(model_config, device, restoring=checkpoint is not None,
+                         fused_optimizer=args.fused_optimizer and cuda,
+                         skip_unused_decoder_layers=not args.compute_unused_decoder_layers, attention=args.attention)
+    if args.channels_last:
+        policy.to(memory_format=torch.channels_last)  # only 4-D (convolution) weights change layout
     optimizer = policy.configure_optimizers()
+    zero_gradients = unused_gradients(policy)
     start = 0
     if checkpoint:
         policy.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
+        match_optimizer_state_layout(optimizer)
         start = checkpoint['step']
         torch.set_rng_state(checkpoint['torch_rng'])
         if device.type == 'cuda' and checkpoint['cuda_rng'] is not None:
@@ -421,6 +551,7 @@ def _train(args, output, root, resources):
         raise ValueError(f'--max-steps must exceed resumed step {start}')
     train_config = vars(args).copy()
     train_config['resume'] = str(args.resume) if args.resume else None
+    train_config['frame_cache'] = str(args.frame_cache) if args.frame_cache else None
     run = {'model_config': model_config, 'adapter_config': adapter, 'train_config': train_config,
            'task_map': dataset.task_map, 'normalization': stats, 'wandb': wandb_identity}
     atomic_json(run, output / ('resume_run.json' if checkpoint else 'run.json'))
@@ -436,28 +567,50 @@ def _train(args, output, root, resources):
                                                      opencv_threads=args.opencv_threads))
     loader_sampler = SplitBatchSampler(sampler, args.loader_batch_size) if args.loader_batch_size else sampler
     loader = DataLoader(dataset, batch_sampler=loader_sampler, **loader_kwargs)
+    if args.compile != 'none' and cuda:
+        compile_policy(policy, args.compile)
     policy.train()
-    LOGGER.info('Training %d -> %d steps on %s with real upstream %s',
-                start, args.max_steps, device, policy_class(model_config))
+    autocast = ((lambda: torch.autocast('cuda', dtype=torch.bfloat16)) if args.autocast == 'bf16' and cuda
+                else nullcontext)
+    copy_stream = torch.cuda.Stream(device) if cuda else None
+    LOGGER.info('Training %d -> %d steps on %s with real upstream %s (matmul %s, autocast %s, attention %s, '
+                'channels_last %s, fused optimizer %s, compile %s, frame cache %s, skipped unused decoder parameters %d)',
+                start, args.max_steps, device, policy_class(model_config), args.matmul_precision, args.autocast,
+                args.attention, args.channels_last, args.fused_optimizer and cuda, args.compile, bool(args.frame_cache),
+                sum(parameter.numel() for parameter, _ in zero_gradients))
     begin = time.monotonic()
     previous_end = begin
+    batches = optimizer_batches(loader, args.batch_size, args.loader_batch_size, device=device, stream=copy_stream)
+    fetch_start = time.monotonic()
+    upcoming = next(batches, None)
+    upcoming_wait = time.monotonic() - fetch_start
+    step = start
     with (output / 'metrics.jsonl').open('a') as metrics:
-        for step, batch in enumerate(optimizer_batches(loader, args.batch_size, args.loader_batch_size), start + 1):
+        while upcoming is not None:
+            step += 1
+            batch, data_wait = upcoming, upcoming_wait
             batch_ready = time.monotonic()
-            if device.type == 'cuda':
+            if cuda:
                 torch.cuda.reset_peak_memory_stats(device)
             optimizer.zero_grad(set_to_none=True)
-            images, qpos, actions, is_pad = [x.to(device, non_blocking=True) for x in batch[:4]]
-            losses = policy(qpos, images, actions, is_pad)
+            images, qpos, actions, is_pad, timings = consume_batch(batch, copy_stream, args.channels_last)
+            with autocast():
+                losses = policy(qpos, images, actions, is_pad)
+            losses['loss'].backward()
+            for parameter, zeros in zero_gradients:
+                parameter.grad = zeros
+            # The next batch is assembled on the device while this step's forward/backward kernels run.
+            fetch_start = time.monotonic()
+            upcoming = next(batches, None)
+            upcoming_wait = time.monotonic() - fetch_start
             if not torch.isfinite(losses['loss']):
                 raise FloatingPointError(f'Non-finite loss at step {step}')
-            losses['loss'].backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), float('inf'), error_if_nonfinite=True)
             optimizer.step()
             record = {'step': step, **{k: float(v.detach()) for k, v in losses.items()},
                       'grad_norm': float(grad_norm), 'lr': optimizer.param_groups[0]['lr'],
-                      **{key: float(value.mean()) for key, value in batch[4].items()}}
-            if device.type == 'cuda':
+                      **{key: float(value.mean()) for key, value in timings.items()}}
+            if cuda:
                 torch.cuda.synchronize(device)
                 record.update({'gpu/allocated_bytes': torch.cuda.memory_allocated(device),
                                'gpu/reserved_bytes': torch.cuda.memory_reserved(device),
@@ -478,7 +631,9 @@ def _train(args, output, root, resources):
                 path = save_full_checkpoint(saved, output, args.save_total_limit, bool(args.export_every))
                 LOGGER.info('Saved standalone checkpoint %s', path)
             finished = time.monotonic()
-            record.update({'elapsed_s': finished - begin, 'timing/data_wait_s': batch_ready - previous_end,
+            # data_wait_s: host time blocked fetching this step's batch (overlapped with the previous
+            # step's compute after step 1); train_s covers this step's launch, compute and that overlap.
+            record.update({'elapsed_s': finished - begin, 'timing/data_wait_s': data_wait,
                            'timing/train_s': trained - batch_ready, 'timing/checkpoint_s': finished - trained,
                            'timing/step_s': finished - previous_end,
                            'samples_per_s': args.batch_size / (finished - previous_end)})
@@ -487,7 +642,7 @@ def _train(args, output, root, resources):
             LOGGER.info('%s', json.dumps(record))
             if tracked:
                 tracked.log(record, step=step)
-            del images, qpos, actions, is_pad, losses, grad_norm, batch
+            del images, qpos, actions, is_pad, losses, grad_norm, batch, timings
             previous_end = time.monotonic()
     return path
 
