@@ -52,16 +52,19 @@ def quantize_image(tensor):
 def dequantize_images(images):
     """Cached uint8 (..., H, W, 3) tensor to the float (..., 3, H, W) tensor `preprocess_image` produces.
 
-    Values are exactly `uint8 / 255`. Elementwise ops preserve dense strides, so each image stays in
-    channels-last memory order (the tensor-core convolution fast path). A (batch, camera, H, W, 3)
-    batch is stored camera-major first so that every `images[:, camera]` is one dense channels-last
-    (batch, 3, H, W) block and convolutions need no relayout copy.
+    Values are exactly `uint8 / 255` on every device: dividing by a 0-dim tensor runs a true IEEE
+    division kernel, whereas a Python scalar divisor becomes a reciprocal multiply on CUDA that is one
+    ulp off for some of the 256 values (so this matches `preprocess_image` bit for bit). Elementwise
+    ops preserve dense strides, so each image stays in channels-last memory order (the tensor-core
+    convolution fast path). A (batch, camera, H, W, 3) batch is stored camera-major first so that every
+    `images[:, camera]` is one dense channels-last (batch, 3, H, W) block and convolutions need no
+    relayout copy.
     """
     if images.dtype != torch.uint8 or images.shape[-1] != 3:
         raise ValueError('Expected uint8 (..., H, W, 3) frames')
     if images.dim() == 5:
         images = images.transpose(0, 1).contiguous().transpose(0, 1)
-    return images.movedim(-1, -3).float().div_(255)
+    return images.movedim(-1, -3).float().div_(torch.tensor(255.0, dtype=torch.float32, device=images.device))
 
 
 def cache_stem(cache_root, dataset_root, video_path):

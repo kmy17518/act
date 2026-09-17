@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Workspace launch recipe: one GPU, 30 CPU cores, fp32 weights/optimizer with TF32 matmuls, uint8
-# resized-frame cache, torch.compile'd backbone/transformer regions, and resumable logging.
+# resized-frame cache, autotuned torch.compile regions, bit-identical stem pooling, and resumable logging.
+# GPU_UUID overrides the card (default: GPU index 2 of the host provisioned on 2026-09-17; the earlier
+# host's GPU 2 was GPU-aa99f910-8e39-d04c-a717-a6f7a06f52e8).
 set -euo pipefail
 source /tmp/dev/env.sh
 cd /tmp/dev/baselines/act
-export CUDA_VISIBLE_DEVICES=GPU-aa99f910-8e39-d04c-a717-a6f7a06f52e8
+export CUDA_VISIBLE_DEVICES=${GPU_UUID:-GPU-10567c56-9603-b2aa-1ce1-63234ee50192}
 if [[ -n "$(nvidia-smi --id "$CUDA_VISIBLE_DEVICES" --query-compute-apps=pid --format=csv,noheader)" ]]; then
     printf 'Assigned ACT GPU is occupied; refusing to start.\n' >&2
     exit 1
@@ -38,7 +40,7 @@ taskset -c 60-89 .venv/bin/python -u scripts/b1k/train_b1k.py \
     --kl-weight 10 --lr 1e-5 --lr-backbone 1e-5 --weight-decay 1e-4 \
     --batch-size 1560 --loader-batch-size 128 --num-workers 8 --prefetch-factor 2 \
     --torch-threads 2 --worker-threads 1 --arrow-threads 1 --opencv-threads 1 --device cuda \
-    --matmul-precision high --compile regions \
+    --matmul-precision high --compile regions-autotune \
     --save-every 2500 --save-first-step --save-total-limit 3 --export-every 10000 \
     --wandb-mode online --wandb-entity kmy17518 --wandb-project b1k-challenge-2026-act \
     --wandb-name turning-on-radio-act-bs1560-300k --wandb-id actradio16 \

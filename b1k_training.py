@@ -247,6 +247,24 @@ def optimizer_batches(loader, batch_size, loader_batch_size, device=None, stream
         raise RuntimeError('Incomplete optimizer batch from data loader')
 
 
+def verify_resynced_dataset(dataset, stats, fingerprint):
+    """Accept a resumed dataset whose fingerprint changed only because files were re-synced.
+
+    The fingerprint covers file sizes and mtimes, so a re-downloaded copy of the same data fails the
+    cheap check. Exact full-dataset statistics are deterministic in the data alone; recomputing them
+    and requiring equality with the checkpoint (plus the same frame count) proves the selected rows
+    are unchanged. Approximate (smoke) statistics cannot be verified this way and still fail.
+    """
+    if stats.get('approximate'):
+        raise ValueError('Resume dataset metadata/files differ from checkpoint; use the same local subset')
+    recomputed = dataset.compute_stats()
+    keys = ('qpos_mean', 'qpos_std', 'action_mean', 'action_std', 'count', 'std_correction', 'std_floor')
+    if any(recomputed[key] != stats[key] for key in keys) or recomputed['approximate']:
+        raise ValueError('Resume dataset metadata/files differ from checkpoint; use the same local subset')
+    LOGGER.warning('Dataset fingerprint changed (%s -> %s) but the exact statistics of all %d selected frames are '
+                   'identical; accepting the re-synced files', stats['fingerprint'][:16], fingerprint[:16], stats['count'])
+
+
 def compile_policy(policy, mode):
     """torch.compile forward passes in place; parameters, state_dict keys and the optimizer are untouched.
 
@@ -256,12 +274,16 @@ def compile_policy(policy, mode):
     the explicit TF32 attention is kept instead of being rewritten into the fp32-only fused kernel.
     Other modes compile the whole network forward.
     """
-    if mode in ('backbone', 'regions'):
+    if mode in ('backbone', 'regions', 'regions-autotune'):
+        import torch._inductor.config as inductor_config
+        if mode == 'regions-autotune':
+            # Benchmark Triton/cuBLAS GEMM and convolution choices per shape (a few extra minutes once,
+            # cached on disk); the selected kernels are still TF32/fp32.
+            inductor_config.max_autotune = True
         for backbone in policy.model.backbones:
             body = backbone[0]
             body.forward = torch.compile(body.forward)
-        if mode == 'regions':
-            import torch._inductor.config as inductor_config
+        if mode != 'backbone':
             inductor_config.pattern_matcher = False
             for module in (policy.model.encoder, policy.model.transformer):
                 module.forward = torch.compile(module.forward)
@@ -440,11 +462,12 @@ def parser():
                    help='Let cuDNN autotune convolution algorithms for the fixed batch shape')
     p.add_argument('--fast-maxpool', action=argparse.BooleanOptionalAction, default=True,
                    help='Bit-identical channels-last Triton kernels for the ResNet stem max pooling on CUDA')
-    p.add_argument('--compile', choices=['none', 'backbone', 'regions', 'default', 'max-autotune-no-cudagraphs'],
-                   default='none',
+    p.add_argument('--compile', choices=['none', 'backbone', 'regions', 'regions-autotune', 'default',
+                                         'max-autotune-no-cudagraphs'], default='none',
                    help='torch.compile on CUDA: "backbone" compiles the ResNet bodies only (fuses frozen-BN/ReLU/'
                         'residual elementwise work around cuDNN convolutions), "regions" also compiles the ACT '
-                        'encoder/transformer separately; other modes compile the whole network')
+                        'encoder/transformer separately, "regions-autotune" additionally benchmarks GEMM/convolution '
+                        'kernel choices; other modes compile the whole network')
     p.add_argument('--compute-unused-decoder-layers', action='store_true',
                    help='Also run the ACT decoder layers whose outputs are discarded (upstream behavior); '
                         'by default they are skipped and receive the same exactly-zero gradients')
@@ -537,9 +560,10 @@ def _train(args, output, root, resources):
     fingerprint = dataset.fingerprint()
     output.mkdir(parents=True, exist_ok=True)
     if checkpoint:
-        stats = checkpoint['normalization']
+        stats = dict(checkpoint['normalization'])
         if stats['fingerprint'] != fingerprint:
-            raise ValueError('Resume dataset metadata/files differ from checkpoint; use the same local subset')
+            verify_resynced_dataset(dataset, stats, fingerprint)
+            stats['fingerprint'] = fingerprint
     else:
         stats_path = output / f'stats_{fingerprint[:16]}_{args.stats_max_frames or "all"}.json'
         if stats_path.exists():
