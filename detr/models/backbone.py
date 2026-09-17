@@ -54,7 +54,9 @@ class FrozenBatchNorm2d(torch.nn.Module):
         eps = 1e-5
         scale = w * (rv + eps).rsqrt()
         bias = b - rm * scale
-        return x * scale + bias
+        # Keep the affine in the activation dtype (no-op in fp32) so autocast bf16 activations are not
+        # promoted back to fp32 here; the frozen statistics stay in fp32.
+        return x * scale.to(x.dtype) + bias.to(x.dtype)
 
 
 class BackboneBase(nn.Module):
