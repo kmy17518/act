@@ -11,24 +11,27 @@
 #     (Inductor-fused elementwise work plus autotuned GEMM/convolution kernels; a few minutes of
 #     compilation on the first step for a new batch size, cached under /tmp/.cache/torchinductor).
 #   Steady state: 0.30 s/step at batch 1024, 0.45 s/step at batch 1560 (baseline 1.77 / 3.40 s/step).
-# Overrides (environment variables):
-#   BATCH_SIZE  physical batch (default 1560; 1024 is the other measured size).
-#   RUN_TAG     default 20260916 = the original run directory outputs/turning-on-radio-act-bs1560-300k-20260916,
-#               resumed from latest.pt when present with the original W&B identity. Any other tag names a fresh
-#               run (outputs/turning-on-radio-act-bs${BATCH_SIZE}-300k-${RUN_TAG}) with its own log/exit file and
-#               W&B run (WANDB_ID defaults to actradio-${RUN_TAG}); it also resumes its own latest.pt if present.
-#   AUTOCAST    none (default: TF32 recipe, resumed losses match the original run within dropout noise),
-#               bf16-backbone (bf16 inside the ResNet bodies only: 0.28 / 0.42 s/step, mean L1 +0.04 % over a
-#               300-step resume) or bf16 (0.29 / 0.44 s/step before compile; L1 +0.6-1.0 %, not neutral).
-#   COMPILE_MODE regions-autotune (default), regions, backbone or none.
-#   GPU_UUID    default: GPU index 2 of the host provisioned on 2026-09-17 (the earlier host's GPU 2 was
-#               GPU-aa99f910-8e39-d04c-a717-a6f7a06f52e8). One GPU per run.
-#   CORES       taskset range for the loader workers and trainer (default 60-89, 30 cores).
-#   FRAME_CACHE, DATASET, WANDB_ID  as named.
+# Overrides (environment variables, all prefixed ACT_ so that a tmux server or shell shared with the
+# Diffusion Policy recipe -- which uses BATCH_SIZE, FRAME_CACHE, GPU_UUID, ... -- can never redirect this run;
+# launch from a dedicated tmux server, e.g. `tmux -L b1k-act new-session -d -s act-radio 'bash .../run_radio_300k.sh'`):
+#   ACT_BATCH_SIZE  physical batch (default 1560; 1024 is the other measured size).
+#   ACT_RUN_TAG     default 20260916 = the original run directory outputs/turning-on-radio-act-bs1560-300k-20260916,
+#                   resumed from latest.pt when present with the original W&B identity. Any other tag names a fresh
+#                   run (outputs/turning-on-radio-act-bs${ACT_BATCH_SIZE}-300k-${ACT_RUN_TAG}) with its own log/exit
+#                   file and W&B run (ACT_WANDB_ID defaults to actradio-${ACT_RUN_TAG}); it resumes its own latest.pt.
+#   ACT_AUTOCAST    none (default: TF32 recipe, resumed losses match the original run within dropout noise),
+#                   bf16-backbone (bf16 inside the ResNet bodies only: 0.28 / 0.42 s/step, mean L1 +0.04 % over a
+#                   300-step resume) or bf16 (0.29 / 0.44 s/step before compile; L1 +0.6-1.0 %, not neutral).
+#   ACT_COMPILE_MODE regions-autotune (default), regions, backbone or none.
+#   ACT_GPU_UUID    default: GPU index 2 of the host provisioned on 2026-09-17 (the earlier host's GPU 2 was
+#                   GPU-aa99f910-8e39-d04c-a717-a6f7a06f52e8). One GPU per run.
+#   ACT_CORES       taskset range for the loader workers and trainer (default 60-89, 30 cores).
+#   ACT_FRAME_CACHE, ACT_DATASET, ACT_WANDB_ID  as named. The cache builder refuses a directory that holds
+#                   another tool's or another image size's cache entries.
 set -euo pipefail
 source /tmp/dev/env.sh
 cd /tmp/dev/baselines/act
-export CUDA_VISIBLE_DEVICES=${GPU_UUID:-GPU-10567c56-9603-b2aa-1ce1-63234ee50192}
+export CUDA_VISIBLE_DEVICES=${ACT_GPU_UUID:-GPU-10567c56-9603-b2aa-1ce1-63234ee50192}
 if [[ -n "$(nvidia-smi --id "$CUDA_VISIBLE_DEVICES" --query-compute-apps=pid --format=csv,noheader)" ]]; then
     printf 'Assigned ACT GPU is occupied; refusing to start.\n' >&2
     exit 1
@@ -40,26 +43,26 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 # launch scripts); harmless when the system headers exist.
 export CPATH=/tmp/dev/sysroots/libpython3.10-dev/usr/include/python3.10:/tmp/dev/sysroots/libpython3.10-dev/usr/include${CPATH:+:$CPATH}
 export WANDB_BASE_URL=https://api.wandb.ai WANDB_MODE=online
-BATCH_SIZE=${BATCH_SIZE:-1560}
-RUN_TAG=${RUN_TAG:-20260916}
-AUTOCAST=${AUTOCAST:-none}
-COMPILE_MODE=${COMPILE_MODE:-regions-autotune}
-CORES=${CORES:-60-89}
-DATASET=${DATASET:-/tmp/dev/datasets/2026-challenge-demos}
-CACHE=${FRAME_CACHE:-/tmp/dev/datasets/2026-challenge-demos-act-frame-cache-240x240}
+BATCH_SIZE=${ACT_BATCH_SIZE:-1560}
+RUN_TAG=${ACT_RUN_TAG:-20260916}
+AUTOCAST=${ACT_AUTOCAST:-none}
+COMPILE_MODE=${ACT_COMPILE_MODE:-regions-autotune}
+CORES=${ACT_CORES:-60-89}
+DATASET=${ACT_DATASET:-/tmp/dev/datasets/2026-challenge-demos}
+CACHE=${ACT_FRAME_CACHE:-/tmp/dev/datasets/2026-challenge-demos-act-frame-cache-240x240}
 if [[ "$RUN_TAG" == 20260916 ]]; then
     # The original run: directory, log and W&B identity are fixed regardless of the other overrides.
     RUN=outputs/turning-on-radio-act-bs1560-300k-20260916
     LOG=/tmp/dev/logs/act-radio-300k-20260916.log
     STATUS=/tmp/dev/logs/act-radio-300k-20260916.exit
     WANDB_NAME=turning-on-radio-act-bs1560-300k
-    WANDB_ID=${WANDB_ID:-actradio16}
+    WANDB_ID=${ACT_WANDB_ID:-actradio16}
 else
     RUN=outputs/turning-on-radio-act-bs${BATCH_SIZE}-300k-${RUN_TAG}
     LOG=/tmp/dev/logs/act-radio-300k-${RUN_TAG}.log
     STATUS=/tmp/dev/logs/act-radio-300k-${RUN_TAG}.exit
     WANDB_NAME=turning-on-radio-act-bs${BATCH_SIZE}-300k-${RUN_TAG}
-    WANDB_ID=${WANDB_ID:-actradio-${RUN_TAG}}
+    WANDB_ID=${ACT_WANDB_ID:-actradio-${RUN_TAG}}
 fi
 # Build any missing/stale cache entries (about 8 minutes from scratch on 30 cores; a no-op when
 # complete) and spot-check 64 random samples against native decoding before every launch.

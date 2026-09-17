@@ -485,6 +485,16 @@ def test_frame_cache_matches_native_decoding_and_detects_stale_entries(tiny_root
         build_frame_cache(native, tiny_root / 'cache', log=lambda *_: None)
     videos = build_frame_cache(native, cache, workers=2, log=lambda *_: None)
     assert videos == selected_videos(native) and len(videos) == 3
+    # Another size or another tool's entries in the same directory are a wrong --cache-dir, never rebuilt over.
+    with pytest.raises(ValueError, match='separate --cache-dir'):
+        build_frame_cache(B1KDataset(tiny_root, chunk_size=4, image_size=(8, 8)), cache, log=lambda *_: None)
+    foreign = tmp_path / 'foreign'
+    entry = foreign / 'videos/observation.rgb.zed_link_camera_0/chunk-042'
+    entry.mkdir(parents=True)
+    (entry / 'file-000.json').write_text(json.dumps({'format': 'diffusion_policy_b1k_frame_cache_v1', 'image_size': 96}))
+    with pytest.raises(ValueError, match='diffusion_policy_b1k_frame_cache_v1'):
+        build_frame_cache(native, foreign, log=lambda *_: None)
+    assert not list(foreign.rglob('*.npy')) and not list(foreign.rglob('.*.tmp'))
     assert verify_frame_cache(native, cache, samples=10, log=lambda *_: None) == 30
     manifest = json.loads(next(cache.rglob('*.json')).read_text())
     assert manifest['frames'] == 20 and manifest['image_size'] == [16, 16]

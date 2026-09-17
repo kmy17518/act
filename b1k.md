@@ -125,14 +125,14 @@ All of the following keep fp32 weights, fp32 optimizer state, the upstream loss,
 **Launching.** `scripts/b1k/run_radio_300k.sh` is the complete recipe (cache build/verify, GPU occupancy check, resume, W&B, exit-status file) with the fastest numerically neutral settings as defaults; its header documents every override. Examples:
 
 ```bash
-bash scripts/b1k/run_radio_300k.sh                                   # resume the original run (batch 1560, TF32)
-BATCH_SIZE=1024 RUN_TAG=bs1024 bash scripts/b1k/run_radio_300k.sh    # fresh run at batch 1024, own directory/log/W&B run
-AUTOCAST=bf16-backbone RUN_TAG=bf16bb bash scripts/b1k/run_radio_300k.sh   # fastest option with a small measured deviation
-AUTOCAST=bf16 RUN_TAG=bf16 bash scripts/b1k/run_radio_300k.sh        # fastest, not numerically neutral (see table)
-COMPILE_MODE=none bash scripts/b1k/run_radio_300k.sh                 # eager kernels (0.41 / 0.65 s/step), no compile time
+bash scripts/b1k/run_radio_300k.sh                                            # resume the original run (batch 1560, TF32)
+ACT_BATCH_SIZE=1024 ACT_RUN_TAG=bs1024 bash scripts/b1k/run_radio_300k.sh     # fresh run at batch 1024, own directory/log/W&B run
+ACT_AUTOCAST=bf16-backbone ACT_RUN_TAG=bf16bb bash scripts/b1k/run_radio_300k.sh   # fastest option with a small measured deviation
+ACT_AUTOCAST=bf16 ACT_RUN_TAG=bf16 bash scripts/b1k/run_radio_300k.sh         # fastest, not numerically neutral (see table)
+ACT_COMPILE_MODE=none bash scripts/b1k/run_radio_300k.sh                      # eager kernels (0.41 / 0.65 s/step), no compile time
 ```
 
-A fresh `RUN_TAG` never touches the original directory or W&B run (`WANDB_ID` defaults to `actradio-<tag>`); a fresh run also needs its own uploader invocation if its checkpoints should be published. Direct `train_b1k.py` invocations take the same flags (`--frame-cache`, `--matmul-precision high`, `--compile regions-autotune`, `--autocast ...`).
+The overrides are prefixed `ACT_` because the Diffusion Policy recipe uses `BATCH_SIZE`, `FRAME_CACHE`, `GPU_UUID`, ... and a tmux server or shell shared with it would otherwise redirect this run (its `FRAME_CACHE` once pointed the builder at the DP 96 px cache directory; the builder now refuses directories holding another format or size). Launch from a dedicated tmux server (`tmux -L b1k-act ...`). A fresh `ACT_RUN_TAG` never touches the original directory or W&B run (`ACT_WANDB_ID` defaults to `actradio-<tag>`); a fresh run also needs its own uploader invocation if its checkpoints should be published. Direct `train_b1k.py` invocations take the same flags (`--frame-cache`, `--matmul-precision high`, `--compile regions-autotune`, `--autocast ...`).
 
 ### Long-run controls
 
