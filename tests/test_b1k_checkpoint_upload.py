@@ -348,6 +348,41 @@ def test_backend_has_finite_timeouts(monkeypatch):
     assert constants.HF_HUB_ENABLE_HF_TRANSFER is False
 
 
+@pytest.mark.parametrize('prefix', ['https://example.invalid/object', '/object'])
+def test_signed_url_and_token_redaction(prefix, monkeypatch):
+    monkeypatch.setenv('HF_TOKEN', 'private-test-token')
+    message = f'SSLError: {prefix}?X-Amz-Credential=key&X-Amz-Signature=signature private-test-token'
+    safe = upload.redact_credentials(message)
+    assert safe == f'SSLError: {prefix}?[REDACTED] [REDACTED]'
+    assert upload.redact_credentials('Authorization: Bearer test-secret') == 'Authorization: Bearer [REDACTED]'
+
+
+def test_logging_filter_redacts_formatted_args_and_traceback():
+    import logging
+    import sys
+    try:
+        raise ConnectionError('/object?X-Amz-Signature=signature')
+    except ConnectionError:
+        record = logging.LogRecord('huggingface_hub.utils._http', logging.WARNING, __file__, 1,
+                                   'retrying %s', ('/object?X-Amz-Signature=signature',), sys.exc_info())
+    assert upload.CredentialFilter().filter(record)
+    text = logging.Formatter().format(record)
+    assert 'signature' not in text and 'ConnectionError' in text and '[REDACTED]' in text
+
+
+def test_cli_retry_redacts_output_and_journal(tmp_path, monkeypatch, capsys):
+    api = FakeApi()
+    def fail():
+        raise ConnectionError('/object?X-Amz-Signature=signature')
+    api.whoami = fail
+    monkeypatch.setattr(upload, 'make_api', lambda *args: api)
+    assert upload.main(['--run-dir', str(tmp_path / 'run'), '--staging-dir', str(tmp_path / 'stage'),
+                        '--repo-id', 'tester/dedicated', '--once']) == 1
+    for text in [capsys.readouterr().out, (tmp_path / 'stage/status.json').read_text(),
+                 (tmp_path / 'stage/state.json').read_text()]:
+        assert 'signature' not in text and '[REDACTED]' in text
+
+
 def test_repo_creation_network_failure_before_creation_retries(tmp_path):
     api = FakeApi()
     original = api.create_repo
