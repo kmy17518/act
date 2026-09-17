@@ -33,6 +33,26 @@ Qualification passed **16 fresh-data optimizer steps at batch 1,560**, then a fu
 
 The 300,000-step trainer was launched on **2026-09-16 at 18:11 UTC** from commit `8deea34` using the new identities above. It is a fresh run, not the qualification checkpoint. The uploader published `resume/step-00000001.pt` to the new private repo; local SHA-256 and remote LFS SHA-256 matched (`2086b50e28638ed67349d88ba0348ea2202d94b5b89df45737820c035c4bb985`). The original checkpoint repo was untouched. A session monitor checks both trainers/uploaders every 30 seconds, and a durable 10-minute health review checks loss, timings and publication status. Training is **in progress**, not complete; no simulator success rate is claimed. Local qualification and monitoring artifacts use `/tmp/dev/audits/act-dp-language-20260916/`. Tmux survives client disconnects, not machine/container termination.
 
+## Controlled short initialization comparison — 2026-09-17
+
+A separate diagnostic uses the full ACT architecture above with **1,000 steps per arm**, physical batch **128**, and seed **0**. Three arms share byte-identical initial parameters/buffers: unconditioned baseline, randomly initialized FiLM, and identity-initialized FiLM (`beta=gamma=0`). Each receives the same minibatch and paired dropout/posterior random draws. Every tenth sorted episode is held out: **180 train / 20 held-out episodes**; exact normalization uses training episodes only. Evaluation uses 128 fixed held-out examples with the inference-time zero latent.
+
+This is intentionally a smaller-batch, single-seed optimization experiment, not directly comparable at equal steps to the stopped batch-1,560 run. Initial full-GPU baseline/identity outputs and losses matched exactly. The harness, CPU tests and full-architecture GPU smoke passed before launch (harness commit `56e6239`).
+
+```bash
+source /tmp/dev/env.sh
+CUDA_VISIBLE_DEVICES=2 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  PYTORCH_ALLOC_CONF=expandable_segments:True WANDB_BASE_URL=https://api.wandb.ai \
+  taskset -c 60-89 .venv/bin/python scripts/b1k/compare_language_init.py \
+  --output-dir /tmp/dev/audits/act-dp-identity-init-20260917/act-1000 \
+  --device cuda:0 --max-steps 1000 --batch-size 128 --num-workers 8 \
+  --eval-samples 128 --eval-batch-size 16 --eval-every 250 \
+  --wandb-mode online --wandb-entity kmy17518 --wandb-project b1k-challenge-2026-act \
+  --wandb-name act-init-20260917 --wandb-group act-init-20260917
+```
+
+Use a new output directory for another experiment; the harness rejects overwrite/resume. W&B runs: baseline [`a10bae591455`](https://wandb.ai/kmy17518/b1k-challenge-2026-act/runs/a10bae591455), random FiLM [`30123523e55f`](https://wandb.ai/kmy17518/b1k-challenge-2026-act/runs/30123523e55f), identity FiLM [`42308356b2b5`](https://wandb.ai/kmy17518/b1k-challenge-2026-act/runs/42308356b2b5). These are finite local diagnostics; there is no HF uploader or recurring monitor. Results will be recorded after verified completion.
+
 ## Original unconditioned run
 
 ## Configuration
