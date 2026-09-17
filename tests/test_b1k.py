@@ -683,6 +683,29 @@ def test_skipping_unused_decoder_layers_is_exact():
             torch.testing.assert_close(value, skipped_state[index][key], atol=0, rtol=0)
 
 
+def test_backbone_autocast_returns_fp32_features_and_matches_fp32_closely():
+    torch.set_num_threads(1)
+    qpos, images = torch.randn(2, 27), torch.rand(2, 3, 3, 32, 32)
+    actions, pad = torch.randn(2, 4, 23), torch.zeros(2, 4, dtype=torch.bool)
+    torch.manual_seed(2)
+    reference = make_policy(small_model_config(), 'cpu')
+    torch.manual_seed(2)
+    policy = make_policy(small_model_config(), 'cpu', backbone_autocast_dtype=torch.bfloat16)
+    assert all(backbone.body_autocast_dtype is None for backbone in reference.model.backbones)
+    assert all(backbone.body_autocast_dtype == torch.bfloat16 for backbone in policy.model.backbones)
+    features, positions = policy.model.backbones[0](images[:, 0])
+    assert features[0].dtype == positions[0].dtype == torch.float32
+    torch.manual_seed(9)
+    expected = reference(qpos, images, actions, pad)
+    torch.manual_seed(9)
+    losses = policy(qpos, images, actions, pad)
+    losses['loss'].backward()
+    assert all(torch.isfinite(p.grad).all() for p in policy.parameters() if p.grad is not None)
+    assert policy.model.backbones[0][0].body.conv1.weight.grad.dtype == torch.float32
+    torch.testing.assert_close(losses['loss'], expected['loss'], rtol=5e-2, atol=0)
+    assert not torch.equal(losses['l1'], expected['l1'])  # reduced-precision body, so not bitwise
+
+
 def test_image_layouts_optimizer_state_layout_and_batch_assembly(tiny_root):
     frames = torch.randint(0, 256, (2, 3, 8, 8, 3), dtype=torch.uint8)
     images = prepare_images(frames)

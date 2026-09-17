@@ -55,14 +55,15 @@ def policy_class(model_config):
 
 
 def make_policy(model_config, device, restoring=False, fused_optimizer=False, skip_unused_decoder_layers=True,
-                attention='auto'):
+                attention='auto', backbone_autocast_dtype=None):
     """Build the upstream policy.
 
-    `fused_optimizer`, `skip_unused_decoder_layers` and `attention` are runtime execution choices, not
-    saved model configuration. ACT consumes only the first stacked decoder output, so with the skip
-    enabled the remaining decoder layers are not executed; predictions and every gradient are unchanged
-    (see `unused_gradients` for the optimizer side). `attention` selects the nn.MultiheadAttention path
-    (`detr.models.transformer.use_fused_attention`).
+    `fused_optimizer`, `skip_unused_decoder_layers`, `attention` and `backbone_autocast_dtype` are runtime
+    execution choices, not saved model configuration. ACT consumes only the first stacked decoder output,
+    so with the skip enabled the remaining decoder layers are not executed; predictions and every
+    gradient are unchanged (see `unused_gradients` for the optimizer side). `attention` selects the
+    nn.MultiheadAttention path (`detr.models.transformer.use_fused_attention`). `backbone_autocast_dtype`
+    runs only the convolutional bodies under autocast and returns fp32 features.
     """
     config = dict(model_config, programmatic=True, device=str(device), fused_optimizer=fused_optimizer)
     if restoring:
@@ -75,6 +76,8 @@ def make_policy(model_config, device, restoring=False, fused_optimizer=False, sk
     for module in policy.modules():
         if hasattr(module, 'attention'):
             module.attention = attention
+    for backbone in policy.model.backbones:
+        backbone.body_autocast_dtype = backbone_autocast_dtype
     return policy
 
 
@@ -421,9 +424,10 @@ def parser():
     p.add_argument('--matmul-precision', choices=['highest', 'high', 'medium'], default='highest',
                    help='torch.set_float32_matmul_precision for fp32 matmuls; "high" enables TF32 tensor cores '
                         '(convolutions already default to TF32 in PyTorch)')
-    p.add_argument('--autocast', choices=['none', 'bf16'], default='none',
-                   help='bf16 autocast for the forward pass on CUDA; weights, optimizer state, output heads, '
-                        'latent distribution and losses stay fp32')
+    p.add_argument('--autocast', choices=['none', 'bf16', 'bf16-backbone'], default='none',
+                   help='bf16 autocast on CUDA for the whole forward pass ("bf16"; weights, optimizer state, output '
+                        'heads, latent distribution and losses stay fp32) or for the ResNet bodies only '
+                        '("bf16-backbone"; fp32 features, transformer and heads)')
     p.add_argument('--channels-last', action=argparse.BooleanOptionalAction, default=True,
                    help='Channels-last (NHWC) memory layout for the convolutional backbone (layout only)')
     p.add_argument('--fused-optimizer', action=argparse.BooleanOptionalAction, default=True,
@@ -553,7 +557,8 @@ def _train(args, output, root, resources):
         torch.backends.cudnn.benchmark = args.cudnn_benchmark
     policy = make_policy(model_config, device, restoring=checkpoint is not None,
                          fused_optimizer=args.fused_optimizer and cuda,
-                         skip_unused_decoder_layers=not args.compute_unused_decoder_layers, attention=args.attention)
+                         skip_unused_decoder_layers=not args.compute_unused_decoder_layers, attention=args.attention,
+                         backbone_autocast_dtype=torch.bfloat16 if args.autocast == 'bf16-backbone' and cuda else None)
     if args.channels_last:
         policy.to(memory_format=torch.channels_last)  # only 4-D (convolution) weights change layout
     optimizer = policy.configure_optimizers()

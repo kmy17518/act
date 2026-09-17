@@ -101,9 +101,17 @@ class Backbone(BackboneBase):
 class Joiner(nn.Sequential):
     def __init__(self, backbone, position_embedding):
         super().__init__(backbone, position_embedding)
+        # Runtime option (not architecture/state): run only the convolutional body under autocast with
+        # this dtype and hand fp32 features to the rest of the network. None keeps the caller's precision.
+        self.body_autocast_dtype = None
 
     def forward(self, tensor_list: NestedTensor):
-        xs = self[0](tensor_list)
+        if self.body_autocast_dtype is None:
+            xs = self[0](tensor_list)
+        else:
+            with torch.autocast(device_type=tensor_list.device.type, dtype=self.body_autocast_dtype):
+                xs = self[0](tensor_list)
+            xs = {name: x.float() for name, x in xs.items()}
         out: List[NestedTensor] = []
         pos = []
         for name, x in xs.items():
