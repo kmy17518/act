@@ -683,6 +683,61 @@ def test_skipping_unused_decoder_layers_is_exact():
             torch.testing.assert_close(value, skipped_state[index][key], atol=0, rtol=0)
 
 
+def test_fast_maxpool_swaps_stem_pooling_and_falls_back_on_cpu():
+    from detr.models.maxpool_nhwc import MaxPool3x3NHWC, replaces
+    torch.manual_seed(1)
+    reference = make_policy(small_model_config(), 'cpu')
+    torch.manual_seed(1)
+    policy = make_policy(small_model_config(), 'cpu', fast_maxpool=True)
+    body = policy.model.backbones[0][0].body
+    assert isinstance(body.maxpool, MaxPool3x3NHWC) and isinstance(reference.model.backbones[0][0].body.maxpool, torch.nn.MaxPool2d)
+    assert list(body.keys()) == list(reference.model.backbones[0][0].body.keys())  # stem order preserved
+    assert list(policy.state_dict()) == list(reference.state_dict())
+    assert replaces(torch.nn.MaxPool2d(3, 2, 1)) and not replaces(torch.nn.MaxPool2d(2, 2)) and not replaces(None)
+    x = torch.randn(2, 5, 9, 8)
+    torch.testing.assert_close(body.maxpool(x), torch.nn.functional.max_pool2d(x, 3, 2, 1), atol=0, rtol=0)
+    qpos, images = torch.rand(2, 27), torch.rand(2, 3, 3, 32, 32)
+    with torch.no_grad():
+        for model in (reference, policy):
+            model.eval()
+        torch.testing.assert_close(policy(qpos, images), reference(qpos, images), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA device required')
+def test_fast_maxpool_kernels_match_aten_bitwise():
+    from detr.models.maxpool_nhwc import MaxPool3x3NHWC, max_pool3x3_nhwc
+    pool = MaxPool3x3NHWC()
+    # The last shape exceeds 2**31 elements (int64 indexing), as the stem output does at a few thousand images.
+    for shape, relu in [((3, 64, 120, 120), True), ((2, 64, 7, 9), True), ((1, 3, 5, 5), False), ((2, 64, 121, 119), False),
+                        ((2340, 64, 120, 120), True)]:
+        x = torch.randn(*shape, device='cuda')
+        if relu:
+            x = torch.relu(x - 0.3)  # exact ties at zero exercise the first-maximum rule
+        x = x.contiguous(memory_format=torch.channels_last).requires_grad_()
+        expected, expected_idx = torch.nn.functional.max_pool2d(x, 3, 2, 1, return_indices=True)
+        actual = pool(x)
+        assert torch.equal(actual, expected) and actual.is_contiguous(memory_format=torch.channels_last)
+        _, taps = max_pool3x3_nhwc(x.detach())
+        oh = torch.arange(expected.shape[-2], device='cuda')[:, None]
+        ow = torch.arange(expected.shape[-1], device='cuda')[None, :]
+        flat = ((oh * 2 - 1)[None, :, :, None] + taps.long() // 3) * shape[-1] + (ow * 2 - 1)[None, :, :, None] + taps.long() % 3
+        assert torch.equal(flat.permute(0, 3, 1, 2), expected_idx)
+        grad = torch.randn_like(expected)
+        expected_grad, = torch.autograd.grad(expected, x, grad)
+        actual_grad, = torch.autograd.grad(actual, x, grad)
+        assert torch.equal(actual_grad, expected_grad)
+    x = torch.randn(1, 64, 8, 8, device='cuda').contiguous(memory_format=torch.channels_last)
+    x[0, 5, 3, 3] = float('nan')
+    actual, expected = pool(x), torch.nn.functional.max_pool2d(x, 3, 2, 1)
+    assert torch.equal(actual.isnan(), expected.isnan()) and torch.equal(actual.nan_to_num(), expected.nan_to_num())
+    # Under torch.compile the op stays opaque and differentiable.
+    x = torch.relu(torch.randn(2, 64, 16, 16, device='cuda')).contiguous(memory_format=torch.channels_last).requires_grad_()
+    compiled = torch.compile(lambda t: pool(t).square().sum())
+    compiled(x).backward()
+    expected_grad, = torch.autograd.grad(torch.nn.functional.max_pool2d(x, 3, 2, 1).square().sum(), x)
+    torch.testing.assert_close(x.grad, expected_grad, atol=0, rtol=0)
+
+
 def test_backbone_autocast_returns_fp32_features_and_matches_fp32_closely():
     torch.set_num_threads(1)
     qpos, images = torch.randn(2, 27), torch.rand(2, 3, 3, 32, 32)

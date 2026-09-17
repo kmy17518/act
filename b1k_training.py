@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 
 from b1k_dataset import B1KDataset, CAMERAS, OBS_KEYS, STATE_INDICES, VIDEO_KEYS, SplitBatchSampler, StepBatchSampler
 from b1k_frame_cache import dequantize_images
+from detr.models.maxpool_nhwc import MaxPool3x3NHWC, replaces
 from detr.models.transformer import use_fused_attention
 from policy import ACTPolicy, CNNMLPPolicy
 
@@ -55,15 +56,16 @@ def policy_class(model_config):
 
 
 def make_policy(model_config, device, restoring=False, fused_optimizer=False, skip_unused_decoder_layers=True,
-                attention='auto', backbone_autocast_dtype=None):
+                attention='auto', backbone_autocast_dtype=None, fast_maxpool=False):
     """Build the upstream policy.
 
-    `fused_optimizer`, `skip_unused_decoder_layers`, `attention` and `backbone_autocast_dtype` are runtime
-    execution choices, not saved model configuration. ACT consumes only the first stacked decoder output,
-    so with the skip enabled the remaining decoder layers are not executed; predictions and every
-    gradient are unchanged (see `unused_gradients` for the optimizer side). `attention` selects the
-    nn.MultiheadAttention path (`detr.models.transformer.use_fused_attention`). `backbone_autocast_dtype`
-    runs only the convolutional bodies under autocast and returns fp32 features.
+    `fused_optimizer`, `skip_unused_decoder_layers`, `attention`, `backbone_autocast_dtype` and
+    `fast_maxpool` are runtime execution choices, not saved model configuration. ACT consumes only the
+    first stacked decoder output, so with the skip enabled the remaining decoder layers are not executed;
+    predictions and every gradient are unchanged (see `unused_gradients` for the optimizer side).
+    `attention` selects the nn.MultiheadAttention path (`detr.models.transformer.use_fused_attention`).
+    `backbone_autocast_dtype` runs only the convolutional bodies under autocast and returns fp32 features.
+    `fast_maxpool` swaps the stateless ResNet stem pooling for the bit-identical channels-last kernels.
     """
     config = dict(model_config, programmatic=True, device=str(device), fused_optimizer=fused_optimizer)
     if restoring:
@@ -78,6 +80,8 @@ def make_policy(model_config, device, restoring=False, fused_optimizer=False, sk
             module.attention = attention
     for backbone in policy.model.backbones:
         backbone.body_autocast_dtype = backbone_autocast_dtype
+        if fast_maxpool and replaces(getattr(backbone[0].body, 'maxpool', None)):
+            backbone[0].body.maxpool = MaxPool3x3NHWC()
     return policy
 
 
@@ -434,6 +438,8 @@ def parser():
                    help='Single-kernel fused AdamW on CUDA (same update rule)')
     p.add_argument('--cudnn-benchmark', action=argparse.BooleanOptionalAction, default=True,
                    help='Let cuDNN autotune convolution algorithms for the fixed batch shape')
+    p.add_argument('--fast-maxpool', action=argparse.BooleanOptionalAction, default=True,
+                   help='Bit-identical channels-last Triton kernels for the ResNet stem max pooling on CUDA')
     p.add_argument('--compile', choices=['none', 'backbone', 'regions', 'default', 'max-autotune-no-cudagraphs'],
                    default='none',
                    help='torch.compile on CUDA: "backbone" compiles the ResNet bodies only (fuses frozen-BN/ReLU/'
@@ -558,7 +564,8 @@ def _train(args, output, root, resources):
     policy = make_policy(model_config, device, restoring=checkpoint is not None,
                          fused_optimizer=args.fused_optimizer and cuda,
                          skip_unused_decoder_layers=not args.compute_unused_decoder_layers, attention=args.attention,
-                         backbone_autocast_dtype=torch.bfloat16 if args.autocast == 'bf16-backbone' and cuda else None)
+                         backbone_autocast_dtype=torch.bfloat16 if args.autocast == 'bf16-backbone' and cuda else None,
+                         fast_maxpool=args.fast_maxpool and cuda)
     if args.channels_last:
         policy.to(memory_format=torch.channels_last)  # only 4-D (convolution) weights change layout
     optimizer = policy.configure_optimizers()
@@ -599,10 +606,11 @@ def _train(args, output, root, resources):
                 else nullcontext)
     copy_stream = torch.cuda.Stream(device) if cuda else None
     LOGGER.info('Training %d -> %d steps on %s with real upstream %s (matmul %s, autocast %s, attention %s, '
-                'channels_last %s, fused optimizer %s, compile %s, frame cache %s, skipped unused decoder parameters %d)',
+                'channels_last %s, fused optimizer %s, fast maxpool %s, compile %s, frame cache %s, '
+                'skipped unused decoder parameters %d)',
                 start, args.max_steps, device, policy_class(model_config), args.matmul_precision, args.autocast,
-                args.attention, args.channels_last, args.fused_optimizer and cuda, args.compile, bool(args.frame_cache),
-                sum(parameter.numel() for parameter, _ in zero_gradients))
+                args.attention, args.channels_last, args.fused_optimizer and cuda, args.fast_maxpool and cuda,
+                args.compile, bool(args.frame_cache), sum(parameter.numel() for parameter, _ in zero_gradients))
     begin = time.monotonic()
     previous_end = begin
     batches = optimizer_batches(loader, args.batch_size, args.loader_batch_size, device=device, stream=copy_stream)

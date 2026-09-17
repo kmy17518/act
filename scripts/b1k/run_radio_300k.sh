@@ -11,6 +11,9 @@ if [[ -n "$(nvidia-smi --id "$CUDA_VISIBLE_DEVICES" --query-compute-apps=pid --f
 fi
 export OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 ARROW_NUM_THREADS=1
 export PYTORCH_ALLOC_CONF=expandable_segments:True
+# Triton builds its kernel launcher with gcc and needs Python.h; the system lacks python3-dev, so use the
+# headers staged under /tmp/dev/sysroots (same convention as the GR00T launch scripts).
+export CPATH=/tmp/dev/sysroots/libpython3.10-dev/usr/include/python3.10:/tmp/dev/sysroots/libpython3.10-dev/usr/include${CPATH:+:$CPATH}
 export WANDB_BASE_URL=https://api.wandb.ai WANDB_MODE=online
 DATASET=/tmp/dev/datasets/2026-challenge-demos
 CACHE=/tmp/dev/datasets/2026-challenge-demos-act-frame-cache-240x240

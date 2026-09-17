@@ -21,7 +21,8 @@ The run was paused at step 10,777 (`latest.pt` = step 10,000) to speed up the tr
 | + frame cache, GPU batch assembly, channels-last, fused AdamW (fp32) | 1.47 s | — | 236 GiB |
 | + TF32 matmuls | 0.60 s | 0.93 s | 236 GiB |
 | + unused decoder layers skipped (bitwise identical) | 0.41 s | 0.65 s | 187 GiB |
-| + `--compile regions` (**current recipe**) | **0.32 s** | **0.48 s** (3,220 samples/s) | 162 GiB |
+| + `--compile regions` | 0.32 s | 0.48 s | 162 GiB |
+| + bit-identical channels-last max-pool kernels (**current recipe**) | **0.31 s** | **0.47 s** (3,300 samples/s) | 150 GiB |
 | opt-in `--autocast bf16-backbone` on top (bf16 only inside the ResNet bodies) | 0.28 s | 0.42 s | 139 GiB |
 | opt-in `--autocast bf16` instead of TF32 (not used: shifts L1 by +0.6–1.0 %) | 0.29 s | 0.44 s | 104 GiB |
 
