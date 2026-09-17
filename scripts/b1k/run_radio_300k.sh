@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Workspace launch recipe: one GPU, 30 CPU cores, fp32 weights/optimizer with TF32 matmuls, uint8
-# resized-frame cache, and resumable logging.
+# resized-frame cache, torch.compile'd backbone/transformer regions, and resumable logging.
 set -euo pipefail
 source /tmp/dev/env.sh
 cd /tmp/dev/baselines/act
@@ -35,7 +35,7 @@ taskset -c 60-89 .venv/bin/python -u scripts/b1k/train_b1k.py \
     --kl-weight 10 --lr 1e-5 --lr-backbone 1e-5 --weight-decay 1e-4 \
     --batch-size 1560 --loader-batch-size 128 --num-workers 8 --prefetch-factor 2 \
     --torch-threads 2 --worker-threads 1 --arrow-threads 1 --opencv-threads 1 --device cuda \
-    --matmul-precision high \
+    --matmul-precision high --compile regions \
     --save-every 2500 --save-first-step --save-total-limit 3 --export-every 10000 \
     --wandb-mode online --wandb-entity kmy17518 --wandb-project b1k-challenge-2026-act \
     --wandb-name turning-on-radio-act-bs1560-300k --wandb-id actradio16 \

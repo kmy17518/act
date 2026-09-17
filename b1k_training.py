@@ -85,7 +85,7 @@ def unused_gradients(policy):
     its decoupled weight decay to them. Assigning the same zeros after each backward keeps every
     parameter and optimizer-state trajectory identical while their forward/backward work is skipped.
     """
-    parameters = getattr(policy.model, 'unused_parameters', list)()
+    parameters = getattr(getattr(policy, 'model', None), 'unused_parameters', list)()
     return [(parameter, torch.zeros_like(parameter)) for parameter in parameters]
 
 
@@ -241,8 +241,25 @@ def optimizer_batches(loader, batch_size, loader_batch_size, device=None, stream
 
 
 def compile_policy(policy, mode):
-    """torch.compile the network forward in place; parameters, state_dict keys and the optimizer are untouched."""
-    policy.model.forward = torch.compile(policy.model.forward, mode=mode)
+    """torch.compile forward passes in place; parameters, state_dict keys and the optimizer are untouched.
+
+    'backbone' compiles each ResNet body (convolutions stay cuDNN calls; Inductor fuses the frozen
+    batch-norm affine, ReLU, residual and pooling elementwise work). 'regions' additionally compiles
+    the ACT style encoder and transformer as separate graphs with Inductor's pattern matcher off, so
+    the explicit TF32 attention is kept instead of being rewritten into the fp32-only fused kernel.
+    Other modes compile the whole network forward.
+    """
+    if mode in ('backbone', 'regions'):
+        for backbone in policy.model.backbones:
+            body = backbone[0]
+            body.forward = torch.compile(body.forward)
+        if mode == 'regions':
+            import torch._inductor.config as inductor_config
+            inductor_config.pattern_matcher = False
+            for module in (policy.model.encoder, policy.model.transformer):
+                module.forward = torch.compile(module.forward)
+    else:
+        policy.model.forward = torch.compile(policy.model.forward, mode=mode)
     return policy
 
 
@@ -413,8 +430,11 @@ def parser():
                    help='Single-kernel fused AdamW on CUDA (same update rule)')
     p.add_argument('--cudnn-benchmark', action=argparse.BooleanOptionalAction, default=True,
                    help='Let cuDNN autotune convolution algorithms for the fixed batch shape')
-    p.add_argument('--compile', choices=['none', 'default', 'max-autotune-no-cudagraphs'], default='none',
-                   help='torch.compile the policy network (CUDA only)')
+    p.add_argument('--compile', choices=['none', 'backbone', 'regions', 'default', 'max-autotune-no-cudagraphs'],
+                   default='none',
+                   help='torch.compile on CUDA: "backbone" compiles the ResNet bodies only (fuses frozen-BN/ReLU/'
+                        'residual elementwise work around cuDNN convolutions), "regions" also compiles the ACT '
+                        'encoder/transformer separately; other modes compile the whole network')
     p.add_argument('--compute-unused-decoder-layers', action='store_true',
                    help='Also run the ACT decoder layers whose outputs are discarded (upstream behavior); '
                         'by default they are skipped and receive the same exactly-zero gradients')
