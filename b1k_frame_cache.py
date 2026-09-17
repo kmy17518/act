@@ -252,11 +252,30 @@ def selected_videos(dataset):
     return sorted({dataset.video_path(ep, key) for ep in dataset.episodes for key in VIDEO_KEYS})
 
 
+def reject_foreign_cache(cache_root, image_size):
+    """Refuse to build into a directory holding another tool's or another image size's cache.
+
+    Entries share the `<video>.frames.npy` naming across baselines, so building here would silently
+    overwrite them; a stale-looking manifest of a different format or size is a wrong directory,
+    not an entry to rebuild.
+    """
+    for manifest_path in Path(cache_root).glob('videos/*/*/*.json'):
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, ValueError):
+            continue
+        if manifest.get('format') != FORMAT or manifest.get('image_size') != list(image_size):
+            raise ValueError(f'{cache_root} already holds a frame cache of format {manifest.get("format")!r} at image '
+                             f'size {manifest.get("image_size")!r} (e.g. {manifest_path.name}); this cache is '
+                             f'{FORMAT!r} at {list(image_size)}. Use a separate --cache-dir.')
+
+
 def build_frame_cache(dataset, cache_root, workers=None, cpu_budget=None, log=LOGGER.info):
     """Build missing/stale entries for every selected video; returns the list of selected videos."""
     cache_root = Path(cache_root).resolve()
     if cache_root == dataset.root or dataset.root in cache_root.parents:
         raise ValueError('The frame cache must not live inside the read-only dataset tree')
+    reject_foreign_cache(cache_root, dataset.image_size)
     videos = selected_videos(dataset)
     pending = [path for path in videos
                if not entry_is_valid(cache_stem(cache_root, dataset.root, path), path, dataset.image_size)]

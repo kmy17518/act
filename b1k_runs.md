@@ -45,25 +45,25 @@ Detailed probe and live verification artifacts are outside git at `/tmp/dev/audi
 
 ## Detached processes
 
-Dedicated tmux server socket name: **`b1k-act-dp`**.
+Dedicated tmux server socket name: **`b1k-act`** (the original 2026-09-16 launches used `b1k-act-dp`, now shared with a DP run whose global environment must not leak into ACT launches).
 
 ```bash
 source /tmp/dev/env.sh
-tmux -L b1k-act-dp list-sessions
-tmux -L b1k-act-dp attach -t act-radio-train
-tmux -L b1k-act-dp attach -t act-radio-upload
+tmux -L b1k-act list-sessions
+tmux -L b1k-act attach -t act-radio-train
+tmux -L b1k-act attach -t act-radio-upload
 ```
 
 Launch recipes (run in separate tmux sessions, trainer first):
 
 ```bash
-tmux -L b1k-act-dp new-session -d -s act-radio-train \
+tmux -L b1k-act new-session -d -s act-radio-train \
   'bash /tmp/dev/baselines/act/scripts/b1k/run_radio_300k.sh'
-tmux -L b1k-act-dp new-session -d -s act-radio-upload \
+tmux -L b1k-act new-session -d -s act-radio-upload \
   'bash /tmp/dev/baselines/act/scripts/b1k/upload_radio_300k.sh'
 ```
 
-The training recipe automatically resumes `latest.pt` if present. It first (re)builds and spot-checks the frame cache (a no-op once complete, ~8 minutes from scratch) and the first step after a restart includes a few minutes of `torch.compile` time (cached on disk under `/tmp/.cache/torchinductor` afterwards). Its header documents the overrides: `BATCH_SIZE`, `RUN_TAG` (any tag other than `20260916` starts a fresh run directory/log/W&B run instead of resuming this one), `AUTOCAST` (`none` = the TF32 recipe; `bf16-backbone` and `bf16` are the faster, measured, non-default variants), `COMPILE_MODE`, `GPU_UUID`, `CORES`, `FRAME_CACHE`, `WANDB_ID`. Environment: `scripts/b1k/setup_venv.sh` recreates `.venv` from `requirements-b1k.lock.txt` and stages Triton's Python headers. Before deliberately restarting an exited job, inspect and archive its `.exit` file; never start a second trainer/uploader for the same run. GPU occupancy checks and file locks reject overlapping jobs. Tmux survives the Grok session ending, but not a machine/container termination.
+The training recipe automatically resumes `latest.pt` if present. It first (re)builds and spot-checks the frame cache (a no-op once complete, ~8 minutes from scratch) and the first step after a restart includes a few minutes of `torch.compile` time (cached on disk under `/tmp/.cache/torchinductor` afterwards). Its header documents the overrides, all prefixed `ACT_` so a tmux server shared with the Diffusion Policy recipe cannot redirect the run: `ACT_BATCH_SIZE`, `ACT_RUN_TAG` (any tag other than `20260916` starts a fresh run directory/log/W&B run instead of resuming this one), `ACT_AUTOCAST` (`none` = the TF32 recipe; `bf16-backbone` and `bf16` are the faster, measured, non-default variants), `ACT_COMPILE_MODE`, `ACT_GPU_UUID`, `ACT_CORES`, `ACT_FRAME_CACHE`, `ACT_WANDB_ID`. Use the dedicated tmux server `b1k-act` (not the `b1k-act-dp` server the DP recipe launched with its own environment). Environment: `scripts/b1k/setup_venv.sh` recreates `.venv` from `requirements-b1k.lock.txt` and stages Triton's Python headers. Before deliberately restarting an exited job, inspect and archive its `.exit` file; never start a second trainer/uploader for the same run. GPU occupancy checks and file locks reject overlapping jobs. Tmux survives the Grok session ending, but not a machine/container termination.
 
 ## Checkpoints and cloud destinations
 
