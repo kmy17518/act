@@ -55,6 +55,8 @@ Use a new output directory for another experiment; the harness rejects overwrite
 
 **Completed all 1,000 steps in about 19.6 minutes; all three final checkpoints and finished W&B runs verified.** Steps 901–1,000 mean training L1: baseline **0.229200**, random FiLM **0.227419** (-0.78%), identity FiLM **0.229427** (+0.10%). Step-1,000 held-out zero-latent inference L1: baseline **0.190817**, random FiLM **0.176195** (-7.66%), identity FiLM **0.189424** (-0.73%). Lower is better. Identity initialization did not improve final training L1 in this diagnostic; random FiLM's early penalty reversed. This weakens, but does not conclusively reject, random FiLM initialization as the explanation for the original large-batch gap. The diagnostic changed batch and train/held-out split and has only one seed; no simulator success or long-run convergence conclusion is established.
 
+For the user's subsequent **one-hour limit**, the primary paired ACT/DP comparison uses the common completed **step500** endpoint. ACT steps401–500 training L1: baseline **0.265343**, random FiLM **0.254325** (-4.15%), identity FiLM **0.264750** (-0.22%). Held-out zero-latent inference L1 at step500: **0.216195 / 0.190886 / 0.211755**, respectively. Random FiLM improves held-out L1 by11.71% and identity by2.05% versus baseline. The completed ACT1000 results above are supplemental; all training/monitoring is stopped. Saved analysis: `/tmp/dev/audits/act-dp-identity-init-20260917/comparison-results.{json,md}` and `comparison-curves.png`.
+
 ## Original unconditioned run
 
 ## Configuration
