@@ -14,6 +14,12 @@ Python 3.10 is verified. Keep environments and caches local; no simulator, LeRob
 ```bash
 source /tmp/dev/env.sh
 cd /tmp/dev/baselines/act
+scripts/b1k/setup_venv.sh          # exact environment from requirements-b1k.lock.txt (about 25 s with a warm uv cache)
+```
+
+`setup_venv.sh` creates `.venv` from `requirements-b1k.lock.txt`, the `uv pip freeze` of the verified environment (CPython 3.10, aarch64, torch 2.10.0+cu130, torchvision 0.25.0+cu130, triton 3.6.0, every transitive pin), prints an import/CUDA check, and then makes sure Triton can build its gcc launcher: if `sysconfig` reports no `Python.h` (this host has no `python3-dev`, and `/usr` is read-only for us) it downloads the matching Ubuntu `libpython3.X-dev` package and extracts it under `/tmp/dev/sysroots`, printing the `CPATH` export that `run_radio_300k.sh` already applies. It is idempotent (`--allow-existing`), writes nothing outside `/tmp`, and honours `PYTHON`, `TORCH_INDEX`, `SYSROOT`. Re-running it after the 2026-09-17 host move reproduced the environment and the GPU tests from a clean checkout. On another platform or CUDA version use `LOCK=0 scripts/b1k/setup_venv.sh`, which installs the pinned torch/torchvision pair from `TORCH_INDEX` and the looser `requirements-b1k.txt`; the equivalent manual steps are:
+
+```bash
 uv venv --python /usr/bin/python3.10 .venv
 uv pip install --python .venv/bin/python torch==2.10.0 torchvision==0.25.0 \
   --index-url https://download.pytorch.org/whl/cu130
@@ -115,6 +121,18 @@ All of the following keep fp32 weights, fp32 optimizer state, the upstream loss,
 | `--autocast bf16` | off | bf16 forward for the backbone/transformer with fp32 output heads, latent distribution and losses; fastest (batch 1024 0.29 s/step, batch 1560 0.44 s/step before compile) | **not numerically neutral**: rel Δloss 1e-4 on one batch, and resumed step-10000 L1 is systematically +0.6–1.0 % (+0.77 % over 300 steps) with a 20–50 % larger gradient norm; kept opt-in, not used by the radio recipe |
 
 `timing/data_wait_s` is the host time blocked fetching a step's batch (overlapped with the previous step's compute after step 1); `timing/train_s` covers launch, compute and that overlap. In cache mode `data/video_decode_s` is 0 and `data/frame_cache_s` reports the memcpy time per sample.
+
+**Launching.** `scripts/b1k/run_radio_300k.sh` is the complete recipe (cache build/verify, GPU occupancy check, resume, W&B, exit-status file) with the fastest numerically neutral settings as defaults; its header documents every override. Examples:
+
+```bash
+bash scripts/b1k/run_radio_300k.sh                                   # resume the original run (batch 1560, TF32)
+BATCH_SIZE=1024 RUN_TAG=bs1024 bash scripts/b1k/run_radio_300k.sh    # fresh run at batch 1024, own directory/log/W&B run
+AUTOCAST=bf16-backbone RUN_TAG=bf16bb bash scripts/b1k/run_radio_300k.sh   # fastest option with a small measured deviation
+AUTOCAST=bf16 RUN_TAG=bf16 bash scripts/b1k/run_radio_300k.sh        # fastest, not numerically neutral (see table)
+COMPILE_MODE=none bash scripts/b1k/run_radio_300k.sh                 # eager kernels (0.41 / 0.65 s/step), no compile time
+```
+
+A fresh `RUN_TAG` never touches the original directory or W&B run (`WANDB_ID` defaults to `actradio-<tag>`); a fresh run also needs its own uploader invocation if its checkpoints should be published. Direct `train_b1k.py` invocations take the same flags (`--frame-cache`, `--matmul-precision high`, `--compile regions-autotune`, `--autocast ...`).
 
 ### Long-run controls
 
