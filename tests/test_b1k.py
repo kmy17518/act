@@ -565,6 +565,44 @@ def test_frame_cache_training_matches_uninterrupted_and_records_provenance(tiny_
     assert first['loss'] == pytest.approx(records[0]['loss'], rel=1e-2)
 
 
+def test_resume_accepts_resynced_files_but_not_changed_data(tiny_root, tmp_path):
+    import os
+    common = ['--dataset-path', str(tiny_root), '--batch-size', '2', '--num-workers', '0', '--device', 'cpu',
+              '--chunk-size', '4', '--image-size', '32', '32', '--hidden-dim', '32', '--dim-feedforward', '64',
+              '--enc-layers', '1', '--dec-layers', '1', '--nheads', '4', '--no-pretrained-backbone', '--save-every', '1']
+    full = tmp_path / 'full'
+    train(parser().parse_args(common + ['--output-dir', str(full), '--max-steps', '3']))
+    split = tmp_path / 'split'
+    train(parser().parse_args(common + ['--output-dir', str(split), '--max-steps', '2']))
+    checkpoint = load_checkpoint(split / 'step_00000002.pt')
+    old_fingerprint = checkpoint['normalization']['fingerprint']
+    data = tiny_root / 'data/chunk-042/file-000.parquet'
+    os.utime(data, ns=(data.stat().st_atime_ns, data.stat().st_mtime_ns + 10 ** 9))  # re-synced copy: new mtime
+    assert B1KDataset(tiny_root, chunk_size=4).fingerprint() != old_fingerprint
+    resumed_path = train(parser().parse_args(common + ['--output-dir', str(split), '--max-steps', '3',
+                                                       '--resume', str(split / 'step_00000002.pt')]))
+    resumed, expected = load_checkpoint(resumed_path), load_checkpoint(full / 'step_00000003.pt')
+    for key in expected['model']:
+        torch.testing.assert_close(expected['model'][key], resumed['model'][key], atol=0, rtol=0)
+    assert resumed['normalization']['fingerprint'] == B1KDataset(tiny_root, chunk_size=4).fingerprint() != old_fingerprint
+    for key in ('qpos_mean', 'qpos_std', 'action_mean', 'action_std', 'count'):
+        assert resumed['normalization'][key] == checkpoint['normalization'][key]
+    # Genuinely different data (one action value) is still refused.
+    rows = pq.read_table(data).to_pylist()
+    rows[3]['action'][5] += 1.0
+    pq.write_table(pa.Table.from_pylist(rows), data)
+    with pytest.raises(ValueError, match='differ from checkpoint'):
+        train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'changed'), '--max-steps', '4',
+                                           '--resume', str(resumed_path)]))
+    # Approximate smoke statistics cannot be verified and are refused when the fingerprint changed.
+    smoke = tmp_path / 'smoke'
+    train(parser().parse_args(common + ['--output-dir', str(smoke), '--max-steps', '1', '--stats-max-frames', '2']))
+    os.utime(data, ns=(data.stat().st_atime_ns, data.stat().st_mtime_ns + 10 ** 9))
+    with pytest.raises(ValueError, match='differ from checkpoint'):
+        train(parser().parse_args(common + ['--output-dir', str(smoke), '--max-steps', '2', '--stats-max-frames', '2',
+                                           '--resume', str(smoke / 'step_00000001.pt')]))
+
+
 def test_fused_attention_matches_explicit_attention_weights_path():
     from detr.models.transformer import use_fused_attention
     torch.set_num_threads(1)
@@ -824,8 +862,8 @@ def test_device_batch_assembly_on_side_stream_matches_host(tiny_root, tmp_path):
             upcoming = next(batches, None)  # prefetched while the previous batch is consumed
             images, qpos, actions, is_pad, timings = consume_batch(batch, stream, channels_last=True)
             assert images.device.type == 'cuda' and images[:, 0].is_contiguous(memory_format=torch.channels_last)
-            # uint8 / 255 may round differently by one ulp between the CUDA and CPU kernels
-            torch.testing.assert_close(images.cpu(), prepare_images(expected[0]), atol=1e-7, rtol=0)
+            # true division by a 0-dim tensor: bit-identical to the CPU uint8 / 255 path
+            torch.testing.assert_close(images.cpu(), prepare_images(expected[0]), atol=0, rtol=0)
             for tensor, other in zip((qpos, actions, is_pad), expected[1:4]):
                 torch.testing.assert_close(tensor.cpu(), other, atol=0, rtol=0)
             assert timings['data/sample_s'].shape == expected[4]['data/sample_s'].shape and timings['data/sample_s'].min() > 0

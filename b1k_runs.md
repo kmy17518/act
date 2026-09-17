@@ -8,7 +8,7 @@
 - Three RGB cameras at 240x240; R1Pro state plus one task category; 23-D actions.
 - FP32 weights and AdamW state (fused CUDA AdamW), learning rate and backbone learning rate `1e-5`, weight decay `1e-4`; TF32 tensor-core matmuls (`--matmul-precision high`), no autocast.
 - Physical batch **1,560**, no gradient accumulation. Loader slices of 128 are reassembled in original order on the GPU before one optimizer update.
-- GPU 2 (`GPU-aa99f910-8e39-d04c-a717-a6f7a06f52e8`), CPU affinity **60-89**. Since 2026-09-17: uint8 resized-frame cache (`--frame-cache`), 8 data workers, prefetch factor 2, `--compile regions`; through step 10,777 the run used native per-sample video decoding with 24 workers and prefetch factor 1.
+- GPU 2, CPU affinity **60-89**. Since 2026-09-17: uint8 resized-frame cache (`--frame-cache`), 8 data workers, prefetch factor 2, `--compile regions-autotune`, bit-identical channels-last stem pooling; through step 10,777 the run used native per-sample video decoding with 24 workers and prefetch factor 1. The host was re-provisioned later on 2026-09-17 (new GPU UUIDs; the recipe defaults to the new GPU 2, `GPU-10567c56-9603-b2aa-1ce1-63234ee50192`, and accepts `GPU_UUID=`). The local run directory, `.venv`, frame cache and staged headers were lost in that move; the step-10000 full checkpoint was restored from the Hugging Face `resume/` path into `outputs/turning-on-radio-act-bs1560-300k-20260916/` (`latest.pt` -> `step_00010000.pt`), the dataset was re-synced (same bytes, new mtimes: the trainer now verifies exact statistics instead of refusing the changed fingerprint), and the cache was rebuilt.
 - `PYTORCH_ALLOC_CONF=expandable_segments:True` avoids allocator fragmentation at this near-capacity batch.
 
 ## Throughput (2026-09-17)
@@ -22,13 +22,14 @@ The run was paused at step 10,777 (`latest.pt` = step 10,000) to speed up the tr
 | + TF32 matmuls | 0.60 s | 0.93 s | 236 GiB |
 | + unused decoder layers skipped (bitwise identical) | 0.41 s | 0.65 s | 187 GiB |
 | + `--compile regions` | 0.32 s | 0.48 s | 162 GiB |
-| + bit-identical channels-last max-pool kernels (**current recipe**) | **0.31 s** | **0.47 s** (3,300 samples/s) | 150 GiB |
+| + bit-identical channels-last max-pool kernels | 0.31 s | 0.47 s | 150 GiB |
+| + `--compile regions-autotune` (GEMM/convolution kernel autotuning; **current recipe**) | **0.30 s** | **0.45 s** (3,500 samples/s) | 150 GiB |
 | opt-in `--autocast bf16-backbone` on top (bf16 only inside the ResNet bodies) | 0.28 s | 0.42 s | 139 GiB |
 | opt-in `--autocast bf16` instead of TF32 (not used: shifts L1 by +0.6–1.0 %) | 0.29 s | 0.44 s | 104 GiB |
 
 Loader wait is below 10 ms per step in every cached configuration. Validation: cached frames are byte-identical to native decoding (1,536 of 1,536 sampled frames) up to the documented half-LSB rounding of the resize; skipping the discarded decoder layers gives bitwise-identical predictions, gradients and optimizer trajectories; the step-10000 checkpoint resumed through the new pipeline reproduces the original run's per-step L1 within ±0.3 % (the dropout-RNG noise floor, identical to what the untouched native path shows) under fp32 and TF32; a 150-step batch-1560 run with saves/exports and a resume from its step-100 checkpoint reproduced the uninterrupted losses exactly. Over 300 resumed steps from step 10000, the mean per-step L1 deviation from the original run is +0.040 % (TF32 eager), +0.046 % (TF32 + `--compile regions`), +0.082 % (`--autocast bf16-backbone`) and +0.77 % (full `--autocast bf16`), with KL and gradient norms indistinguishable except under full bf16 (+25 % gradient norm). Details: `/tmp/dev/audits/act-speed-20260917/` (benchmarks, `numerics-b256.json`, resume comparisons).
 
-At 0.48 s/step the remaining 289,223 steps take about 39 hours instead of roughly 12 days.
+At 0.45 s/step the remaining 289,223 steps take about 36 hours instead of roughly 12 days. Compiling for a new shape set costs about three minutes once (Inductor caches under `/tmp/.cache/torchinductor`).
 
 The node has a 130-CPU quota. Two other runs were budgeted 30 cores each; ACT and DP each get 30, while uploaders use cores 120-123. These are process-affinity limits, not an exclusive system reservation of CPUs.
 
