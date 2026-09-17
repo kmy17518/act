@@ -51,7 +51,9 @@ CUDA_VISIBLE_DEVICES=2 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=
   --wandb-name act-init-20260917 --wandb-group act-init-20260917
 ```
 
-Use a new output directory for another experiment; the harness rejects overwrite/resume. W&B runs: baseline [`a10bae591455`](https://wandb.ai/kmy17518/b1k-challenge-2026-act/runs/a10bae591455), random FiLM [`30123523e55f`](https://wandb.ai/kmy17518/b1k-challenge-2026-act/runs/30123523e55f), identity FiLM [`42308356b2b5`](https://wandb.ai/kmy17518/b1k-challenge-2026-act/runs/42308356b2b5). These are finite local diagnostics; there is no HF uploader or recurring monitor. Results will be recorded after verified completion.
+Use a new output directory for another experiment; the harness rejects overwrite/resume. W&B runs: baseline [`a10bae591455`](https://wandb.ai/kmy17518/b1k-challenge-2026-act/runs/a10bae591455), random FiLM [`30123523e55f`](https://wandb.ai/kmy17518/b1k-challenge-2026-act/runs/30123523e55f), identity FiLM [`42308356b2b5`](https://wandb.ai/kmy17518/b1k-challenge-2026-act/runs/42308356b2b5). These are finite local diagnostics; there is no HF uploader or recurring monitor.
+
+**Completed all 1,000 steps in about 19.6 minutes; all three final checkpoints and finished W&B runs verified.** Steps 901–1,000 mean training L1: baseline **0.229200**, random FiLM **0.227419** (-0.78%), identity FiLM **0.229427** (+0.10%). Step-1,000 held-out zero-latent inference L1: baseline **0.190817**, random FiLM **0.176195** (-7.66%), identity FiLM **0.189424** (-0.73%). Lower is better. Identity initialization did not improve final training L1 in this diagnostic; random FiLM's early penalty reversed. This weakens, but does not conclusively reject, random FiLM initialization as the explanation for the original large-batch gap. The diagnostic changed batch and train/held-out split and has only one seed; no simulator success or long-run convergence conclusion is established.
 
 ## Original unconditioned run
 
