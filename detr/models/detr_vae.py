@@ -34,7 +34,7 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
     def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, action_dim=None,
-                 mt_act_language_dim=None):
+                 mt_act_language_dim=None, camera_batch=False):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -49,10 +49,16 @@ class DETRVAE(nn.Module):
                 the transformer encoder as a third extra token next to the latent and proprioception tokens.
                 Its CVAE style encoder sees [CLS, actions] only (no proprioception token), and `qpos` beyond the
                 first `state_dim` entries (the adapter's one-hot task category) is ignored.
+            camera_batch: run the shared backbone once over the images of all cameras (camera-major batch) instead
+                of once per camera. Per-sample layers give the same result either way; trainable BatchNorm then
+                computes its batch statistics over all cameras jointly, which is what its running statistics
+                describe at evaluation time (per-camera passes normalize each camera by its own statistics, which
+                eval mode cannot reproduce).
         """
         super().__init__()
         self.num_queries = num_queries
         self.camera_names = camera_names
+        self.camera_batch = camera_batch
         self.transformer = transformer
         self.encoder = encoder
         # forward() consumes only the first stacked decoder output (`hs[0]`), so the remaining decoder
@@ -152,19 +158,32 @@ class DETRVAE(nn.Module):
 
         if self.backbones is not None:
             # Image observation features and position embeddings
-            all_cam_features = []
-            all_cam_pos = []
-            for cam_id, cam_name in enumerate(self.camera_names):
-                features, pos = self.backbones[0](image[:, cam_id], lang_emb=lang_emb) # HARDCODED
-                features = features[0] # take the last layer feature
+            ncam = len(self.camera_names)
+            if self.camera_batch:
+                # One backbone pass over every camera: (bs, ncam, 3, H, W) -> (ncam * bs, 3, H, W), camera-major so
+                # each camera's slice stays the dense block the loader produced.
+                flat = image[:, :ncam].transpose(0, 1).reshape(ncam * bs, *image.shape[2:])
+                features, pos = self.backbones[0](flat, lang_emb=None if lang_emb is None else lang_emb.repeat(ncam, 1))
+                features = self.input_proj(features[0]) # (ncam * bs, hidden, h, w)
+                # fold camera dimension into width dimension, in camera order (same layout as the per-camera cat)
+                src = features.view(ncam, bs, *features.shape[1:]).permute(1, 2, 3, 0, 4).reshape(
+                    bs, features.shape[1], features.shape[2], ncam * features.shape[3])
                 pos = pos[0]
-                all_cam_features.append(self.input_proj(features))
-                all_cam_pos.append(pos)
+                pos = torch.cat([pos if pos.shape[0] == 1 else pos[:bs]] * ncam, axis=3)
+            else:
+                all_cam_features = []
+                all_cam_pos = []
+                for cam_id, cam_name in enumerate(self.camera_names):
+                    features, pos = self.backbones[0](image[:, cam_id], lang_emb=lang_emb) # HARDCODED
+                    features = features[0] # take the last layer feature
+                    pos = pos[0]
+                    all_cam_features.append(self.input_proj(features))
+                    all_cam_pos.append(pos)
+                # fold camera dimension into width dimension
+                src = torch.cat(all_cam_features, axis=3)
+                pos = torch.cat(all_cam_pos, axis=3)
             # proprioception features
             proprio_input = self.input_proj_robot_state(qpos)
-            # fold camera dimension into width dimension
-            src = torch.cat(all_cam_features, axis=3)
-            pos = torch.cat(all_cam_pos, axis=3)
             hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight,
                                   decoder_layers=self.decoder_layers_used, task_emb=task_emb)[0]
         else:
@@ -310,6 +329,7 @@ def build(args):
         num_queries=args.num_queries,
         camera_names=args.camera_names,
         mt_act_language_dim=getattr(args, 'language_dim', 768) if mt_act else None,
+        camera_batch=bool(getattr(args, 'camera_batch', False)),
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)

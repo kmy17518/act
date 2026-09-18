@@ -415,6 +415,13 @@ class LanguageOption(argparse.Action):
         setattr(namespace, f'_{self.dest}_explicit', True)
 
 
+class ExplicitBooleanOption(argparse.BooleanOptionalAction):
+    """--flag/--no-flag that also records whether it was given (saved model options adopted on resume)."""
+    def __call__(self, parser, namespace, values, option_string=None):
+        super().__call__(parser, namespace, values, option_string)
+        setattr(namespace, f'_{self.dest}_explicit', True)
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--dataset-path', '--dataset-root', dest='dataset_path', required=True)
@@ -445,6 +452,11 @@ def parser():
                    help='ResNet normalization: frozen ImageNet BatchNorm statistics (upstream ACT) or trainable '
                         'BatchNorm2d with batch statistics (MT-ACT trains its ResNet from scratch this way; combine '
                         'with --no-pretrained-backbone for the faithful reproduction)')
+    p.add_argument('--backbone-camera-batch', dest='camera_batch', action=ExplicitBooleanOption, default=False,
+                   help='Run the shared ResNet once over the images of all cameras instead of once per camera. '
+                        'Same result for per-sample layers; with --backbone-norm batch the BatchNorm statistics are '
+                        'then shared across cameras in training, matching the running statistics used when serving '
+                        '(saved model configuration)')
     p.add_argument('--film-init', choices=['random', 'identity'], default='random', action=LanguageOption,
                    help='clip_film projection initialization: nn.Linear default ("random") or zeros so every FiLM '
                         'layer starts as the identity ("identity"); saved in the checkpoint model configuration')
@@ -550,7 +562,7 @@ def _train(args, output, root, resources):
         model_config = dict(checkpoint['model_config'])
         model_config.setdefault('policy_class', 'ACT')
         for key, default in [('language_conditioning', 'none'), ('prompt_source', 'task_name'), ('film_init', 'random'),
-                             ('language_encoder', 'clip'), ('backbone_norm', 'frozen')]:
+                             ('language_encoder', 'clip'), ('backbone_norm', 'frozen'), ('camera_batch', False)]:
             saved_value = model_config.get(key, default)
             if getattr(args, f'_{key}_explicit', False) and getattr(args, key) != saved_value:
                 raise ValueError(f'--{key.replace("_", "-")} differs from checkpoint')
@@ -561,6 +573,8 @@ def _train(args, output, root, resources):
         image_size = args.image_size or ([240, 240] if args.policy_class == 'ACT' else [480, 640])
         if args.policy_class == 'CNNMLP' and (args.pre_norm or args.position_embedding != 'sine'):
             raise ValueError('Position embeddings and pre-norm are ACT architecture options; CNNMLP does not use them')
+        if args.policy_class == 'CNNMLP' and args.camera_batch:
+            raise ValueError('--backbone-camera-batch applies to the shared ACT backbone; CNNMLP has one per camera')
         if min(image_size) < 1:
             raise ValueError('--image-size dimensions must be positive')
         if args.policy_class == 'CNNMLP' and min(image_size) < 385:
@@ -581,7 +595,7 @@ def _train(args, output, root, resources):
                         'pretrained_backbone': args.pretrained_backbone, 'camera_names': CAMERAS,
                         'position_embedding': args.position_embedding, 'pre_norm': args.pre_norm,
                         'language_conditioning': args.language_conditioning, 'prompt_source': args.prompt_source,
-                        'backbone_norm': args.backbone_norm,
+                        'backbone_norm': args.backbone_norm, 'camera_batch': args.camera_batch,
                         'dilation': False, 'masks': False, 'action_dim': 23}
         if args.language_conditioning != 'none':
             model_config['film_init'] = args.film_init
@@ -693,14 +707,15 @@ def _train(args, output, root, resources):
     LOGGER.info('Training %d -> %d steps on %s with real upstream %s (matmul %s, autocast %s, attention %s, '
                 'channels_last %s, fused optimizer %s, fast maxpool %s, compile %s, frame cache %s, '
                 'skipped unused decoder parameters %d, language %s/%s/%s, film init %s, film recompute %s, '
-                'backbone norm %s, pretrained backbone %s)',
+                'backbone norm %s, pretrained backbone %s, camera batch %s)',
                 start, args.max_steps, device, policy_class(model_config), args.matmul_precision, args.autocast,
                 args.attention, args.channels_last, args.fused_optimizer and cuda, args.fast_maxpool and cuda,
                 args.compile, bool(args.frame_cache), sum(parameter.numel() for parameter, _ in zero_gradients),
                 language_mode(model_config), language_encoder(model_config) if language_embeddings is not None else None,
                 model_config.get('prompt_source', 'task_name'), model_config.get('film_init'),
                 args.film_recompute and language_mode(model_config) == 'clip_film',
-                model_config.get('backbone_norm', 'frozen'), model_config.get('pretrained_backbone', True))
+                model_config.get('backbone_norm', 'frozen'), model_config.get('pretrained_backbone', True),
+                model_config.get('camera_batch', False))
     begin = time.monotonic()
     previous_end = begin
     batches = optimizer_batches(loader, args.batch_size, args.loader_batch_size, device=device, stream=copy_stream)

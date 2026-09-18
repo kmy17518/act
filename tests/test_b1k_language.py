@@ -13,6 +13,7 @@ import pytest
 import torch
 import websockets.asyncio.client
 import websockets.asyncio.server
+from torchvision import transforms
 
 from b1k_language import (CLIP_MODEL, CLIP_REVISION, ENCODERS, MINILM_MODEL, MINILM_REVISION, build_language_cache,
                           encode_prompt, encode_prompt_minilm, language_embedding_table, language_for_qpos,
@@ -581,6 +582,69 @@ def test_mt_act_train_resume_serve_without_transformers(tiny_root, tmp_path, fak
     with pytest.raises(ValueError, match='require --language-conditioning'):
         train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'bad'), '--max-steps', '1',
                                            '--language-encoder', 'minilm']))
+
+
+def test_camera_batch_matches_per_camera_passes_and_shares_batchnorm_statistics(tiny_root, tmp_path, fake_minilm,
+                                                                                monkeypatch):
+    torch.set_num_threads(1)
+    # Per-sample layers: one pass over all cameras reproduces the per-camera loop exactly (frozen BN, both modes).
+    for config in (dict(small_model_config()), dict(small_model_config(), language_conditioning='clip_film'),
+                   dict(small_model_config(), position_embedding='learned')):
+        torch.manual_seed(1)
+        loop = make_policy(config, 'cpu')
+        batched = make_policy(dict(config, camera_batch=True), 'cpu')
+        batched.load_state_dict(loop.state_dict())
+        assert batched.model.camera_batch and not loop.model.camera_batch
+        loop.eval()
+        batched.eval()
+        qpos, images = torch.randn(2, 27), torch.rand(2, 3, 3, 32, 32)
+        kwargs = {'lang_emb': torch.randn(2, 768)} if config.get('language_conditioning') else {}
+        with torch.no_grad():
+            torch.testing.assert_close(batched(qpos, images, **kwargs), loop(qpos, images, **kwargs), atol=0, rtol=0)
+    # Trainable BatchNorm: statistics over the images of all cameras jointly, one update per forward pass.
+    config = dict(small_model_config(), language_conditioning='mt_act', language_encoder='minilm', backbone_norm='batch',
+                  state_dim=25)
+    torch.manual_seed(2)
+    policy = make_policy(dict(config, camera_batch=True), 'cpu')
+    policy.train()
+    body = policy.model.backbones[0][0].body
+    for module in policy.modules():
+        if isinstance(module, torch.nn.BatchNorm2d):
+            module.momentum = 1.0  # running statistics = the statistics of this one forward pass
+    qpos, images = torch.randn(2, 26), torch.rand(2, 3, 3, 32, 32)
+    language = torch.nn.functional.normalize(torch.randn(2, 384), dim=-1)
+    policy(qpos, images, torch.randn(2, 4, 23), torch.zeros(2, 4, dtype=torch.bool), lang_emb=language)['loss'].backward()
+    normalized = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])(images)
+    with torch.no_grad():
+        joint = body.conv1(normalized.transpose(0, 1).reshape(6, 3, 32, 32)).mean(dim=(0, 2, 3))
+        per_camera = [body.conv1(normalized[:, camera]).mean(dim=(0, 2, 3)) for camera in range(3)]
+    assert int(body.bn1.num_batches_tracked) == 1
+    torch.testing.assert_close(body.bn1.running_mean, joint, atol=1e-5, rtol=0)
+    assert all(not torch.allclose(body.bn1.running_mean, mean, atol=1e-5) for mean in per_camera)
+    assert all(m.weight.grad is not None and m.weight.grad.abs().sum() > 0 for m in body.film_generators.values())
+    # Saved model configuration: fresh runs record it, resume adopts it and rejects a contradiction.
+    write_prompts(tiny_root, prompt_rows())
+    common = ['--dataset-path', str(tiny_root), '--batch-size', '2', '--num-workers', '0', '--torch-threads', '1',
+              '--device', 'cpu', '--chunk-size', '4', '--image-size', '32', '32', '--hidden-dim', '32',
+              '--dim-feedforward', '64', '--enc-layers', '1', '--dec-layers', '1', '--nheads', '4',
+              '--save-every', '1', '--output-dir', str(tmp_path / 'run')]
+    path = train(parser().parse_args(common + ['--max-steps', '1', '--language-conditioning', 'mt_act',
+                                              '--prompt-source', 'task_description', '--no-pretrained-backbone',
+                                              '--backbone-norm', 'batch', '--backbone-camera-batch']))
+    saved = load_checkpoint(path)
+    assert saved['model_config']['camera_batch'] is True
+    with pytest.raises(ValueError, match='--camera-batch differs from checkpoint'):
+        train(parser().parse_args(common + ['--max-steps', '2', '--resume', str(path), '--no-backbone-camera-batch']))
+    monkeypatch.setitem(sys.modules, 'transformers', None)
+    resumed = load_checkpoint(train(parser().parse_args(common + ['--max-steps', '2', '--resume', str(path)])))
+    assert resumed['model_config']['camera_batch'] is True
+    tiny_root.rename(tmp_path / 'hidden_dataset')
+    actions = Session(PolicyPredictor(resumed, 'cpu'), resumed, action_horizon=2).act(observation(2, np.array([7, 9])))
+    assert np.isfinite(actions).all()
+    with pytest.raises(ValueError, match='applies to the shared ACT backbone'):
+        train(parser().parse_args(common[:-2] + ['--output-dir', str(tmp_path / 'cnnmlp'), '--max-steps', '1',
+                                                 '--policy-class', 'CNNMLP', '--image-size', '385', '385',
+                                                 '--backbone-camera-batch']))
 
 
 @pytest.mark.skipif(os.environ.get('ACT_TEST_REAL_MINILM') != '1', reason='Opt-in cached real MiniLM CPU test')

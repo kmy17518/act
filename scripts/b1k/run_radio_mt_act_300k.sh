@@ -12,15 +12,21 @@
 #                                       RoboAgent's build_film_backbone does.
 # Deliberate deviations: 96x96 images (the Diffusion Policy baseline's resolution; MT-ACT used RoboSet's
 # native frames), our three cameras, 23-D actions and action chunk 100 (MT-ACT: four cameras, 8-D, H=20),
-# so the L1 is comparable with the other 300k runs. Throughput options are the ones measured in b1k.md.
+# so the L1 is comparable with the other 300k runs, and ACT_CAMERA_BATCH=1 (default): the ResNet runs once over
+# the images of all cameras so its BatchNorm statistics are shared across cameras, which is what the running
+# statistics used when serving describe (RoboAgent's per-camera passes leave a large train/eval gap, see
+# b1k_runs.md). Throughput options are the ones measured in b1k.md.
 #
 # Runs the checkout it lives in (git worktree /tmp/dev/baselines/mt-act) with that checkout's .venv.
 # Overrides (environment variables, ACT_-prefixed as in run_radio_300k.sh; launch from a dedicated tmux
 # server, e.g. `tmux -L b1k-mt-act new-session -d -s mt-act-radio 'bash .../run_radio_mt_act_300k.sh'`):
-#   ACT_RUN_TAG      default opt20260917; names outputs/turning-on-radio-mt-act-${ACT_IMAGE_SIZE}px-bs${ACT_BATCH_SIZE}-300k-${ACT_RUN_TAG},
-#                    the log/exit files /tmp/dev/logs/act-radio-mt-act-${ACT_IMAGE_SIZE}px-300k-${ACT_RUN_TAG}.{log,exit} and the
-#                    W&B run (ACT_WANDB_ID defaults to actradio-mtact-${ACT_IMAGE_SIZE}px-${ACT_RUN_TAG}; the first 96 px run
-#                    keeps its size-less names act-radio-mt-act-300k-<tag> / actradio-mtact-<tag>). A run resumes its own latest.pt.
+#   ACT_CAMERA_BATCH 1 (default): --backbone-camera-batch (shared BatchNorm statistics, "-cambatch" in the run name);
+#                    0: RoboAgent's per-camera backbone passes.
+#   ACT_RUN_TAG      default opt20260917; names outputs/turning-on-radio-mt-act[-cambatch]-${ACT_IMAGE_SIZE}px-bs${ACT_BATCH_SIZE}-300k-${ACT_RUN_TAG},
+#                    the log/exit files /tmp/dev/logs/act-radio-mt-act[-cambatch]-${ACT_IMAGE_SIZE}px-300k-${ACT_RUN_TAG}.{log,exit} and the
+#                    W&B run (ACT_WANDB_ID defaults to actradio-mtact[-cambatch]-${ACT_IMAGE_SIZE}px-${ACT_RUN_TAG}; the first 96 px
+#                    per-camera run keeps its size-less names act-radio-mt-act-300k-<tag> / actradio-mtact-<tag>). A run resumes
+#                    its own latest.pt.
 #   ACT_GPU_UUID     default GPU 1 of the host provisioned 2026-09-17 (GPU-82d44829-...). One GPU per run.
 #   ACT_CORES        taskset range for loader workers and trainer (default 0-29).
 #   ACT_IMAGE_SIZE   default 96 (square); 240 is this adapter's ACT default and the other radio runs' size.
@@ -45,18 +51,23 @@ CORES=${ACT_CORES:-0-29}
 IMAGE_SIZE=${ACT_IMAGE_SIZE:-96}
 DATASET=${ACT_DATASET:-/tmp/dev/datasets/2026-challenge-demos}
 CACHE=${ACT_FRAME_CACHE:-/tmp/dev/datasets/2026-challenge-demos-act-frame-cache-${IMAGE_SIZE}x${IMAGE_SIZE}}
-STEM=turning-on-radio-mt-act-${IMAGE_SIZE}px-bs${BATCH_SIZE}-300k-${RUN_TAG}
+if [[ "${ACT_CAMERA_BATCH:-1}" == 1 ]]; then
+    CAMERA_FLAG=--backbone-camera-batch; VARIANT=-cambatch
+else
+    CAMERA_FLAG=--no-backbone-camera-batch; VARIANT=
+fi
+STEM=turning-on-radio-mt-act${VARIANT}-${IMAGE_SIZE}px-bs${BATCH_SIZE}-300k-${RUN_TAG}
 RUN=outputs/$STEM
 WANDB_NAME=$STEM
-if [[ "$IMAGE_SIZE" == 96 ]]; then
-    # The first (documented) 96 px run was launched with size-less log and W&B names; keep them resumable.
+if [[ "$IMAGE_SIZE" == 96 && -z "$VARIANT" ]]; then
+    # The first (documented) 96 px per-camera run was launched with size-less log and W&B names; keep them resumable.
     LOG=/tmp/dev/logs/act-radio-mt-act-300k-${RUN_TAG}.log
     STATUS=/tmp/dev/logs/act-radio-mt-act-300k-${RUN_TAG}.exit
     WANDB_ID=${ACT_WANDB_ID:-actradio-mtact-${RUN_TAG}}
 else
-    LOG=/tmp/dev/logs/act-radio-mt-act-${IMAGE_SIZE}px-300k-${RUN_TAG}.log
-    STATUS=/tmp/dev/logs/act-radio-mt-act-${IMAGE_SIZE}px-300k-${RUN_TAG}.exit
-    WANDB_ID=${ACT_WANDB_ID:-actradio-mtact-${IMAGE_SIZE}px-${RUN_TAG}}
+    LOG=/tmp/dev/logs/act-radio-mt-act${VARIANT}-${IMAGE_SIZE}px-300k-${RUN_TAG}.log
+    STATUS=/tmp/dev/logs/act-radio-mt-act${VARIANT}-${IMAGE_SIZE}px-300k-${RUN_TAG}.exit
+    WANDB_ID=${ACT_WANDB_ID:-actradio-mtact${VARIANT}-${IMAGE_SIZE}px-${RUN_TAG}}
 fi
 mkdir -p "$(dirname "$LOG")"
 if [[ -e "$STATUS" ]]; then
@@ -86,7 +97,7 @@ taskset -c "$CORES" .venv/bin/python -u scripts/b1k/train_b1k.py \
     --dataset-path "$DATASET" --task-names turning_on_radio --frame-cache "$CACHE" \
     --output-dir "$RUN" --policy-class ACT --max-steps 300000 \
     --language-conditioning mt_act --language-encoder minilm --prompt-source task_description \
-    --no-pretrained-backbone --backbone-norm batch \
+    --no-pretrained-backbone --backbone-norm batch "$CAMERA_FLAG" \
     --hidden-dim 512 --dim-feedforward 3200 --enc-layers 4 --dec-layers 7 --nheads 8 \
     --chunk-size 100 --image-size "$IMAGE_SIZE" "$IMAGE_SIZE" --position-embedding sine --no-pre-norm \
     --kl-weight 10 --lr 1e-5 --lr-backbone 1e-5 --weight-decay 1e-4 \
