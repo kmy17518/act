@@ -30,6 +30,29 @@ tmux -L b1k-mt-act new-session -d -s mt-act-stop5k \
 
 The MT-ACT variant fits the training actions slightly faster than the pretrained frozen-BN baseline despite the 6.25× smaller images and the from-scratch ResNet (three confounded differences at once: architecture, trainable BatchNorm, resolution). These are training losses at 1.7 % of the schedule with different image resolutions, not held-out or simulator results; no convergence or success claim. Resume with `bash scripts/b1k/run_radio_mt_act_300k.sh` after archiving the `.exit` file.
 
+### 240 px (the ACT default) and the precision options — 2026-09-18
+
+Three more MT-ACT runs at **240×240** (`ACT_IMAGE_SIZE=240`; the launch script now gives non-96 px sizes size-qualified log/exit/W&B names), same batch 1,560, seed, schedule and 5,000-step stop, differing only in `ACT_AUTOCAST`. All three were stopped by `/tmp/dev/scripts/act-stop-run-at-step.sh` after `step_00005000.pt` was saved (exit 130, `latest.pt -> step_00005000.pt`, W&B runs finished):
+
+| Run (`outputs/turning-on-radio-mt-act-240px-bs1560-300k-<tag>`) | `ACT_AUTOCAST` | GPU / cores | W&B id | stopped after |
+| --- | --- | --- | --- | --- |
+| `opt20260917` | `none` (TF32) | 1 / 0-29 | `actradio-mtact-240px-opt20260917` | step 5,003 |
+| `opt20260917-bf16bb` | `bf16-backbone` | 2 / 30-59 | `actradio-mtact-240px-opt20260917-bf16bb` | step 5,020 |
+| `opt20260917-bf16` | `bf16` | 3 / 60-89 | `actradio-mtact-240px-opt20260917-bf16` | step 5,000 |
+
+Logs/exit files: `/tmp/dev/logs/act-radio-mt-act-240px-300k-<tag>.{log,exit}`. Step-5,000 comparison (identical batch sequence; mean over steps 4,901–5,000; lower is better):
+
+| Run | L1 | KL | loss | grad norm | s/step | peak GiB | h to 5k |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| MT-ACT 240 px, TF32 | 0.1234 | 0.0054 | 0.1773 | 2.81 | 0.499 | 196 | 0.70 |
+| MT-ACT 240 px, `bf16-backbone` | 0.1235 (+0.08 %) | 0.0054 | 0.1774 | 2.86 | **0.427** | 156 | 0.60 |
+| MT-ACT 240 px, `bf16` | 0.1240 (+0.5 %) | 0.0055 | 0.1789 | 2.89 | **0.337** | 103 | 0.47 |
+| MT-ACT 96 px, TF32 (above) | 0.1135 | 0.0054 | 0.1674 | 1.98 | 0.160 | 61 | 0.23 |
+| unconditioned `opt20260917`, 240 px, TF32 | 0.1165 | 0.0057 | 0.1738 | 2.36 | 0.447 | 150 | 0.63 |
+| clip_film identity init, 240 px, TF32 | 0.1235 | 0.0047 | 0.1700 | 2.44 | 0.455 | 165 | 0.64 |
+
+Where the time goes (b1k.md "Throughput of the MT-ACT architecture"): the MT-ACT modules themselves are free; trainable BatchNorm costs +0.05 s/step and +40 GiB over frozen BatchNorm (the same network with `--backbone-norm frozen` runs at 0.452 s/step — a speed-only diagnostic). Both precision options recover that and more: `bf16-backbone` is 14 % faster at an L1 deviation inside the ±0.3 % dropout noise floor measured for the CLIP runs, `bf16` is 33 % faster at +0.5 % L1. At 240 px the from-scratch MT-ACT trails the ImageNet-initialized baseline at this early point (0.1234 vs 0.1165) and its own 96 px run (0.1135); the smaller images also let it run 3× faster. Training losses only; no convergence or simulator claim.
+
 ## Optimized CLIP/FiLM runs, random vs identity initialization — 2026-09-17
 
 The `lang` branch (this checkout, worktree `/tmp/dev/baselines/act-lang` with its own `.venv`) merged the `my` branch throughput work (frame cache, TF32, channels-last, fused AdamW, Triton stem pooling, skipped unused decoder layers, GPU batch assembly, `--compile regions-autotune`; see "Throughput (2026-09-17)" below). The merge added `--film-init random|identity` (saved as `model_config['film_init']`) and the runtime `--film-recompute/--no-film-recompute` switch; the FiLM layers are part of the compiled backbone region. CPU suite after the merge: **118 passed, 4 skipped** (`tests/`).
