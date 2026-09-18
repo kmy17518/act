@@ -23,6 +23,16 @@ tmux -L b1k-act-lang new-session -d -s act-radio-lang-identity \
 
 Restart rule as before: a run resumes its own `latest.pt`; archive its `.exit` file first, and never start a second trainer for the same directory (the GPU occupancy check and `run.lock` reject overlaps).
 
+**Stopped at 5,000 steps on the user's request (2026-09-18 01:00–01:02 UTC).** `/tmp/dev/scripts/act-lang-stop-at-step.sh` (tmux `act-radio-lang-stop5k`, log `/tmp/dev/logs/act-lang-stop-at-5000.log`) sent SIGINT once each run had logged step ≥ 5,000 with `step_00005000.pt` saved: random stopped after step 5,019, identity after 5,003, both exit status 130, `latest.pt -> step_00005000.pt`, local full checkpoints at steps 1 / 2,500 / 5,000, W&B runs finished. The unconditioned `opt20260917` run was stopped at step 5,000 as well (00:29 UTC, exit 130), so all three have step-5,000 checkpoints. Training-loss comparison on the identical batch sequence (seed 0; dropout differs), mean over steps 4,901–5,000:
+
+| Run | L1 | KL | loss | L1 (2,401–2,500) | median s/step |
+| --- | --- | --- | --- | --- | --- |
+| unconditioned `opt20260917` | **0.1165** | 0.0057 | 0.1738 | 0.1549 | 0.447 |
+| clip_film, identity FiLM init | 0.1235 | 0.0047 | 0.1700 | 0.1606 | 0.455 |
+| clip_film, random FiLM init | 0.1366 | 0.0047 | 0.1831 | 0.1689 | 0.455 |
+
+Each run took 0.64 h for 5,000 steps. These are training losses at 1.7 % of the planned schedule, not held-out or simulator results; no convergence claim. Resume with `ACT_FILM_INIT=<init> bash scripts/b1k/run_radio_language_300k.sh` after archiving the `.exit` file.
+
 **Throughput of the conditioned trainer** (batch 1,560, 30 cores, 25-step probes on GPU 1, steady-state median `timing/step_s`, peak allocated memory):
 
 | Configuration | s/step | peak GPU memory |
