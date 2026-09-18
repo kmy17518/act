@@ -17,12 +17,14 @@
 # Runs the checkout it lives in (git worktree /tmp/dev/baselines/mt-act) with that checkout's .venv.
 # Overrides (environment variables, ACT_-prefixed as in run_radio_300k.sh; launch from a dedicated tmux
 # server, e.g. `tmux -L b1k-mt-act new-session -d -s mt-act-radio 'bash .../run_radio_mt_act_300k.sh'`):
-#   ACT_RUN_TAG      default opt20260917; names outputs/turning-on-radio-mt-act-96px-bs${ACT_BATCH_SIZE}-300k-${ACT_RUN_TAG},
-#                    the log/exit files and the W&B run (ACT_WANDB_ID defaults to actradio-mtact-${ACT_RUN_TAG}).
-#                    A run resumes its own latest.pt.
+#   ACT_RUN_TAG      default opt20260917; names outputs/turning-on-radio-mt-act-${ACT_IMAGE_SIZE}px-bs${ACT_BATCH_SIZE}-300k-${ACT_RUN_TAG},
+#                    the log/exit files /tmp/dev/logs/act-radio-mt-act-${ACT_IMAGE_SIZE}px-300k-${ACT_RUN_TAG}.{log,exit} and the
+#                    W&B run (ACT_WANDB_ID defaults to actradio-mtact-${ACT_IMAGE_SIZE}px-${ACT_RUN_TAG}; the first 96 px run
+#                    keeps its size-less names act-radio-mt-act-300k-<tag> / actradio-mtact-<tag>). A run resumes its own latest.pt.
 #   ACT_GPU_UUID     default GPU 1 of the host provisioned 2026-09-17 (GPU-82d44829-...). One GPU per run.
 #   ACT_CORES        taskset range for loader workers and trainer (default 0-29).
-#   ACT_IMAGE_SIZE   default 96 (square); the frame cache directory follows it.
+#   ACT_IMAGE_SIZE   default 96 (square); 240 is this adapter's ACT default and the other radio runs' size.
+#                    The frame cache directory follows it (…-act-frame-cache-<size>x<size>).
 #   ACT_BATCH_SIZE (1560), ACT_AUTOCAST (none), ACT_COMPILE_MODE (regions-autotune), ACT_FRAME_CACHE, ACT_DATASET,
 #   ACT_WANDB_ID     as in run_radio_300k.sh.
 set -euo pipefail
@@ -45,10 +47,17 @@ DATASET=${ACT_DATASET:-/tmp/dev/datasets/2026-challenge-demos}
 CACHE=${ACT_FRAME_CACHE:-/tmp/dev/datasets/2026-challenge-demos-act-frame-cache-${IMAGE_SIZE}x${IMAGE_SIZE}}
 STEM=turning-on-radio-mt-act-${IMAGE_SIZE}px-bs${BATCH_SIZE}-300k-${RUN_TAG}
 RUN=outputs/$STEM
-LOG=/tmp/dev/logs/act-radio-mt-act-300k-${RUN_TAG}.log
-STATUS=/tmp/dev/logs/act-radio-mt-act-300k-${RUN_TAG}.exit
 WANDB_NAME=$STEM
-WANDB_ID=${ACT_WANDB_ID:-actradio-mtact-${RUN_TAG}}
+if [[ "$IMAGE_SIZE" == 96 ]]; then
+    # The first (documented) 96 px run was launched with size-less log and W&B names; keep them resumable.
+    LOG=/tmp/dev/logs/act-radio-mt-act-300k-${RUN_TAG}.log
+    STATUS=/tmp/dev/logs/act-radio-mt-act-300k-${RUN_TAG}.exit
+    WANDB_ID=${ACT_WANDB_ID:-actradio-mtact-${RUN_TAG}}
+else
+    LOG=/tmp/dev/logs/act-radio-mt-act-${IMAGE_SIZE}px-300k-${RUN_TAG}.log
+    STATUS=/tmp/dev/logs/act-radio-mt-act-${IMAGE_SIZE}px-300k-${RUN_TAG}.exit
+    WANDB_ID=${ACT_WANDB_ID:-actradio-mtact-${IMAGE_SIZE}px-${RUN_TAG}}
+fi
 mkdir -p "$(dirname "$LOG")"
 if [[ -e "$STATUS" ]]; then
     printf 'Archive the previous exit status before restarting: %s\n' "$STATUS" >&2
