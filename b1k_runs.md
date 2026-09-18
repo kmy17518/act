@@ -2,7 +2,7 @@
 
 ## MT-ACT reproduction at 96 px — 2026-09-18
 
-Branch `mt-act` (worktree `/tmp/dev/baselines/mt-act`, own `.venv`, branched from `lang`) adds `--language-conditioning mt_act` (see b1k.md "Optional MT-ACT reproduction"). One run, launched from this commit with `scripts/b1k/run_radio_mt_act_300k.sh`, on the same batch (**1,560**), optimizer, transformer, sampler seed 0, 300,000-step schedule and checkpoint cadence as the `opt20260917` runs, to be **stopped at 5,000 steps** like them:
+Branch `lang_optimized_mt_act` (formerly `mt-act`; worktree `/tmp/dev/baselines/mt-act`, own `.venv`, branched from `lang_optimized`) adds `--language-conditioning mt_act` (see b1k.md "Optional MT-ACT reproduction"). One run, launched from this commit with `scripts/b1k/run_radio_mt_act_300k.sh`, on the same batch (**1,560**), optimizer, transformer, sampler seed 0, 300,000-step schedule and checkpoint cadence as the `opt20260917` runs, to be **stopped at 5,000 steps** like them:
 
 | Run | Model | Images | GPU | cores | W&B run | log/exit |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -123,7 +123,7 @@ Per-camera statistics close the gap completely (served within 0.2 % of the train
 
 ## Optimized CLIP/FiLM runs, random vs identity initialization — 2026-09-17
 
-The `lang` branch (this checkout, worktree `/tmp/dev/baselines/act-lang` with its own `.venv`) merged the `my` branch throughput work (frame cache, TF32, channels-last, fused AdamW, Triton stem pooling, skipped unused decoder layers, GPU batch assembly, `--compile regions-autotune`; see "Throughput (2026-09-17)" below). The merge added `--film-init random|identity` (saved as `model_config['film_init']`) and the runtime `--film-recompute/--no-film-recompute` switch; the FiLM layers are part of the compiled backbone region. CPU suite after the merge: **118 passed, 4 skipped** (`tests/`).
+The `lang_optimized` branch (formerly `lang`; worktree `/tmp/dev/baselines/act-lang` with its own `.venv`) merged the `my` branch throughput work (frame cache, TF32, channels-last, fused AdamW, Triton stem pooling, skipped unused decoder layers, GPU batch assembly, `--compile regions-autotune`; see "Throughput (2026-09-17)" below). The merge added `--film-init random|identity` (saved as `model_config['film_init']`) and the runtime `--film-recompute/--no-film-recompute` switch; the FiLM layers are part of the compiled backbone region. CPU suite after the merge: **118 passed, 4 skipped** (`tests/`).
 
 Two 300,000-step runs launched on 2026-09-18 from this commit, identical to the unconditioned `outputs/turning-on-radio-act-bs1560-300k-opt20260917` recipe (batch **1,560**, TF32, fp32 weights/optimizer, same architecture, images, sampler seed 0 and checkpoint schedule) plus `--language-conditioning clip_film --prompt-source task_name`, which is the comparison they are meant for:
 
