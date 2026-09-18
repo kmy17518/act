@@ -1,4 +1,4 @@
-"""Frozen, task-cached CLIP prompts for ACT visual FiLM conditioning."""
+"""Frozen, task-cached text prompts for ACT language conditioning (CLIP FiLM and the MT-ACT reproduction)."""
 
 import json
 from pathlib import Path
@@ -8,23 +8,53 @@ import torch
 
 CLIP_MODEL = 'openai/clip-vit-large-patch14'
 CLIP_REVISION = '32bd64288804d66eefd0ccbe215aa642df71cc41'
-LANGUAGE_DIM = 768
+MINILM_MODEL = 'sentence-transformers/all-MiniLM-L6-v2'
+MINILM_REVISION = '1110a243fdf4706b3f48f1d95db1a4f5529b4d41'
+MINILM_MAX_TOKENS = 256  # sentence_bert_config.json max_seq_length
+LANGUAGE_DIM = 768  # CLIP; kept for callers that predate the encoder registry
 PROMPT_SOURCES = ('task_name', 'task_description')
 FILM_INITS = ('random', 'identity')  # random: nn.Linear default; identity: zero projection (beta = gamma = 0)
 LONG_PROMPT_POLICY = 'mean_projected_75_token_chunks'
+# Frozen text encoders. `clip`: CLIP ViT-L/14 projected text embeddings (768-d, unnormalized, long prompts
+# averaged over 75-token chunks). `minilm`: sentence-transformers all-MiniLM-L6-v2 as RoboAgent's MT-ACT used
+# it (masked mean pooling of the last hidden state, L2-normalized, 384-d, truncated to 256 word pieces).
+ENCODERS = {
+    'clip': {'model': CLIP_MODEL, 'revision': CLIP_REVISION, 'embedding_dim': 768, 'normalized': False,
+             'long_prompt_policy': LONG_PROMPT_POLICY},
+    'minilm': {'model': MINILM_MODEL, 'revision': MINILM_REVISION, 'embedding_dim': 384, 'normalized': True,
+               'long_prompt_policy': f'truncate_{MINILM_MAX_TOKENS}_word_pieces_mean_pool_l2_normalize'},
+}
+# clip_film: FiLM after every ResNet block output (b1k.md). mt_act: RoboAgent's MT-ACT (FiLM inside the
+# residual branch of ResNet stages 2-4, a shared learned text projection that also enters the transformer
+# encoder as a token, CVAE style encoder over actions only, no one-hot task input; see detr_vae.py).
+LANGUAGE_MODES = ('none', 'clip_film', 'mt_act')
+BACKBONE_NORMS = ('frozen', 'batch')
 
 
 def language_mode(model_config):
     mode = model_config.get('language_conditioning', 'none')
-    if mode not in ('none', 'clip_film'):
+    if mode not in LANGUAGE_MODES:
         raise ValueError(f'Unsupported language conditioning {mode}')
     if model_config.get('prompt_source', 'task_name') not in PROMPT_SOURCES:
         raise ValueError('Unsupported prompt source')
     if model_config.get('film_init', 'random') not in FILM_INITS:
         raise ValueError('Unsupported FiLM initialization')
+    if model_config.get('backbone_norm', 'frozen') not in BACKBONE_NORMS:
+        raise ValueError('Unsupported backbone normalization')
+    if mode != 'none' and language_encoder(model_config) not in ENCODERS:
+        raise ValueError('Unsupported language encoder')
     if mode != 'none' and model_config.get('policy_class', 'ACT') != 'ACT':
-        raise ValueError('CLIP FiLM language conditioning is only supported for ACT, not CNNMLP')
+        raise ValueError('Language conditioning is only supported for ACT, not CNNMLP')
     return mode
+
+
+def language_encoder(model_config):
+    """Encoder name; checkpoints that predate the registry (clip_film only) used CLIP."""
+    return model_config.get('language_encoder', 'clip')
+
+
+def language_dim(model_config):
+    return ENCODERS[language_encoder(model_config)]['embedding_dim'] if language_mode(model_config) != 'none' else None
 
 
 def task_prompts(root, task_map, source):
@@ -107,16 +137,50 @@ def encode_prompt(prompt, tokenizer, model):
     return embedding
 
 
-def build_language_cache(root, task_map, source):
-    prompts = task_prompts(root, task_map, source)
-    tokenizer, model = load_clip_text_encoder()
+def load_minilm_encoder():
+    try:
+        from transformers import AutoModel, AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError('MiniLM prompts require transformers; install requirements-b1k.txt') from exc
+    tokenizer = AutoTokenizer.from_pretrained(MINILM_MODEL, revision=MINILM_REVISION)
+    model = AutoModel.from_pretrained(MINILM_MODEL, revision=MINILM_REVISION)
     model.requires_grad_(False).eval()
-    tasks = {i: {'task_name': task_map[i], 'prompt': prompt,
-                 'embedding': encode_prompt(prompt, tokenizer, model).tolist()}
+    return tokenizer, model
+
+
+@torch.inference_mode()
+def encode_prompt_minilm(prompt, tokenizer, model):
+    """sentence-transformers all-MiniLM-L6-v2 semantics: truncate, masked mean pooling, L2 normalization."""
+    tokens = tokenizer(prompt, return_tensors='pt', padding=True, truncation=True, max_length=MINILM_MAX_TOKENS,
+                       return_attention_mask=True)
+    device = next(model.parameters()).device
+    tokens = {key: value.to(device) for key, value in tokens.items()}
+    hidden = model(**tokens).last_hidden_state
+    dim = ENCODERS['minilm']['embedding_dim']
+    if hidden.ndim != 3 or hidden.shape[0] != 1 or hidden.shape[2] != dim:
+        raise ValueError(f'Expected MiniLM hidden states with dimension {dim}')
+    mask = tokens['attention_mask'].unsqueeze(-1).to(hidden.dtype)
+    pooled = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1e-9)
+    embedding = torch.nn.functional.normalize(pooled.float(), p=2, dim=-1)[0].cpu()
+    if not torch.isfinite(embedding).all():
+        raise ValueError('Non-finite MiniLM text embedding')
+    return embedding
+
+
+def build_language_cache(root, task_map, source, encoder='clip'):
+    if encoder not in ENCODERS:
+        raise ValueError(f'Unsupported language encoder {encoder}')
+    prompts = task_prompts(root, task_map, source)
+    if encoder == 'clip':
+        tokenizer, model = load_clip_text_encoder()
+        encode = encode_prompt
+    else:
+        tokenizer, model = load_minilm_encoder()
+        encode = encode_prompt_minilm
+    model.requires_grad_(False).eval()
+    tasks = {i: {'task_name': task_map[i], 'prompt': prompt, 'embedding': encode(prompt, tokenizer, model).tolist()}
              for i, prompt in prompts.items()}
-    return {'version': 1, 'model': CLIP_MODEL, 'revision': CLIP_REVISION, 'embedding_dim': LANGUAGE_DIM,
-            'normalized': False, 'long_prompt_policy': LONG_PROMPT_POLICY, 'prompt_source': source,
-            'tasks': tasks}
+    return {'version': 1, **ENCODERS[encoder], 'prompt_source': source, 'tasks': tasks}
 
 
 def language_embedding_table(model_config, task_map, cache):
@@ -124,9 +188,9 @@ def language_embedding_table(model_config, task_map, cache):
         if cache is not None:
             raise ValueError('Unconditioned checkpoint must not contain a language cache')
         return None
-    expected = {'version': 1, 'model': CLIP_MODEL, 'revision': CLIP_REVISION, 'embedding_dim': LANGUAGE_DIM,
-                'normalized': False, 'long_prompt_policy': LONG_PROMPT_POLICY,
+    expected = {'version': 1, **ENCODERS[language_encoder(model_config)],
                 'prompt_source': model_config.get('prompt_source', 'task_name')}
+    dim = expected['embedding_dim']
     if not isinstance(cache, dict) or any(cache.get(key) != value for key, value in expected.items()):
         raise ValueError('Missing or incompatible checkpoint language cache model/revision/source/policy')
     tasks = cache.get('tasks')
@@ -146,8 +210,8 @@ def language_embedding_table(model_config, task_map, cache):
             embedding = torch.tensor(entry.get('embedding'), dtype=torch.float32)
         except (TypeError, ValueError, RuntimeError) as exc:
             raise ValueError(f'Invalid checkpoint language embedding for {task_id}') from exc
-        if embedding.shape != (LANGUAGE_DIM,) or not torch.isfinite(embedding).all():
-            raise ValueError(f'Expected finite {LANGUAGE_DIM}d checkpoint language embedding for {task_id}')
+        if embedding.shape != (dim,) or not torch.isfinite(embedding).all():
+            raise ValueError(f'Expected finite {dim}d checkpoint language embedding for {task_id}')
         embeddings.append(embedding)
     return torch.stack(embeddings)
 

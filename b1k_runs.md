@@ -1,5 +1,24 @@
 # ACT radio training run — 2026-09-16
 
+## MT-ACT reproduction at 96 px — 2026-09-18
+
+Branch `mt-act` (worktree `/tmp/dev/baselines/mt-act`, own `.venv`, branched from `lang`) adds `--language-conditioning mt_act` (see b1k.md "Optional MT-ACT reproduction"). One run, launched from this commit with `scripts/b1k/run_radio_mt_act_300k.sh`, on the same batch (**1,560**), optimizer, transformer, sampler seed 0, 300,000-step schedule and checkpoint cadence as the `opt20260917` runs, to be **stopped at 5,000 steps** like them:
+
+| Run | Model | Images | GPU | cores | W&B run | log/exit |
+| --- | --- | --- | --- | --- | --- | --- |
+| `outputs/turning-on-radio-mt-act-96px-bs1560-300k-opt20260917` | MT-ACT: MiniLM task description → `proj_text_emb` → residual-branch FiLM (stages 2–4) + encoder token; style encoder over actions; no one-hot; ResNet-18 from scratch with BatchNorm | **96×96** (Diffusion Policy's resolution; new cache `2026-challenge-demos-act-frame-cache-96x96`, verified against native decoding) | 1 (`GPU-82d44829-…`) | 0-29 | `actradio-mtact-opt20260917` | `/tmp/dev/logs/act-radio-mt-act-300k-opt20260917.{log,exit}` |
+
+Kept from our recipe rather than RoboAgent's: three cameras, 25-D proprioception, 23-D actions, chunk 100 (MT-ACT used four cameras, 8-D actions and H=20 on 42-step trajectories), no random crop (Diffusion Policy crops 96→86; ACT does not crop). The prompt is the dataset instruction *"Turn on the radio receiver that's on the table in the living room."* With one task the language vector is constant, so — as for the CLIP runs — this measures the MT-ACT architecture (residual FiLM affine, extra token, from-scratch BatchNorm ResNet at 96 px), not language grounding.
+
+Probes (GPU 1, batch 1,560, 25 steps, steady-state median): eager **0.20 s/step**, 74 GiB peak; `--compile regions-autotune` **0.16 s/step**, 61 GiB peak, 134 s first-step compile; loader wait ~1.4 ms. Step-1–3 L1 compiled vs eager 0.8352/0.7532/0.7011 vs 0.8352/0.7537/0.7020. CPU suite: **121 passed, 5 skipped**; the cached real-MiniLM check reproduces RoboAgent's shipped `TEXT_EMBEDDINGS` to 1.3e-7.
+
+```bash
+source /tmp/dev/env.sh
+tmux -L b1k-mt-act new-session -d -s mt-act-radio 'bash /tmp/dev/baselines/mt-act/scripts/b1k/run_radio_mt_act_300k.sh'
+tmux -L b1k-mt-act new-session -d -s mt-act-stop5k \
+  'ACT_STOP_RUN_DIR=/tmp/dev/baselines/mt-act/outputs/turning-on-radio-mt-act-96px-bs1560-300k-opt20260917 ACT_STOP_EXIT_FILE=/tmp/dev/logs/act-radio-mt-act-300k-opt20260917.exit /tmp/dev/scripts/act-stop-run-at-step.sh'
+```
+
 ## Optimized CLIP/FiLM runs, random vs identity initialization — 2026-09-17
 
 The `lang` branch (this checkout, worktree `/tmp/dev/baselines/act-lang` with its own `.venv`) merged the `my` branch throughput work (frame cache, TF32, channels-last, fused AdamW, Triton stem pooling, skipped unused decoder layers, GPU batch assembly, `--compile regions-autotune`; see "Throughput (2026-09-17)" below). The merge added `--film-init random|identity` (saved as `model_config['film_init']`) and the runtime `--film-recompute/--no-film-recompute` switch; the FiLM layers are part of the compiled backbone region. CPU suite after the merge: **118 passed, 4 skipped** (`tests/`).

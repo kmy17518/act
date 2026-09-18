@@ -210,6 +210,9 @@ class B1KServer:
                          'task_map': {str(k): v for k, v in checkpoint['task_map'].items()}, 'proprio_dim': 61,
                          'observation_keys': OBS_KEYS, 'checkpoint_step': checkpoint['step'],
                          'language_conditioning': checkpoint['model_config'].get('language_conditioning', 'none'),
+                         'language_encoder': (checkpoint['model_config'].get('language_encoder', 'clip')
+                                              if checkpoint['model_config'].get('language_conditioning', 'none') != 'none'
+                                              else None),
                          'prompt_source': checkpoint['model_config'].get('prompt_source', 'task_name')}
 
     async def handler(self, websocket):

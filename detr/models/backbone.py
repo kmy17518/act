@@ -69,11 +69,11 @@ class FiLMLayer(nn.Module):
     `init='identity'` zeroes the projection so beta = gamma = 0 and the layer starts as the identity on the
     (already non-negative) residual-block output; `init='random'` keeps nn.Linear's default initialization.
     """
-    def __init__(self, channels, init='random'):
+    def __init__(self, channels, init='random', lang_dim=768):
         super().__init__()
         if init not in FILM_INITS:
             raise ValueError(f'Unsupported FiLM initialization {init!r}; expected one of {FILM_INITS}')
-        self.lang_proj = nn.Linear(768, 2 * channels)
+        self.lang_proj = nn.Linear(lang_dim, 2 * channels)
         if init == 'identity':
             nn.init.zeros_(self.lang_proj.weight)
             nn.init.zeros_(self.lang_proj.bias)
@@ -84,10 +84,12 @@ class FiLMLayer(nn.Module):
 
 
 class FiLMIntermediateLayerGetter(IntermediateLayerGetter):
-    def __init__(self, backbone, return_layers, film_init='random'):
+    def __init__(self, backbone, return_layers, film_init='random', lang_dim=768):
         super().__init__(backbone, return_layers)
+        self.lang_dim = lang_dim
         self.film_layers = nn.ModuleDict({name: nn.ModuleList([
-            FiLMLayer(block.conv3.out_channels if hasattr(block, 'conv3') else block.conv2.out_channels, film_init)
+            FiLMLayer(block.conv3.out_channels if hasattr(block, 'conv3') else block.conv2.out_channels, film_init,
+                      lang_dim)
             for block in layer]) for name, layer in self.items() if name.startswith('layer')})
         # Runtime option (not architecture/state): recompute each conditioned residual block's activations
         # during backward instead of storing them (same math, less memory, extra forward work).
@@ -98,8 +100,8 @@ class FiLMIntermediateLayerGetter(IntermediateLayerGetter):
         return film(block(x), lang_emb)
 
     def forward(self, x, lang_emb):
-        if lang_emb is None or lang_emb.shape != (x.shape[0], 768):
-            raise ValueError('CLIP FiLM requires language embeddings with shape (B, 768)')
+        if lang_emb is None or lang_emb.shape != (x.shape[0], self.lang_dim):
+            raise ValueError(f'CLIP FiLM requires language embeddings with shape (B, {self.lang_dim})')
         recompute = self.recompute and self.training and torch.is_grad_enabled()
         out = OrderedDict()
         for name, layer in self.items():
@@ -118,10 +120,69 @@ class FiLMIntermediateLayerGetter(IntermediateLayerGetter):
         return out
 
 
+MT_ACT_FILM_STAGES = ('layer2', 'layer3', 'layer4')  # RoboAgent film_config['use_in_layers'] = [1, 2, 3]
+
+
+class ResidualFiLMBody(nn.Module):
+    """RoboAgent MT-ACT visual encoder: FiLM inside the residual branch of the selected ResNet stages.
+
+    Follows robopen/roboagent `detr/models/resnet_film.py`: one `Linear(cond_dim, num_blocks * 2 * planes)`
+    per FiLM stage produces (gamma, beta) for each BasicBlock, applied after `bn2` and before the skip
+    connection is added and the block's ReLU runs: `relu(identity + (1 + gamma) * bn2(conv2(...)) + beta)`.
+    Stage 1 and the stem are unmodulated. `cond` is the *projected* task embedding (the transformer width),
+    shared with the language token in `DETRVAE`. Keeps the torchvision module names (`conv1`, `bn1`,
+    `layer1`...) so ImageNet weights and `--fast-maxpool` apply unchanged; only returns the last stage.
+    """
+    def __init__(self, backbone, cond_dim, stages=MT_ACT_FILM_STAGES, film_init='random'):
+        super().__init__()
+        if film_init not in FILM_INITS:
+            raise ValueError(f'Unsupported FiLM initialization {film_init!r}; expected one of {FILM_INITS}')
+        for name in ('conv1', 'bn1', 'relu', 'maxpool', 'layer1', 'layer2', 'layer3', 'layer4'):
+            setattr(self, name, getattr(backbone, name))
+        self.cond_dim = cond_dim
+        self.film_generators = nn.ModuleDict()
+        for name in stages:
+            layer = getattr(self, name)
+            if any(hasattr(block, 'conv3') for block in layer):
+                raise ValueError('MT-ACT FiLM is implemented for BasicBlock ResNets (resnet18/34) only')
+            planes = layer[0].conv2.out_channels
+            generator = nn.Linear(cond_dim, len(layer) * 2 * planes)
+            if film_init == 'identity':
+                nn.init.zeros_(generator.weight)
+                nn.init.zeros_(generator.bias)
+            self.film_generators[name] = generator
+
+    @staticmethod
+    def film_block(block, x, gamma, beta):
+        identity = x
+        out = block.relu(block.bn1(block.conv1(x)))
+        out = block.bn2(block.conv2(out))
+        out = (1 + gamma[:, :, None, None]) * out + beta[:, :, None, None]
+        if block.downsample is not None:
+            identity = block.downsample(x)
+        return block.relu(out + identity)
+
+    def forward(self, x, cond):
+        if cond is None or cond.shape != (x.shape[0], self.cond_dim):
+            raise ValueError(f'MT-ACT FiLM requires projected task embeddings with shape (B, {self.cond_dim})')
+        x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
+        for name in ('layer1', 'layer2', 'layer3', 'layer4'):
+            layer = getattr(self, name)
+            if name not in self.film_generators:
+                x = layer(x)
+                continue
+            # RoboAgent: film_feat.view(-1, 2, num_blocks, planes) -> gamma first, beta second
+            film = self.film_generators[name](cond).view(x.shape[0], 2, len(layer), -1).to(x.dtype)
+            for index, block in enumerate(layer):
+                x = self.film_block(block, x, film[:, 0, index], film[:, 1, index])
+        return OrderedDict([('0', x)])
+
+
 class BackboneBase(nn.Module):
 
     def __init__(self, backbone: nn.Module, train_backbone: bool, num_channels: int,
-                 return_interm_layers: bool, language_conditioning: str = 'none', film_init: str = 'random'):
+                 return_interm_layers: bool, language_conditioning: str = 'none', film_init: str = 'random',
+                 lang_dim: int = 768, film_cond_dim: int = 512):
         super().__init__()
         # for name, parameter in backbone.named_parameters(): # only train later layers # TODO do we want this?
         #     if not train_backbone or 'layer2' not in name and 'layer3' not in name and 'layer4' not in name:
@@ -130,20 +191,25 @@ class BackboneBase(nn.Module):
             return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
         else:
             return_layers = {'layer4': "0"}
-        if language_conditioning not in ('none', 'clip_film'):
+        if language_conditioning not in ('none', 'clip_film', 'mt_act'):
             raise ValueError(f'Unsupported language conditioning {language_conditioning}')
         self.language_conditioning = language_conditioning
         if language_conditioning == 'clip_film':
-            self.body = FiLMIntermediateLayerGetter(backbone, return_layers=return_layers, film_init=film_init)
+            self.body = FiLMIntermediateLayerGetter(backbone, return_layers=return_layers, film_init=film_init,
+                                                    lang_dim=lang_dim)
+        elif language_conditioning == 'mt_act':
+            if return_interm_layers:
+                raise ValueError('MT-ACT FiLM returns the last stage only')
+            self.body = ResidualFiLMBody(backbone, film_cond_dim, film_init=film_init)
         else:
             self.body = IntermediateLayerGetter(backbone, return_layers=return_layers)
         self.num_channels = num_channels
 
     def forward(self, tensor, lang_emb=None):
-        if self.language_conditioning == 'clip_film':
+        if self.language_conditioning != 'none':
             return self.body(tensor, lang_emb)
         if lang_emb is not None:
-            raise ValueError('Language embeddings require clip_film conditioning')
+            raise ValueError('Language embeddings require clip_film or mt_act conditioning')
         xs = self.body(tensor)
         return xs
         # out: Dict[str, NestedTensor] = {}
@@ -156,17 +222,21 @@ class BackboneBase(nn.Module):
 
 
 class Backbone(BackboneBase):
-    """ResNet backbone with frozen BatchNorm."""
+    """ResNet backbone with frozen BatchNorm (upstream ACT) or regular BatchNorm (`norm='batch'`, as MT-ACT)."""
     def __init__(self, name: str,
                  train_backbone: bool,
                  return_interm_layers: bool,
                  dilation: bool, pretrained: bool = True, language_conditioning: str = 'none',
-                 film_init: str = 'random'):
+                 film_init: str = 'random', lang_dim: int = 768, film_cond_dim: int = 512, norm: str = 'frozen'):
+        if norm not in ('frozen', 'batch'):
+            raise ValueError(f'Unsupported backbone normalization {norm!r}; expected frozen or batch')
         backbone = getattr(torchvision.models, name)(
             replace_stride_with_dilation=[False, False, dilation],
-            pretrained=pretrained and is_main_process(), norm_layer=FrozenBatchNorm2d) # pretrained # TODO do we want frozen batch_norm??
+            pretrained=pretrained and is_main_process(),
+            norm_layer=FrozenBatchNorm2d if norm == 'frozen' else nn.BatchNorm2d) # pretrained # TODO do we want frozen batch_norm??
         num_channels = 512 if name in ('resnet18', 'resnet34') else 2048
-        super().__init__(backbone, train_backbone, num_channels, return_interm_layers, language_conditioning, film_init)
+        super().__init__(backbone, train_backbone, num_channels, return_interm_layers, language_conditioning, film_init,
+                         lang_dim, film_cond_dim)
 
 
 class Joiner(nn.Sequential):
@@ -199,7 +269,8 @@ def build_backbone(args):
     return_interm_layers = args.masks
     backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation,
                         getattr(args, 'pretrained_backbone', True), getattr(args, 'language_conditioning', 'none'),
-                        getattr(args, 'film_init', 'random'))
+                        getattr(args, 'film_init', 'random'), getattr(args, 'language_dim', 768),
+                        args.hidden_dim, getattr(args, 'backbone_norm', 'frozen'))
     model = Joiner(backbone, position_embedding)
     model.num_channels = backbone.num_channels
     return model

@@ -14,11 +14,12 @@ import torch
 import websockets.asyncio.client
 import websockets.asyncio.server
 
-from b1k_language import (CLIP_MODEL, CLIP_REVISION, build_language_cache, encode_prompt,
-                          language_embedding_table, language_for_qpos, task_prompts)
+from b1k_language import (CLIP_MODEL, CLIP_REVISION, ENCODERS, MINILM_MODEL, MINILM_REVISION, build_language_cache,
+                          encode_prompt, encode_prompt_minilm, language_embedding_table, language_for_qpos,
+                          task_prompts)
 from b1k_server import B1KServer, PolicyPredictor, Session, packb, unpackb
 from b1k_training import load_checkpoint, make_policy, parser, save_eval_checkpoint, train
-from detr.models.backbone import Backbone, FiLMLayer
+from detr.models.backbone import Backbone, FiLMLayer, ResidualFiLMBody
 from test_b1k import observation, small_model_config, tiny_root
 
 
@@ -72,6 +73,46 @@ def fake_clip(monkeypatch):
     monkeypatch.setitem(sys.modules, 'transformers', SimpleNamespace(
         AutoTokenizer=SimpleNamespace(from_pretrained=load_tokenizer),
         CLIPTextModelWithProjection=SimpleNamespace(from_pretrained=load_model)))
+    return tokenizer, model, loaded
+
+
+class FakeMiniLMTokenizer(FakeTokenizer):
+    def __call__(self, text, add_special_tokens=True, return_tensors=None, truncation=False, max_length=None, **kwargs):
+        assert truncation and max_length == 256 and kwargs.get('return_attention_mask')
+        ids = [sum(word.encode()) % 90 + 1 for word in text.split()][:max_length - 2]
+        ids = [self.bos_token_id, *ids, self.eos_token_id]
+        return self.pad({'input_ids': [ids], 'attention_mask': [[1] * len(ids)]}, return_tensors=return_tensors)
+
+
+class FakeHiddenStateModel(torch.nn.Module):
+    """Deterministic (B, T, 384) hidden states; the language module must mean-pool and normalize them."""
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.arange(1, 385, dtype=torch.float32) / 384)
+        self.calls = []
+
+    def forward(self, input_ids, attention_mask, **kwargs):
+        self.calls.append((input_ids.clone(), attention_mask.clone(), self.training, torch.is_grad_enabled()))
+        positions = torch.arange(1, input_ids.shape[1] + 1, dtype=torch.float32)
+        hidden = torch.sin(input_ids[..., None].float() * positions[None, :, None] / 50 + self.weight)
+        return SimpleNamespace(last_hidden_state=hidden)
+
+
+@pytest.fixture
+def fake_minilm(monkeypatch):
+    tokenizer, model = FakeMiniLMTokenizer(), FakeHiddenStateModel()
+    loaded = []
+
+    def load(kind):
+        def from_pretrained(name, revision):
+            loaded.append((kind, name, revision))
+            return tokenizer if kind == 'tokenizer' else model
+        return from_pretrained
+
+    monkeypatch.setitem(sys.modules, 'transformers', SimpleNamespace(
+        AutoTokenizer=SimpleNamespace(from_pretrained=load('tokenizer')),
+        AutoModel=SimpleNamespace(from_pretrained=load('model')),
+        CLIPTextModelWithProjection=SimpleNamespace(from_pretrained=lambda *a, **k: pytest.fail('CLIP must not load'))))
     return tokenizer, model, loaded
 
 
@@ -254,7 +295,7 @@ def test_film_identity_init_matches_unconditioned_and_recompute_is_runtime_only(
               '--device', 'cpu', '--chunk-size', '4', '--image-size', '32', '32', '--hidden-dim', '32',
               '--dim-feedforward', '64', '--enc-layers', '1', '--dec-layers', '1', '--nheads', '4',
               '--no-pretrained-backbone', '--save-every', '1', '--output-dir', str(tmp_path / 'run')]
-    with pytest.raises(ValueError, match='requires --language-conditioning clip_film'):
+    with pytest.raises(ValueError, match='require --language-conditioning clip_film or mt_act'):
         train(parser().parse_args(common + ['--max-steps', '1', '--film-init', 'identity']))
     path = train(parser().parse_args(common + ['--max-steps', '1', '--language-conditioning', 'clip_film',
                                               '--film-init', 'identity', '--no-film-recompute']))
@@ -397,6 +438,164 @@ def test_conditioned_train_resume_eval_and_network_without_clip_or_sidecar(tiny_
                     np.testing.assert_array_equal(unpackb(await client.recv())['action'], reference)
         asyncio.run(network())
     assert len(loaded) == 4 and len(encoder.calls) == 4
+
+
+def test_minilm_cache_mean_pools_normalizes_and_validates(tmp_path, fake_minilm):
+    write_prompts(tmp_path, prompt_rows())
+    tokenizer, model, loaded = fake_minilm
+    task_map = {7: 'first', 9: 'second'}
+    cache = build_language_cache(tmp_path, task_map, 'task_description', 'minilm')
+    assert loaded == [('tokenizer', MINILM_MODEL, MINILM_REVISION), ('model', MINILM_MODEL, MINILM_REVISION)]
+    assert len(model.calls) == 2 and all(not training and not grad for _, _, training, grad in model.calls)
+    assert cache['model'] == MINILM_MODEL and cache['embedding_dim'] == 384 and cache['normalized'] is True
+    assert cache['long_prompt_policy'] == ENCODERS['minilm']['long_prompt_policy']
+    for task_id, prompt in task_prompts(tmp_path, task_map, 'task_description').items():
+        embedding = torch.tensor(cache['tasks'][task_id]['embedding'])
+        assert embedding.shape == (384,) and abs(float(embedding.norm()) - 1) < 1e-5
+        tokens = tokenizer(prompt, return_tensors='pt', truncation=True, max_length=256, return_attention_mask=True)
+        hidden = model(**tokens).last_hidden_state
+        expected = torch.nn.functional.normalize(hidden.mean(dim=1), dim=-1)[0]  # mask is all ones here
+        torch.testing.assert_close(embedding, expected)
+    # the 159-word description is truncated to 256 word pieces rather than chunked
+    assert model.calls[1][0].shape[1] == 161
+    table = language_embedding_table({'language_conditioning': 'mt_act', 'language_encoder': 'minilm',
+                                      'prompt_source': 'task_description'}, task_map, cache)
+    assert table.shape == (2, 384)
+    with pytest.raises(ValueError, match='incompatible checkpoint language cache'):
+        language_embedding_table({'language_conditioning': 'mt_act', 'prompt_source': 'task_description'}, task_map, cache)
+    with pytest.raises(ValueError, match='Unsupported language encoder'):
+        build_language_cache(tmp_path, task_map, 'task_description', 'other')
+
+
+def test_mt_act_residual_film_language_token_and_ignored_onehot():
+    torch.set_num_threads(1)
+    torch.manual_seed(8)
+    backbone = Backbone('resnet18', True, False, False, pretrained=False, language_conditioning='mt_act',
+                        film_cond_dim=16, norm='batch').eval()
+    body = backbone.body
+    assert isinstance(body, ResidualFiLMBody) and sorted(body.film_generators) == ['layer2', 'layer3', 'layer4']
+    assert isinstance(body.bn1, torch.nn.BatchNorm2d)
+    for name in ('layer2', 'layer3', 'layer4'):
+        layer = getattr(body, name)
+        assert body.film_generators[name].out_features == len(layer) * 2 * layer[0].conv2.out_channels
+    image, cond = torch.rand(2, 3, 32, 32), torch.randn(2, 16)
+    with torch.no_grad():
+        actual = backbone(image, lang_emb=cond)['0']
+        # Manual MT-ACT forward: stem and layer1 as torchvision, FiLM on the residual branch of later blocks.
+        x = body.maxpool(body.relu(body.bn1(body.conv1(image))))
+        x = body.layer1(x)
+        for name in ('layer2', 'layer3', 'layer4'):
+            layer = getattr(body, name)
+            film = body.film_generators[name](cond).view(2, 2, len(layer), -1)  # gamma first, beta second
+            for index, block in enumerate(layer):
+                gamma, beta = film[:, 0, index, :, None, None], film[:, 1, index, :, None, None]
+                out = block.bn2(block.conv2(block.relu(block.bn1(block.conv1(x)))))
+                identity = block.downsample(x) if block.downsample is not None else x
+                x = torch.relu((1 + gamma) * out + beta + identity)
+        torch.testing.assert_close(actual, x, atol=0, rtol=0)
+        plain = Backbone('resnet18', True, False, False, pretrained=False, norm='batch').eval()
+        plain.load_state_dict(backbone.state_dict(), strict=False)
+        identity_init = Backbone('resnet18', True, False, False, pretrained=False, language_conditioning='mt_act',
+                                 film_cond_dim=16, norm='batch', film_init='identity').eval()
+        identity_init.load_state_dict(backbone.state_dict(), strict=False)
+        for generator in identity_init.body.film_generators.values():
+            generator.weight.zero_()
+            generator.bias.zero_()
+        torch.testing.assert_close(identity_init(image, lang_emb=cond)['0'], plain(image)['0'], atol=0, rtol=0)
+    with pytest.raises(ValueError, match='projected task embeddings'):
+        backbone(image, lang_emb=torch.randn(2, 384))
+    with pytest.raises(ValueError, match='Unsupported backbone normalization'):
+        Backbone('resnet18', True, False, False, pretrained=False, norm='other')
+    # Full policy: 384-d MiniLM input, learned projection shared by FiLM and the encoder token, one-hot ignored.
+    config = dict(small_model_config(), language_conditioning='mt_act', language_encoder='minilm', state_dim=25)
+    policy = make_policy(config, 'cpu')
+    model = policy.model
+    assert model.proj_text_emb.in_features == 384 and model.proj_text_emb.out_features == config['hidden_dim']
+    assert model.additional_pos_embed.num_embeddings == 3 and not hasattr(model, 'encoder_joint_proj')
+    assert model.pos_table.shape[1] == 1 + config['num_queries'] and model.input_proj_robot_state.in_features == 25
+    assert not isinstance(model.backbones[0][0].body.bn1, torch.nn.BatchNorm2d)  # frozen unless backbone_norm=batch
+    qpos = torch.randn(2, 27)  # 25 proprioception values + two one-hot columns from the adapter
+    images, actions, pad = torch.rand(2, 3, 3, 32, 32), torch.randn(2, 4, 23), torch.zeros(2, 4, dtype=torch.bool)
+    language = torch.nn.functional.normalize(torch.randn(2, 384), dim=-1)
+    losses = policy(qpos, images, actions, pad, lang_emb=language)
+    losses['loss'].backward()
+    for name, value in policy.named_parameters():
+        if 'film_generators' in name or 'proj_text_emb' in name or 'additional_pos_embed' in name:
+            assert value.grad is not None and value.grad.abs().sum() > 0, name
+    policy.eval()
+    with torch.no_grad():
+        first = policy(qpos, images, lang_emb=language)
+        altered = qpos.clone()
+        altered[:, 25:] = 7.0
+        torch.testing.assert_close(policy(altered, images, lang_emb=language), first, atol=0, rtol=0)
+        assert (policy(qpos, images, lang_emb=-language) - first).abs().max() > 1e-6
+    with pytest.raises(ValueError, match='MT-ACT requires language embeddings'):
+        policy(qpos, images)
+    with pytest.raises(ValueError, match='at least 25 proprioception'):
+        policy(qpos[:, :20], images, lang_emb=language)
+
+
+def test_mt_act_train_resume_serve_without_transformers(tiny_root, tmp_path, fake_minilm, monkeypatch):
+    torch.set_num_threads(1)
+    write_prompts(tiny_root, prompt_rows())
+    tokenizer, encoder, loaded = fake_minilm
+    common = ['--dataset-path', str(tiny_root), '--batch-size', '2', '--num-workers', '0', '--torch-threads', '1',
+              '--device', 'cpu', '--chunk-size', '4', '--image-size', '32', '32', '--hidden-dim', '32',
+              '--dim-feedforward', '64', '--enc-layers', '1', '--dec-layers', '1', '--nheads', '4',
+              '--save-every', '1', '--dropout', '0.1', '--export-every', '1']
+    mt_act = ['--language-conditioning', 'mt_act', '--prompt-source', 'task_description',
+              '--no-pretrained-backbone', '--backbone-norm', 'batch']
+    full, split = tmp_path / 'full', tmp_path / 'split'
+    expected_path = train(parser().parse_args(common + mt_act + ['--output-dir', str(full), '--max-steps', '2']))
+    first_path = train(parser().parse_args(common + mt_act + ['--output-dir', str(split), '--max-steps', '1']))
+    assert len(loaded) == 4 and len(encoder.calls) == 4
+    first = load_checkpoint(first_path)
+    config = first['model_config']
+    assert config['language_conditioning'] == 'mt_act' and config['language_encoder'] == 'minilm'
+    assert config['state_dim'] == 25 and config['backbone_norm'] == 'batch' and config['pretrained_backbone'] is False
+    assert config['film_init'] == 'random' and first['adapter_config']['task_conditioning'] == 'onehot'
+    assert first['language_cache']['embedding_dim'] == 384 and first['language_cache']['normalized'] is True
+    assert any('running_mean' in key for key in first['model'] if 'backbones' in key)
+    assert any('proj_text_emb' in key for key in first['model']) and any('film_generators' in key for key in first['model'])
+    for option, value in [('--language-encoder', 'clip'), ('--backbone-norm', 'frozen'),
+                          ('--language-conditioning', 'clip_film')]:
+        with pytest.raises(ValueError, match='differs from checkpoint'):
+            train(parser().parse_args(common + ['--output-dir', str(split), '--resume', str(first_path),
+                                               '--max-steps', '2', option, value]))
+    monkeypatch.setitem(sys.modules, 'transformers', None)
+    resumed_path = train(parser().parse_args(common + ['--output-dir', str(split), '--resume', str(first_path),
+                                                      '--max-steps', '2', '--loader-batch-size', '1']))
+    resumed, expected = load_checkpoint(resumed_path), load_checkpoint(expected_path)
+    assert resumed['language_cache'] == expected['language_cache']
+    for key in expected['model']:
+        torch.testing.assert_close(expected['model'][key], resumed['model'][key], atol=0, rtol=0)
+    exported = load_checkpoint(split / 'export_queue/eval/step_00000002.pt')
+    tiny_root.rename(tmp_path / 'hidden_dataset')
+    predictor = PolicyPredictor(exported, 'cpu')
+    session = Session(predictor, exported, action_horizon=2)
+    obs = observation(2, np.array([7, 9]))
+    actions = session.act(obs)
+    assert actions.shape[-1] == 23 and np.isfinite(actions).all()
+    reference = Session(PolicyPredictor(resumed, 'cpu'), resumed, action_horizon=2).act(obs)
+    np.testing.assert_array_equal(actions, reference)
+    with pytest.raises(ValueError, match='require --language-conditioning'):
+        train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'bad'), '--max-steps', '1',
+                                           '--language-encoder', 'minilm']))
+
+
+@pytest.mark.skipif(os.environ.get('ACT_TEST_REAL_MINILM') != '1', reason='Opt-in cached real MiniLM CPU test')
+def test_real_minilm_matches_sentence_transformers_semantics():
+    from b1k_language import load_minilm_encoder
+    tokenizer, model = load_minilm_encoder()
+    first = encode_prompt_minilm('Slide open drawer from left to right', tokenizer, model)
+    again = encode_prompt_minilm('Slide open drawer from left to right', tokenizer, model)
+    other = encode_prompt_minilm('Cap lid on the mug with a bowl on the table', tokenizer, model)
+    assert first.shape == (384,) and abs(float(first.norm()) - 1) < 1e-5
+    torch.testing.assert_close(first, again, atol=0, rtol=0)
+    assert 0.0 < float(first @ other) < 0.9
+    # RoboAgent constants.TEXT_EMBEDDINGS[0] (the same prompt) starts with these values.
+    torch.testing.assert_close(first[:3], torch.tensor([-0.01232353039085865, 0.020831076428294182, -0.005870897322893143]),
+                               atol=2e-6, rtol=0)
 
 
 @pytest.mark.skipif(os.environ.get('ACT_TEST_REAL_CLIP') != '1', reason='Opt-in cached real CLIP CPU test')
