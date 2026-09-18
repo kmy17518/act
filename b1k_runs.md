@@ -74,7 +74,7 @@ The forward precision itself barely matters (TF32-trained weights lose only 0.12
 
 Swapping only the statistics grouping on the same batch reproduces almost the whole gap (+48 % of the +56 %; the rest is the EMA), and the camera-batched model has the ordinary sub-percent BatchNorm train/eval difference. Per-camera normalization does fit the training batches a little better (0.1121 vs 0.1163), but that advantage does not exist in eval mode, where the camera-batched model is 33 % better (0.1170 vs 0.1747).
 
-*The other fix — per-camera running statistics (domain-specific BatchNorm) — also works, without retraining.* Estimating one set of running statistics per camera for the existing per-camera-trained TF32 checkpoint (cumulative average over the same 16 batches, train-mode BatchNorm, one camera at a time, ImageNet-normalized inputs as `ACTPolicy` provides) and swapping each camera's statistics in before its backbone pass gives eval-mode L1 **0.1119** — the training regime's 0.1121 recovered exactly — versus 0.1747 with the checkpoint's mixed statistics; feeding each camera another camera's statistics (control) gives 0.2267 (`/tmp/act-lang-probe/bn_per_camera_eval.py`). The per-camera means differ from the mixed ones by only 0.04 standard deviations on average, so the network is sensitive to small systematic normalization shifts compounded over 20 layers. Not implemented as a model option: it needs per-camera running buffers in the BatchNorm layers (shared affine), the camera index passed through the backbone, and a one-off conversion for existing checkpoints; camera batching reaches 0.117 with standard BatchNorm.
+*The other fix — per-camera running statistics (domain-specific BatchNorm) — also works, without retraining.* Estimating one set of running statistics per camera for the existing per-camera-trained TF32 checkpoint (cumulative average over the same 16 batches, train-mode BatchNorm, one camera at a time, ImageNet-normalized inputs as `ACTPolicy` provides) and swapping each camera's statistics in before its backbone pass gives eval-mode L1 **0.1119** — the training regime's 0.1121 recovered exactly — versus 0.1747 with the checkpoint's mixed statistics; feeding each camera another camera's statistics (control) gives 0.2267 (`/tmp/act-lang-probe/bn_per_camera_eval.py`). The per-camera means differ from the mixed ones by only 0.04 standard deviations on average, so the network is sensitive to small systematic normalization shifts compounded over 20 layers. Implemented as `--backbone-norm batch_per_camera` plus `scripts/b1k/recalibrate_camera_batchnorm.py` (see "Per-camera running statistics" below); camera batching reaches 0.116 with standard BatchNorm.
 
 ### Shared BatchNorm statistics across cameras (`--backbone-camera-batch`) — 2026-09-18
 
@@ -98,6 +98,28 @@ Logs/exit files: `/tmp/dev/logs/act-radio-mt-act-cambatch-240px-300k-<tag>.{log,
 | MT-ACT per-camera, `bf16-backbone` | 0.1745 | 0.1124 | 0.1227 | 0.1235 |
 
 Shared statistics remove the gap (eval 0.1162 vs batch-statistics 0.1161) and cut the served-mode error by a third (0.175 → 0.116) at identical cost; the per-camera runs' lower training-log L1 (0.1234 vs 0.1280) was the flattering effect of a normalization that serving cannot reproduce. Served, the from-scratch MT-ACT now sits between the ImageNet-initialized baseline and the CLIP FiLM variants; `bf16-backbone` stays within 0.7 % of TF32. Training losses on 24,960 samples at 1.7 % of the schedule; no rollout or convergence claim.
+
+### Per-camera running statistics (`--backbone-norm batch_per_camera`) — 2026-09-18
+
+Commit `0be5692` adds the other fix as a model option (b1k.md "Per-camera running statistics"): RoboAgent's per-camera passes and training computation unchanged, one set of BatchNorm running statistics per camera, selected before each pass, so serving normalizes each camera as training did. Two 240 px runs (`ACT_BACKBONE_NORM=batch_per_camera`, "-percam"), otherwise identical to the per-camera runs above, stopped at 5,000 steps by the watcher (exit 130, `step_00005000.pt` saved, W&B runs finished):
+
+| Run (`outputs/turning-on-radio-mt-act-percam-240px-bs1560-300k-<tag>`) | `ACT_AUTOCAST` | GPU / cores | W&B id | s/step | peak GiB | stopped after |
+| --- | --- | --- | --- | --- | --- | --- |
+| `opt20260917` | `none` (TF32) | 1 / 0-29 | `actradio-mtact-percam-240px-opt20260917` | 0.500 | 196 | step 5,002 |
+| `opt20260917-bf16bb` | `bf16-backbone` | 3 / 30-59 | `actradio-mtact-percam-240px-opt20260917-bf16bb` | 0.428 | 156 | step 5,020 |
+
+Logs/exit files: `/tmp/dev/logs/act-radio-mt-act-percam-240px-300k-<tag>.{log,exit}`. Speed and memory equal the per-camera-pass runs (the compiled body specializes once per camera index; 34 s of extra first-step compile). The training computation is identical to the RoboAgent-faithful runs, so the training-log L1 is too (4,901–5,000: 0.1234 / 0.1235). Same 16-batch evaluation (`/tmp/act-lang-probe/served_eval.py`, TF32 forward, no dropout) of every MT-ACT step-5,000 checkpoint at 240 px:
+
+| Weights | served (eval mode, running statistics) | training regime (BN batch statistics) |
+| --- | --- | --- |
+| per-camera passes, mixed statistics (RoboAgent), TF32 | 0.1747 | 0.1121 |
+| same weights after `recalibrate_camera_batchnorm.py` (16 batches, 7 s) | 0.1119 | 0.1121 |
+| camera-batched (joint statistics), TF32 | 0.1162 | 0.1161 |
+| camera-batched (joint statistics), `bf16-backbone` | 0.1170 | 0.1163 |
+| **per-camera statistics, TF32** | **0.1119** | 0.1121 |
+| **per-camera statistics, `bf16-backbone`** | **0.1117** | 0.1120 |
+
+Per-camera statistics close the gap completely (served within 0.2 % of the training regime) and serve 3.7 % better than joint statistics (0.1119 vs 0.1162), because per-camera normalization also removes camera-specific offsets before the transformer; the recalibration tool reaches the same point from the RoboAgent-faithful checkpoint without retraining (the run trained natively with per-camera statistics has the same weights: only the running-statistics bookkeeping differs). `bf16-backbone` is neutral here too (0.1117). Training-set losses on 24,960 samples at 1.7 % of the schedule; no rollout or convergence claim.
 
 ## Optimized CLIP/FiLM runs, random vs identity initialization — 2026-09-17
 
