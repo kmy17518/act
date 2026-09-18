@@ -1,5 +1,40 @@
 # ACT radio training run — 2026-09-16
 
+## Optimized CLIP/FiLM runs, random vs identity initialization — 2026-09-17
+
+The `lang` branch (this checkout, worktree `/tmp/dev/baselines/act-lang` with its own `.venv`) merged the `my` branch throughput work (frame cache, TF32, channels-last, fused AdamW, Triton stem pooling, skipped unused decoder layers, GPU batch assembly, `--compile regions-autotune`; see "Throughput (2026-09-17)" below). The merge added `--film-init random|identity` (saved as `model_config['film_init']`) and the runtime `--film-recompute/--no-film-recompute` switch; the FiLM layers are part of the compiled backbone region. CPU suite after the merge: **118 passed, 4 skipped** (`tests/`).
+
+Two 300,000-step runs launched on 2026-09-18 from this commit, identical to the unconditioned `outputs/turning-on-radio-act-bs1560-300k-opt20260917` recipe (batch **1,560**, TF32, fp32 weights/optimizer, same architecture, images, sampler seed 0 and checkpoint schedule) plus `--language-conditioning clip_film --prompt-source task_name`, which is the comparison they are meant for:
+
+| Run | FiLM init | GPU | cores | W&B run | log/exit |
+| --- | --- | --- | --- | --- | --- |
+| `outputs/turning-on-radio-act-clipfilm-taskname-random-bs1560-300k-opt20260917` | `random` (nn.Linear default) | 1 (`GPU-82d44829-7cec-7d3c-9918-6dc1321320d4`) | 0-29 | `actradioclip-random-opt20260917` | `/tmp/dev/logs/act-radio-clipfilm-random-300k-opt20260917.{log,exit}` |
+| `outputs/turning-on-radio-act-clipfilm-taskname-identity-bs1560-300k-opt20260917` | `identity` (zero projection) | 3 (`GPU-3b6edd76-2c6a-3087-f7f1-964db3c27635`) | 30-59 | `actradioclip-identity-opt20260917` | `/tmp/dev/logs/act-radio-clipfilm-identity-300k-opt20260917.{log,exit}` |
+
+Both use W&B project `b1k-challenge-2026-act` (entity `kmy17518`), the run directory name as the W&B name, and no uploader (checkpoints stay local: three newest full saves plus eval exports every 10,000 steps). With the shared seed 0 the two conditioned runs start from byte-identical non-FiLM weights and draw the same batch sequence; only the FiLM projections differ (default vs zero). Their weights are not byte-identical to the unconditioned run (constructing the FiLM projections consumes RNG before the transformer is initialized); the byte-paired three-arm comparison is the controlled diagnostic below.
+
+```bash
+source /tmp/dev/env.sh
+tmux -L b1k-act-lang new-session -d -s act-radio-lang-random \
+  'ACT_FILM_INIT=random bash /tmp/dev/baselines/act-lang/scripts/b1k/run_radio_language_300k.sh'
+tmux -L b1k-act-lang new-session -d -s act-radio-lang-identity \
+  'ACT_FILM_INIT=identity bash /tmp/dev/baselines/act-lang/scripts/b1k/run_radio_language_300k.sh'
+```
+
+Restart rule as before: a run resumes its own `latest.pt`; archive its `.exit` file first, and never start a second trainer for the same directory (the GPU occupancy check and `run.lock` reject overlaps).
+
+**Throughput of the conditioned trainer** (batch 1,560, 30 cores, 25-step probes on GPU 1, steady-state median `timing/step_s`, peak allocated memory):
+
+| Configuration | s/step | peak GPU memory |
+| --- | --- | --- |
+| unconditioned recipe (`opt20260917` run, for reference) | 0.45 s | 150 GiB |
+| clip_film, eager, `--film-recompute` (the original language recipe's memory behaviour) | 0.78 s | 165 GiB |
+| clip_film, eager, `--no-film-recompute` | 0.66 s | 196 GiB |
+| clip_film, `--compile regions-autotune`, `--film-recompute` | 0.48 s | 135 GiB |
+| clip_film, `--compile regions-autotune`, `--no-film-recompute` (**launched configuration**) | **0.45 s** | 165 GiB |
+
+The FiLM layers themselves are nearly free once compiled (the eight `Linear(768, 2C)` projections and one fused affine+ReLU per block); the activation recomputation that the original language recipe needed for memory costs ~7 % per step and is no longer necessary at this batch (165 of 284 GiB). Loader wait stays below 10 ms. At 0.45 s/step, 300,000 steps take about 37.5 hours per run. Probe logs: `/tmp/act-lang-probe/*.log` (outside git).
+
 ## Task-name CLIP/FiLM run
 
 **Stopped by user on 2026-09-17 at 05:15 UTC.** The trainer stopped after recorded step **10,656**; the latest resumable/full and eval checkpoint is **step 10,000**. Trainer, uploader, scheduled health reviews and failure watcher are stopped. Checkpoints and upload journals remain intact. The historical launch/monitoring statements below describe the earlier running state; do not restart this run without a new request.
@@ -65,10 +100,32 @@ For the user's subsequent **one-hour limit**, the primary paired ACT/DP comparis
 - Target: **300,000 optimizer steps**.
 - Policy: upstream ACT, ImageNet-initialized ResNet18, sine positions, post-norm, hidden 512, feedforward 3200, 4 encoder / 7 decoder layers, 8 heads, action chunk 100, KL weight 10.
 - Three RGB cameras at 240x240; R1Pro state plus one task category; 23-D actions.
-- FP32 AdamW, learning rate and backbone learning rate `1e-5`, weight decay `1e-4`.
-- Physical batch **1,560**, no gradient accumulation. Loader slices of 128 are reassembled in original order before one optimizer update.
-- GPU 2 (`GPU-aa99f910-8e39-d04c-a717-a6f7a06f52e8`), CPU affinity **60-89**, 24 data workers, one thread per worker, two main-process torch threads, prefetch factor 1.
+- FP32 weights and AdamW state (fused CUDA AdamW), learning rate and backbone learning rate `1e-5`, weight decay `1e-4`; TF32 tensor-core matmuls (`--matmul-precision high`), no autocast.
+- Physical batch **1,560**, no gradient accumulation. Loader slices of 128 are reassembled in original order on the GPU before one optimizer update.
+- GPU 2, CPU affinity **60-89**. Since 2026-09-17: uint8 resized-frame cache (`--frame-cache`), 8 data workers, prefetch factor 2, `--compile regions-autotune`, bit-identical channels-last stem pooling; through step 10,777 the run used native per-sample video decoding with 24 workers and prefetch factor 1. The host was re-provisioned later on 2026-09-17 (new GPU UUIDs; the recipe defaults to the new GPU 2, `GPU-10567c56-9603-b2aa-1ce1-63234ee50192`, and accepts `GPU_UUID=`). The local run directory, `.venv`, frame cache and staged headers were lost in that move; the step-10000 full checkpoint was restored from the Hugging Face `resume/` path into `outputs/turning-on-radio-act-bs1560-300k-20260916/` (`latest.pt` -> `step_00010000.pt`), the dataset was re-synced (same bytes, new mtimes: the trainer now verifies exact statistics instead of refusing the changed fingerprint), and the cache was rebuilt.
 - `PYTORCH_ALLOC_CONF=expandable_segments:True` avoids allocator fragmentation at this near-capacity batch.
+
+## Throughput (2026-09-17)
+
+The run was paused at step 10,777 (`latest.pt` = step 10,000) to speed up the trainer without changing the model, loss, optimizer, sampling or which parameters train. Steady-state medians on the assigned GPU with the same 30 cores:
+
+| Configuration | batch 1024 | batch 1560 | peak GPU memory (1560) |
+| --- | --- | --- | --- |
+| Original recipe (native decode, fp32 matmuls, 24 workers) | 1.77 s/step | 3.40 s/step (2.37 s compute + ~1 s loader wait) | 269 GiB |
+| + frame cache, GPU batch assembly, channels-last, fused AdamW (fp32) | 1.47 s | — | 236 GiB |
+| + TF32 matmuls | 0.60 s | 0.93 s | 236 GiB |
+| + unused decoder layers skipped (bitwise identical) | 0.41 s | 0.65 s | 187 GiB |
+| + `--compile regions` | 0.32 s | 0.48 s | 162 GiB |
+| + bit-identical channels-last max-pool kernels | 0.31 s | 0.47 s | 150 GiB |
+| + `--compile regions-autotune` (GEMM/convolution kernel autotuning; **current recipe**) | **0.30 s** | **0.45 s** (3,500 samples/s) | 150 GiB |
+| opt-in `--autocast bf16-backbone` on top (bf16 only inside the ResNet bodies) | 0.28 s | 0.42 s | 139 GiB |
+| opt-in `--autocast bf16` instead of TF32 (not used: shifts L1 by +0.6–1.0 %) | 0.29 s | 0.44 s | 104 GiB |
+
+Loader wait is below 10 ms per step in every cached configuration. Validation: cached frames are byte-identical to native decoding (1,536 of 1,536 sampled frames) up to the documented half-LSB rounding of the resize; skipping the discarded decoder layers gives bitwise-identical predictions, gradients and optimizer trajectories; the step-10000 checkpoint resumed through the new pipeline reproduces the original run's per-step L1 within ±0.3 % (the dropout-RNG noise floor, identical to what the untouched native path shows) under fp32 and TF32; a 150-step batch-1560 run with saves/exports and a resume from its step-100 checkpoint reproduced the uninterrupted losses exactly. Over 300 resumed steps from step 10000, the mean per-step L1 deviation from the original run is +0.040 % (TF32 eager), +0.046 % (TF32 + `--compile regions`), +0.082 % (`--autocast bf16-backbone`) and +0.77 % (full `--autocast bf16`), with KL and gradient norms indistinguishable except under full bf16 (+25 % gradient norm). Details: `/tmp/dev/audits/act-speed-20260917/` (benchmarks, `numerics-b256.json`, resume comparisons).
+
+Measured but not adopted: PyTorch's multi-tensor AdamW and the fused kernel take the same 2.55 ms per step for ACT's 263 parameter tensors (either is fine; the recipe keeps fused), and CUDA graphs for the compiled regions (`reduce-overhead`) gave 0.293 vs 0.297 s/step at batch 1024, within noise, for extra allocator complexity. On the re-provisioned host the recipe measured 0.297 s/step (batch 1024) and 0.440 s/step (batch 1560), with the restored step-10000 checkpoint resuming to the same losses as before.
+
+At 0.45 s/step the remaining 289,223 steps take about 36 hours instead of roughly 12 days. Compiling for a new shape set costs about three minutes once (Inductor caches under `/tmp/.cache/torchinductor`).
 
 The node has a 130-CPU quota. Two other runs were budgeted 30 cores each; ACT and DP each get 30, while uploaders use cores 120-123. These are process-affinity limits, not an exclusive system reservation of CPUs.
 
@@ -82,25 +139,25 @@ Detailed probe and live verification artifacts are outside git at `/tmp/dev/audi
 
 ## Detached processes
 
-Dedicated tmux server socket name: **`b1k-act-dp`**.
+Dedicated tmux server socket name: **`b1k-act`** (the original 2026-09-16 launches used `b1k-act-dp`, now shared with a DP run whose global environment must not leak into ACT launches).
 
 ```bash
 source /tmp/dev/env.sh
-tmux -L b1k-act-dp list-sessions
-tmux -L b1k-act-dp attach -t act-radio-train
-tmux -L b1k-act-dp attach -t act-radio-upload
+tmux -L b1k-act list-sessions
+tmux -L b1k-act attach -t act-radio-train
+tmux -L b1k-act attach -t act-radio-upload
 ```
 
 Launch recipes (run in separate tmux sessions, trainer first):
 
 ```bash
-tmux -L b1k-act-dp new-session -d -s act-radio-train \
+tmux -L b1k-act new-session -d -s act-radio-train \
   'bash /tmp/dev/baselines/act/scripts/b1k/run_radio_300k.sh'
-tmux -L b1k-act-dp new-session -d -s act-radio-upload \
+tmux -L b1k-act new-session -d -s act-radio-upload \
   'bash /tmp/dev/baselines/act/scripts/b1k/upload_radio_300k.sh'
 ```
 
-The training recipe automatically resumes `latest.pt` if present. Before deliberately restarting an exited job, inspect and archive its `.exit` file; never start a second trainer/uploader for the same run. GPU occupancy checks and file locks reject overlapping jobs. Tmux survives the Grok session ending, but not a machine/container termination.
+The training recipe automatically resumes `latest.pt` if present. It first (re)builds and spot-checks the frame cache (a no-op once complete, ~8 minutes from scratch) and the first step after a restart includes a few minutes of `torch.compile` time (cached on disk under `/tmp/.cache/torchinductor` afterwards). Its header documents the overrides, all prefixed `ACT_` so a tmux server shared with the Diffusion Policy recipe cannot redirect the run: `ACT_BATCH_SIZE`, `ACT_RUN_TAG` (any tag other than `20260916` starts a fresh run directory/log/W&B run instead of resuming this one), `ACT_AUTOCAST` (`none` = the TF32 recipe; `bf16-backbone` and `bf16` are the faster, measured, non-default variants), `ACT_COMPILE_MODE`, `ACT_GPU_UUID`, `ACT_CORES`, `ACT_FRAME_CACHE`, `ACT_WANDB_ID`. Use the dedicated tmux server `b1k-act` (not the `b1k-act-dp` server the DP recipe launched with its own environment). Environment: `scripts/b1k/setup_venv.sh` recreates `.venv` from `requirements-b1k.lock.txt` and stages Triton's Python headers. Before deliberately restarting an exited job, inspect and archive its `.exit` file; never start a second trainer/uploader for the same run. GPU occupancy checks and file locks reject overlapping jobs. Tmux survives the Grok session ending, but not a machine/container termination.
 
 ## Checkpoints and cloud destinations
 

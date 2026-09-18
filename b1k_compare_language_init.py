@@ -300,6 +300,8 @@ def restrict_episodes(dataset, episode_ids):
     dataset.lengths = np.array([ep['length'] for ep in dataset.episodes], dtype=np.int64)
     dataset.ends = dataset.lengths.cumsum()
     dataset.starts = dataset.ends - dataset.lengths
+    dataset.positions = {int(ep['episode_index']): i for i, ep in enumerate(dataset.episodes)}
+    dataset._table = dataset._frame_rows = None  # in-memory rows (frame-cache mode) are indexed by position
     dataset.stats = None
     return dataset
 

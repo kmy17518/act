@@ -1,7 +1,7 @@
 """Step-based training and standalone checkpoints for upstream ACT and CNNMLP policies."""
 
 import argparse
-from contextlib import contextmanager, ExitStack
+from contextlib import contextmanager, ExitStack, nullcontext
 import fcntl
 from functools import partial
 import json
@@ -19,6 +19,9 @@ import torch
 from torch.utils.data import DataLoader
 
 from b1k_dataset import B1KDataset, CAMERAS, OBS_KEYS, STATE_INDICES, VIDEO_KEYS, SplitBatchSampler, StepBatchSampler
+from b1k_frame_cache import dequantize_images
+from detr.models.maxpool_nhwc import MaxPool3x3NHWC, replaces
+from detr.models.transformer import use_fused_attention
 from policy import ACTPolicy, CNNMLPPolicy
 from b1k_language import (build_language_cache, language_embedding_table, language_for_qpos,
                           language_mode, validate_resume_prompts)
@@ -56,12 +59,49 @@ def policy_class(model_config):
     return name
 
 
-def make_policy(model_config, device, restoring=False):
-    config = dict(model_config, programmatic=True, device=str(device))
+def make_policy(model_config, device, restoring=False, fused_optimizer=False, skip_unused_decoder_layers=True,
+                attention='auto', backbone_autocast_dtype=None, fast_maxpool=False, film_recompute=True):
+    """Build the upstream policy.
+
+    `fused_optimizer`, `skip_unused_decoder_layers`, `attention`, `backbone_autocast_dtype`, `fast_maxpool`
+    and `film_recompute` are runtime execution choices, not saved model configuration. ACT consumes only the
+    first stacked decoder output, so with the skip enabled the remaining decoder layers are not executed;
+    predictions and every gradient are unchanged (see `unused_gradients` for the optimizer side).
+    `attention` selects the nn.MultiheadAttention path (`detr.models.transformer.use_fused_attention`).
+    `backbone_autocast_dtype` runs only the convolutional bodies under autocast and returns fp32 features.
+    `fast_maxpool` swaps the stateless ResNet stem pooling for the bit-identical channels-last kernels.
+    `film_recompute` recomputes the CLIP FiLM-conditioned residual blocks in backward (memory for time);
+    the FiLM initialization itself (`model_config['film_init']`) is saved model configuration.
+    """
+    config = dict(model_config, programmatic=True, device=str(device), fused_optimizer=fused_optimizer)
     if restoring:
         config['pretrained_backbone'] = False
     policy_type = ACTPolicy if policy_class(config) == 'ACT' else CNNMLPPolicy
-    return policy_type(config)
+    policy = policy_type(config)
+    if skip_unused_decoder_layers and hasattr(policy.model, 'decoder_layers_used'):
+        policy.model.decoder_layers_used = 1
+    use_fused_attention(attention)  # validate the mode
+    for module in policy.modules():
+        if hasattr(module, 'attention'):
+            module.attention = attention
+    for backbone in policy.model.backbones:
+        backbone.body_autocast_dtype = backbone_autocast_dtype
+        if fast_maxpool and replaces(getattr(backbone[0].body, 'maxpool', None)):
+            backbone[0].body.maxpool = MaxPool3x3NHWC()
+        if hasattr(backbone[0].body, 'recompute'):
+            backbone[0].body.recompute = film_recompute
+    return policy
+
+
+def unused_gradients(policy):
+    """Persistent zero gradients for parameters the forward pass never reaches.
+
+    Upstream autograd produces exactly-zero gradients for those parameters, and AdamW still applies
+    its decoupled weight decay to them. Assigning the same zeros after each backward keeps every
+    parameter and optimizer-state trajectory identical while their forward/backward work is skipped.
+    """
+    parameters = getattr(getattr(policy, 'model', None), 'unused_parameters', list)()
+    return [(parameter, torch.zeros_like(parameter)) for parameter in parameters]
 
 
 def _sync_directory(path):
@@ -164,9 +204,32 @@ def save_eval_checkpoint(run, policy, step, output):
     return path
 
 
-def optimizer_batches(loader, batch_size, loader_batch_size):
+def optimizer_batches(loader, batch_size, loader_batch_size, device=None, stream=None):
+    """Yield one ordered optimizer batch per step: (images, qpos, actions, is_pad, per-sample timings).
+
+    Worker slices are reassembled in sampler order. With a CUDA `device`, the four tensors are
+    allocated on the device and each pinned slice is copied straight into place (`stream`, when given,
+    carries the copies so they overlap the previous step's compute; consume with `consume_batch`).
+    Without a device the batch is assembled on the host exactly as before.
+    """
+    on_device = device is not None and torch.device(device).type == 'cuda'
+    context = torch.cuda.stream(stream) if on_device and stream is not None else nullcontext()
+
+    def allocate(first):
+        if on_device:
+            return torch.empty((batch_size, *first.shape[1:]), dtype=first.dtype, device=device)
+        return torch.empty((batch_size, *first.shape[1:]), dtype=first.dtype, pin_memory=loader.pin_memory)
+
     if not loader_batch_size or loader_batch_size >= batch_size:
-        yield from loader
+        for batch in loader:
+            if on_device:
+                with context:
+                    tensors = [value.to(device, non_blocking=True) for value in batch[:4]]
+                yield (*tensors, batch[4])
+                del tensors
+            else:
+                yield batch
+            del batch
         return
     slices = []
     parts = (batch_size + loader_batch_size - 1) // loader_batch_size
@@ -174,23 +237,107 @@ def optimizer_batches(loader, batch_size, loader_batch_size):
         slices.append(batch)
         if len(slices) == parts:
             tensors = []
-            for column in range(4):
-                first = slices[0][column]
-                merged = torch.empty((batch_size, *first.shape[1:]), dtype=first.dtype, pin_memory=loader.pin_memory)
-                offset = 0
-                for part in slices:
-                    value = part[column]
-                    merged[offset:offset + len(value)].copy_(value)
-                    offset += len(value)
-                if offset != batch_size:
-                    raise RuntimeError('Incorrect optimizer batch size from data loader')
-                tensors.append(merged)
+            with context:
+                for column in range(4):
+                    merged = allocate(slices[0][column])
+                    offset = 0
+                    for part in slices:
+                        value = part[column]
+                        merged[offset:offset + len(value)].copy_(value, non_blocking=on_device)
+                        offset += len(value)
+                    if offset != batch_size:
+                        raise RuntimeError('Incorrect optimizer batch size from data loader')
+                    tensors.append(merged)
             timings = {key: torch.cat([part[4][key] for part in slices]) for key in slices[0][4]}
             slices.clear()
             yield (*tensors, timings)
-            del tensors, timings, merged, first, value, part, batch
+            del tensors, timings, merged, value, part, batch
     if slices:
         raise RuntimeError('Incomplete optimizer batch from data loader')
+
+
+def verify_resynced_dataset(dataset, stats, fingerprint):
+    """Accept a resumed dataset whose fingerprint changed only because files were re-synced.
+
+    The fingerprint covers file sizes and mtimes, so a re-downloaded copy of the same data fails the
+    cheap check. Exact full-dataset statistics are deterministic in the data alone; recomputing them
+    and requiring equality with the checkpoint (plus the same frame count) proves the selected rows
+    are unchanged. Approximate (smoke) statistics cannot be verified this way and still fail.
+    """
+    if stats.get('approximate'):
+        raise ValueError('Resume dataset metadata/files differ from checkpoint; use the same local subset')
+    recomputed = dataset.compute_stats()
+    keys = ('qpos_mean', 'qpos_std', 'action_mean', 'action_std', 'count', 'std_correction', 'std_floor')
+    if any(recomputed[key] != stats[key] for key in keys) or recomputed['approximate']:
+        raise ValueError('Resume dataset metadata/files differ from checkpoint; use the same local subset')
+    LOGGER.warning('Dataset fingerprint changed (%s -> %s) but the exact statistics of all %d selected frames are '
+                   'identical; accepting the re-synced files', stats['fingerprint'][:16], fingerprint[:16], stats['count'])
+
+
+def compile_policy(policy, mode):
+    """torch.compile forward passes in place; parameters, state_dict keys and the optimizer are untouched.
+
+    'backbone' compiles each ResNet body (convolutions stay cuDNN calls; Inductor fuses the frozen
+    batch-norm affine, ReLU, residual and pooling elementwise work). 'regions' additionally compiles
+    the ACT style encoder and transformer as separate graphs with Inductor's pattern matcher off, so
+    the explicit TF32 attention is kept instead of being rewritten into the fp32-only fused kernel.
+    Other modes compile the whole network forward.
+    """
+    if mode in ('backbone', 'regions', 'regions-autotune'):
+        import torch._inductor.config as inductor_config
+        if mode == 'regions-autotune':
+            # Benchmark Triton/cuBLAS GEMM and convolution choices per shape (a few extra minutes once,
+            # cached on disk); the selected kernels are still TF32/fp32.
+            inductor_config.max_autotune = True
+        for backbone in policy.model.backbones:
+            body = backbone[0]
+            body.forward = torch.compile(body.forward)
+        if mode != 'backbone':
+            inductor_config.pattern_matcher = False
+            for module in (policy.model.encoder, policy.model.transformer):
+                module.forward = torch.compile(module.forward)
+    else:
+        policy.model.forward = torch.compile(policy.model.forward, mode=mode)
+    return policy
+
+
+def match_optimizer_state_layout(optimizer):
+    """Give restored moment tensors the memory layout of their (possibly channels-last) parameters.
+
+    Restored states are plain contiguous tensors; fused/foreach kernels pair elements positionally, so
+    the layouts must agree. `empty_like` preserves the parameter's strides and `copy_` is a logical copy.
+    """
+    for group in optimizer.param_groups:
+        for parameter in group['params']:
+            for key, value in list(optimizer.state.get(parameter, {}).items()):
+                if torch.is_tensor(value) and value.shape == parameter.shape and value.stride() != parameter.stride():
+                    optimizer.state[parameter][key] = torch.empty_like(parameter).copy_(value)
+
+
+def prepare_images(images, channels_last=True):
+    """Loader images to the float (batch, camera, 3, H, W) tensor in [0, 1] the policies expect.
+
+    uint8 frame-cache batches arrive as (batch, camera, H, W, 3) and become float images whose
+    per-camera slices are dense channels-last blocks; float batches only get re-laid out the same
+    way when `channels_last` asks for it.
+    """
+    if images.dtype == torch.uint8:
+        images = dequantize_images(images)
+        return images if channels_last else images.contiguous()
+    if channels_last and images.dim() == 5:
+        return images.permute(1, 0, 3, 4, 2).contiguous().permute(1, 0, 4, 2, 3)
+    return images
+
+
+def consume_batch(batch, stream=None, channels_last=True):
+    """Hand a prefetched batch to the current stream and convert its images for the forward pass."""
+    images, qpos, actions, is_pad, timings = batch
+    if stream is not None:
+        current = torch.cuda.current_stream(images.device)
+        current.wait_stream(stream)
+        for tensor in (images, qpos, actions, is_pad):
+            tensor.record_stream(current)
+    return prepare_images(images, channels_last), qpos, actions, is_pad, timings
 
 
 def configure_cpu_threads(worker_id=None, torch_threads=1, arrow_threads=1, opencv_threads=1):
@@ -287,6 +434,12 @@ def parser():
     p.add_argument('--policy-class', choices=['ACT', 'CNNMLP'], default='ACT')
     p.add_argument('--language-conditioning', choices=['none', 'clip_film'], default='none', action=LanguageOption)
     p.add_argument('--prompt-source', choices=['task_name', 'task_description'], default='task_name', action=LanguageOption)
+    p.add_argument('--film-init', choices=['random', 'identity'], default='random', action=LanguageOption,
+                   help='clip_film projection initialization: nn.Linear default ("random") or zeros so every FiLM '
+                        'layer starts as the identity ("identity"); saved in the checkpoint model configuration')
+    p.add_argument('--film-recompute', action=argparse.BooleanOptionalAction, default=True,
+                   help='Recompute the FiLM-conditioned ResNet blocks during backward instead of storing their '
+                        'activations (same math; less memory, more compute). Runtime choice, not saved')
     p.add_argument('--chunk-size', type=int, default=100, help='ACT prediction length; CNNMLP always uses one action')
     p.add_argument('--image-size', type=int, nargs=2, metavar=('HEIGHT', 'WIDTH'),
                    help='Default: ACT 240 240; CNNMLP 480 640 (original convolution/flatten path)')
@@ -315,6 +468,35 @@ def parser():
     p.add_argument('--stats-max-frames', type=int, help='Smoke only: use first N selected frames, not full statistics')
     p.add_argument('--cache-row-groups', type=int, default=2)
     p.add_argument('--timestamp-tolerance', type=float, default=0.008)
+    p.add_argument('--frame-cache', type=Path, help='Root of the uint8 resized-frame cache built by '
+                   'scripts/b1k/build_frame_cache.py for this image size; default decodes video per sample')
+    p.add_argument('--matmul-precision', choices=['highest', 'high', 'medium'], default='highest',
+                   help='torch.set_float32_matmul_precision for fp32 matmuls; "high" enables TF32 tensor cores '
+                        '(convolutions already default to TF32 in PyTorch)')
+    p.add_argument('--autocast', choices=['none', 'bf16', 'bf16-backbone'], default='none',
+                   help='bf16 autocast on CUDA for the whole forward pass ("bf16"; weights, optimizer state, output '
+                        'heads, latent distribution and losses stay fp32) or for the ResNet bodies only '
+                        '("bf16-backbone"; fp32 features, transformer and heads)')
+    p.add_argument('--channels-last', action=argparse.BooleanOptionalAction, default=True,
+                   help='Channels-last (NHWC) memory layout for the convolutional backbone (layout only)')
+    p.add_argument('--fused-optimizer', action=argparse.BooleanOptionalAction, default=True,
+                   help='Single-kernel fused AdamW on CUDA (same update rule)')
+    p.add_argument('--cudnn-benchmark', action=argparse.BooleanOptionalAction, default=True,
+                   help='Let cuDNN autotune convolution algorithms for the fixed batch shape')
+    p.add_argument('--fast-maxpool', action=argparse.BooleanOptionalAction, default=True,
+                   help='Bit-identical channels-last Triton kernels for the ResNet stem max pooling on CUDA')
+    p.add_argument('--compile', choices=['none', 'backbone', 'regions', 'regions-autotune', 'default',
+                                         'max-autotune-no-cudagraphs'], default='none',
+                   help='torch.compile on CUDA: "backbone" compiles the ResNet bodies only (fuses frozen-BN/ReLU/'
+                        'residual elementwise work around cuDNN convolutions), "regions" also compiles the ACT '
+                        'encoder/transformer separately, "regions-autotune" additionally benchmarks GEMM/convolution '
+                        'kernel choices; other modes compile the whole network')
+    p.add_argument('--compute-unused-decoder-layers', action='store_true',
+                   help='Also run the ACT decoder layers whose outputs are discarded (upstream behavior); '
+                        'by default they are skipped and receive the same exactly-zero gradients')
+    p.add_argument('--attention', choices=['auto', 'fused', 'explicit'], default='auto',
+                   help='nn.MultiheadAttention path: explicit upstream matmul+softmax, fused scaled-dot-product '
+                        'kernels, or auto (fused only under autocast)')
     return p
 
 
@@ -356,7 +538,7 @@ def _train(args, output, root, resources):
         adapter = checkpoint['adapter_config']
         model_config = dict(checkpoint['model_config'])
         model_config.setdefault('policy_class', 'ACT')
-        for key, default in [('language_conditioning', 'none'), ('prompt_source', 'task_name')]:
+        for key, default in [('language_conditioning', 'none'), ('prompt_source', 'task_name'), ('film_init', 'random')]:
             saved_value = model_config.get(key, default)
             if getattr(args, f'_{key}_explicit', False) and getattr(args, key) != saved_value:
                 raise ValueError(f'--{key.replace("_", "-")} differs from checkpoint')
@@ -388,6 +570,10 @@ def _train(args, output, root, resources):
                         'position_embedding': args.position_embedding, 'pre_norm': args.pre_norm,
                         'language_conditioning': args.language_conditioning, 'prompt_source': args.prompt_source,
                         'dilation': False, 'masks': False, 'action_dim': 23}
+        if args.language_conditioning == 'clip_film':
+            model_config['film_init'] = args.film_init
+        elif getattr(args, '_film_init_explicit', False):
+            raise ValueError('--film-init requires --language-conditioning clip_film')
         if args.policy_class == 'CNNMLP':
             model_config['image_size'] = list(image_size)
     if policy_class(model_config) == 'ACT':
@@ -398,7 +584,8 @@ def _train(args, output, root, resources):
                           arrow_threads=args.arrow_threads, opencv_threads=args.opencv_threads)
     dataset = B1KDataset(root, task_names, model_config['num_queries'], adapter['image_size'],
                          cache_row_groups=args.cache_row_groups, profile_reads=True,
-                         timestamp_tolerance=adapter['timestamp_tolerance'])
+                         timestamp_tolerance=adapter['timestamp_tolerance'],
+                         frame_cache=args.frame_cache.resolve() if args.frame_cache else None)
     resources.callback(dataset.close)
     if checkpoint and dataset.task_map != checkpoint['task_map']:
         raise ValueError('Resume task map differs from checkpoint')
@@ -412,9 +599,10 @@ def _train(args, output, root, resources):
     fingerprint = dataset.fingerprint()
     output.mkdir(parents=True, exist_ok=True)
     if checkpoint:
-        stats = checkpoint['normalization']
+        stats = dict(checkpoint['normalization'])
         if stats['fingerprint'] != fingerprint:
-            raise ValueError('Resume dataset metadata/files differ from checkpoint; use the same local subset')
+            verify_resynced_dataset(dataset, stats, fingerprint)
+            stats['fingerprint'] = fingerprint
     else:
         stats_path = output / f'stats_{fingerprint[:16]}_{args.stats_max_frames or "all"}.json'
         if stats_path.exists():
@@ -432,14 +620,26 @@ def _train(args, output, root, resources):
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
+    cuda = device.type == 'cuda'
+    torch.set_float32_matmul_precision(args.matmul_precision)
+    if cuda:
+        torch.backends.cudnn.benchmark = args.cudnn_benchmark
     if language_embeddings is not None:
         language_embeddings = language_embeddings.to(device)
-    policy = make_policy(model_config, device, restoring=checkpoint is not None)
+    policy = make_policy(model_config, device, restoring=checkpoint is not None,
+                         fused_optimizer=args.fused_optimizer and cuda,
+                         skip_unused_decoder_layers=not args.compute_unused_decoder_layers, attention=args.attention,
+                         backbone_autocast_dtype=torch.bfloat16 if args.autocast == 'bf16-backbone' and cuda else None,
+                         fast_maxpool=args.fast_maxpool and cuda, film_recompute=args.film_recompute)
+    if args.channels_last:
+        policy.to(memory_format=torch.channels_last)  # only 4-D (convolution) weights change layout
     optimizer = policy.configure_optimizers()
+    zero_gradients = unused_gradients(policy)
     start = 0
     if checkpoint:
         policy.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
+        match_optimizer_state_layout(optimizer)
         start = checkpoint['step']
         torch.set_rng_state(checkpoint['torch_rng'])
         if device.type == 'cuda' and checkpoint['cuda_rng'] is not None:
@@ -448,6 +648,7 @@ def _train(args, output, root, resources):
         raise ValueError(f'--max-steps must exceed resumed step {start}')
     train_config = {key: value for key, value in vars(args).items() if not key.startswith('_')}
     train_config['resume'] = str(args.resume) if args.resume else None
+    train_config['frame_cache'] = str(args.frame_cache) if args.frame_cache else None
     run = {'model_config': model_config, 'adapter_config': adapter, 'train_config': train_config,
            'task_map': dataset.task_map, 'normalization': stats, 'wandb': wandb_identity}
     if language_cache is not None:
@@ -465,30 +666,55 @@ def _train(args, output, root, resources):
                                                      opencv_threads=args.opencv_threads))
     loader_sampler = SplitBatchSampler(sampler, args.loader_batch_size) if args.loader_batch_size else sampler
     loader = DataLoader(dataset, batch_sampler=loader_sampler, **loader_kwargs)
+    if args.compile != 'none' and cuda:
+        compile_policy(policy, args.compile)
     policy.train()
-    LOGGER.info('Training %d -> %d steps on %s with real upstream %s',
-                start, args.max_steps, device, policy_class(model_config))
+    autocast = ((lambda: torch.autocast('cuda', dtype=torch.bfloat16)) if args.autocast == 'bf16' and cuda
+                else nullcontext)
+    copy_stream = torch.cuda.Stream(device) if cuda else None
+    LOGGER.info('Training %d -> %d steps on %s with real upstream %s (matmul %s, autocast %s, attention %s, '
+                'channels_last %s, fused optimizer %s, fast maxpool %s, compile %s, frame cache %s, '
+                'skipped unused decoder parameters %d, language %s/%s, film init %s, film recompute %s)',
+                start, args.max_steps, device, policy_class(model_config), args.matmul_precision, args.autocast,
+                args.attention, args.channels_last, args.fused_optimizer and cuda, args.fast_maxpool and cuda,
+                args.compile, bool(args.frame_cache), sum(parameter.numel() for parameter, _ in zero_gradients),
+                language_mode(model_config), model_config.get('prompt_source', 'task_name'),
+                model_config.get('film_init'), args.film_recompute and language_embeddings is not None)
     begin = time.monotonic()
     previous_end = begin
+    batches = optimizer_batches(loader, args.batch_size, args.loader_batch_size, device=device, stream=copy_stream)
+    fetch_start = time.monotonic()
+    upcoming = next(batches, None)
+    upcoming_wait = time.monotonic() - fetch_start
+    step = start
     with (output / 'metrics.jsonl').open('a') as metrics:
-        for step, batch in enumerate(optimizer_batches(loader, args.batch_size, args.loader_batch_size), start + 1):
+        while upcoming is not None:
+            step += 1
+            batch, data_wait = upcoming, upcoming_wait
             batch_ready = time.monotonic()
-            if device.type == 'cuda':
+            if cuda:
                 torch.cuda.reset_peak_memory_stats(device)
             optimizer.zero_grad(set_to_none=True)
-            images, qpos, actions, is_pad = [x.to(device, non_blocking=True) for x in batch[:4]]
+            images, qpos, actions, is_pad, timings = consume_batch(batch, copy_stream, args.channels_last)
             lang_emb = language_for_qpos(qpos, language_embeddings)
             kwargs = {'lang_emb': lang_emb} if lang_emb is not None else {}
-            losses = policy(qpos, images, actions, is_pad, **kwargs)
+            with autocast():
+                losses = policy(qpos, images, actions, is_pad, **kwargs)
+            losses['loss'].backward()
+            for parameter, zeros in zero_gradients:
+                parameter.grad = zeros
+            # The next batch is assembled on the device while this step's forward/backward kernels run.
+            fetch_start = time.monotonic()
+            upcoming = next(batches, None)
+            upcoming_wait = time.monotonic() - fetch_start
             if not torch.isfinite(losses['loss']):
                 raise FloatingPointError(f'Non-finite loss at step {step}')
-            losses['loss'].backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), float('inf'), error_if_nonfinite=True)
             optimizer.step()
             record = {'step': step, **{k: float(v.detach()) for k, v in losses.items()},
                       'grad_norm': float(grad_norm), 'lr': optimizer.param_groups[0]['lr'],
-                      **{key: float(value.mean()) for key, value in batch[4].items()}}
-            if device.type == 'cuda':
+                      **{key: float(value.mean()) for key, value in timings.items()}}
+            if cuda:
                 torch.cuda.synchronize(device)
                 record.update({'gpu/allocated_bytes': torch.cuda.memory_allocated(device),
                                'gpu/reserved_bytes': torch.cuda.memory_reserved(device),
@@ -509,7 +735,9 @@ def _train(args, output, root, resources):
                 path = save_full_checkpoint(saved, output, args.save_total_limit, bool(args.export_every))
                 LOGGER.info('Saved standalone checkpoint %s', path)
             finished = time.monotonic()
-            record.update({'elapsed_s': finished - begin, 'timing/data_wait_s': batch_ready - previous_end,
+            # data_wait_s: host time blocked fetching this step's batch (overlapped with the previous
+            # step's compute after step 1); train_s covers this step's launch, compute and that overlap.
+            record.update({'elapsed_s': finished - begin, 'timing/data_wait_s': data_wait,
                            'timing/train_s': trained - batch_ready, 'timing/checkpoint_s': finished - trained,
                            'timing/step_s': finished - previous_end,
                            'samples_per_s': args.batch_size / (finished - previous_end)})
@@ -518,7 +746,7 @@ def _train(args, output, root, resources):
             LOGGER.info('%s', json.dumps(record))
             if tracked:
                 tracked.log(record, step=step)
-            del images, qpos, actions, is_pad, losses, grad_norm, batch, lang_emb, kwargs
+            del images, qpos, actions, is_pad, losses, grad_norm, batch, timings, lang_emb, kwargs
             previous_end = time.monotonic()
     return path
 

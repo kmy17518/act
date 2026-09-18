@@ -10,6 +10,7 @@ CLIP_MODEL = 'openai/clip-vit-large-patch14'
 CLIP_REVISION = '32bd64288804d66eefd0ccbe215aa642df71cc41'
 LANGUAGE_DIM = 768
 PROMPT_SOURCES = ('task_name', 'task_description')
+FILM_INITS = ('random', 'identity')  # random: nn.Linear default; identity: zero projection (beta = gamma = 0)
 LONG_PROMPT_POLICY = 'mean_projected_75_token_chunks'
 
 
@@ -19,6 +20,8 @@ def language_mode(model_config):
         raise ValueError(f'Unsupported language conditioning {mode}')
     if model_config.get('prompt_source', 'task_name') not in PROMPT_SOURCES:
         raise ValueError('Unsupported prompt source')
+    if model_config.get('film_init', 'random') not in FILM_INITS:
+        raise ValueError('Unsupported FiLM initialization')
     if mode != 'none' and model_config.get('policy_class', 'ACT') != 'ACT':
         raise ValueError('CLIP FiLM language conditioning is only supported for ACT, not CNNMLP')
     return mode

@@ -48,6 +48,10 @@ class DETRVAE(nn.Module):
         self.camera_names = camera_names
         self.transformer = transformer
         self.encoder = encoder
+        # forward() consumes only the first stacked decoder output (`hs[0]`), so the remaining decoder
+        # layers never influence predictions or gradients. `decoder_layers_used = 1` skips computing
+        # them; None runs every layer as upstream does. Plain attribute: not saved, not architecture.
+        self.decoder_layers_used = None
         hidden_dim = transformer.d_model
         action_dim = state_dim if action_dim is None else action_dim
         self.action_head = nn.Linear(hidden_dim, action_dim)
@@ -96,7 +100,7 @@ class DETRVAE(nn.Module):
             encoder_input = torch.cat([cls_embed, qpos_embed, action_embed], axis=1) # (bs, seq+1, hidden_dim)
             encoder_input = encoder_input.permute(1, 0, 2) # (seq+1, bs, hidden_dim)
             # do not mask cls token
-            cls_joint_is_pad = torch.full((bs, 2), False).to(qpos.device) # False: not a padding
+            cls_joint_is_pad = torch.full((bs, 2), False, device=qpos.device) # False: not a padding
             is_pad = torch.cat([cls_joint_is_pad, is_pad], axis=1)  # (bs, seq+1)
             # obtain position embedding
             pos_embed = self.pos_table.clone().detach()
@@ -104,10 +108,12 @@ class DETRVAE(nn.Module):
             # query model
             encoder_output = self.encoder(encoder_input, pos=pos_embed, src_key_padding_mask=is_pad)
             encoder_output = encoder_output[0] # take cls output only
-            latent_info = self.latent_proj(encoder_output)
-            mu = latent_info[:, :self.latent_dim]
-            logvar = latent_info[:, self.latent_dim:]
-            latent_sample = reparametrize(mu, logvar)
+            with torch.autocast(device_type=encoder_output.device.type, enabled=False):
+                # Latent distribution, KL inputs and the reparametrized sample stay fp32 under autocast.
+                latent_info = self.latent_proj(encoder_output.float())
+                mu = latent_info[:, :self.latent_dim]
+                logvar = latent_info[:, self.latent_dim:]
+                latent_sample = reparametrize(mu, logvar)
             latent_input = self.latent_out_proj(latent_sample)
         else:
             mu = logvar = None
@@ -129,15 +135,26 @@ class DETRVAE(nn.Module):
             # fold camera dimension into width dimension
             src = torch.cat(all_cam_features, axis=3)
             pos = torch.cat(all_cam_pos, axis=3)
-            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight,
+                                  decoder_layers=self.decoder_layers_used)[0]
         else:
             qpos = self.input_proj_robot_state(qpos)
             env_state = self.input_proj_env_state(env_state)
             transformer_input = torch.cat([qpos, env_state], axis=1) # seq length = 2
-            hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]
-        a_hat = self.action_head(hs)
-        is_pad_hat = self.is_pad_head(hs)
+            hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight,
+                                  decoder_layers=self.decoder_layers_used)[0]
+        with torch.autocast(device_type=hs.device.type, enabled=False):
+            # Output heads (and therefore the L1 loss inputs) stay fp32 under autocast.
+            hs = hs.float()
+            a_hat = self.action_head(hs)
+            is_pad_hat = self.is_pad_head(hs)
         return a_hat, is_pad_hat, [mu, logvar]
+
+    def unused_parameters(self):
+        """Parameters of decoder layers that forward() never consumes (their autograd gradient is exactly zero)."""
+        if self.decoder_layers_used is None:
+            return []
+        return [p for layer in self.transformer.decoder.layers[self.decoder_layers_used:] for p in layer.parameters()]
 
 
 

@@ -57,8 +57,15 @@ def _matrix(column):
 
 
 class B1KDataset(torch.utils.data.Dataset):
+    """Samples decode video on demand, or come from a prebuilt uint8 frame cache (`frame_cache=`).
+
+    With a frame cache, images are returned as uint8 (camera, H, W, 3) tensors (see
+    `b1k_frame_cache.dequantize_images`) and all scalar/state/action columns are held in memory once
+    per process instead of filtering Parquet row groups per sample.
+    """
     def __init__(self, dataset_path, task_names=None, chunk_size=100, image_size=(240, 240),
-                 cache_row_groups=2, video_cache_size=3, timestamp_tolerance=0.008, profile_reads=False):
+                 cache_row_groups=2, video_cache_size=3, timestamp_tolerance=0.008, profile_reads=False,
+                 frame_cache=None):
         self.root = Path(dataset_path).resolve()
         self.info = json.loads((self.root / 'meta/info.json').read_text())
         if self.info.get('codebase_version') != 'v3.0':
@@ -142,11 +149,22 @@ class B1KDataset(torch.utils.data.Dataset):
         self.lengths = np.array([ep['length'] for ep in self.episodes], dtype=np.int64)
         self.ends = self.lengths.cumsum()
         self.starts = self.ends - self.lengths
+        self.positions = {int(ep['episode_index']): i for i, ep in enumerate(self.episodes)}
         self._groups = OrderedDict()
         self._footers = OrderedDict()
         self._videos = OrderedDict()
+        self._table = None
+        self._frame_rows = None
+        self.frame_cache = None
         LOGGER.info('Local dataset: %d episodes, %d frames, %d tasks; skipped %d incomplete episodes',
                     len(self.episodes), len(self), len(self.task_map), skipped)
+        if frame_cache is not None:
+            from b1k_frame_cache import FrameCacheReader
+            self.frame_cache = FrameCacheReader(frame_cache, self.root, self.image_size, timestamp_tolerance)
+            self.frame_cache.validate({self.video_path(ep, key) for ep in self.episodes for key in VIDEO_KEYS})
+            self._ensure_table()
+            LOGGER.info('Frame cache %s: %d frames x %d cameras at %s, in-memory table for %d rows',
+                        self.frame_cache.cache_root, len(self), len(VIDEO_KEYS), list(self.image_size), len(self))
 
     def data_path(self, ep):
         return self.root / self.info['data_path'].format(chunk_index=ep['data/chunk_index'],
@@ -235,7 +253,24 @@ class B1KDataset(torch.utils.data.Dataset):
                              f'nearest error {distance:.6f}s (tolerance {self.timestamp_tolerance})')
         return best.to_ndarray(format='rgb24')
 
+    def camera_timestamps(self, ep, frame, timestamp=None):
+        """(video path, absolute video time) per camera for one row: row timestamp plus the camera's offset."""
+        if timestamp is None:
+            if self._table is not None:
+                timestamp = float(self._table['timestamp'][int(self.starts[self.positions[int(ep['episode_index'])]]) + frame])
+            else:
+                timestamp = float(self._read_rows(ep, frame, 1)['timestamp'][0].as_py())
+        targets = []
+        for key in VIDEO_KEYS:
+            offset = float(ep[f'videos/{key}/from_timestamp'])
+            target = offset + timestamp
+            if target < offset - self.timestamp_tolerance or target >= ep[f'videos/{key}/to_timestamp']:
+                raise ValueError(f'Timestamp {target} outside episode {ep["episode_index"]} camera {key}')
+            targets.append((self.video_path(ep, key), target))
+        return targets
+
     def raw_sample(self, episode_id, frame):
+        """Native read: decoded source-resolution RGB frames, state, zero-padded action chunk, pad mask, task."""
         ep = self.by_id[episode_id]
         if not 0 <= frame < ep['length']:
             raise IndexError(f'Frame {frame} outside episode {episode_id}')
@@ -243,13 +278,7 @@ class B1KDataset(torch.utils.data.Dataset):
         table = self._read_rows(ep, frame, self.chunk_size)
         video_start = time.perf_counter() if self.profile_reads else 0
         timestamp = float(table['timestamp'][0].as_py())
-        images = []
-        for key in VIDEO_KEYS:
-            offset = float(ep[f'videos/{key}/from_timestamp'])
-            target = offset + timestamp
-            if target < offset - self.timestamp_tolerance or target >= ep[f'videos/{key}/to_timestamp']:
-                raise ValueError(f'Timestamp {target} outside episode {episode_id} camera {key}')
-            images.append(self._decode(self.video_path(ep, key), target))
+        images = [self._decode(path, target) for path, target in self.camera_timestamps(ep, frame, timestamp)]
         if self.profile_reads:
             self._read_timings = {'data/parquet_s': video_start - read_start,
                                   'data/video_decode_s': time.perf_counter() - video_start}
@@ -261,9 +290,92 @@ class B1KDataset(torch.utils.data.Dataset):
             raise ValueError('Non-finite actions in dataset')
         return images, state, actions, is_pad, int(ep['task_index'])
 
+    def _ensure_table(self):
+        """Load timestamp/state/action for every selected frame once per process (~350 bytes per frame).
+
+        Applies the same episode/frame/task/absolute-index consistency checks as `_read_rows`, to every row.
+        """
+        if self._table is not None:
+            return self._table
+        count = len(self)
+        timestamp = np.full(count, np.nan, dtype=np.float64)
+        state = np.empty((count, 61), dtype=np.float32)
+        action = np.empty((count, 23), dtype=np.float32)
+        filled = np.zeros(count, dtype=bool)
+        by_file = {}
+        for position, ep in enumerate(self.episodes):
+            by_file.setdefault(self.data_path(ep), []).append(position)
+        for path, positions in sorted(by_file.items()):
+            ids = pa.array([int(self.episodes[p]['episode_index']) for p in positions])
+            table = pq.read_table(path, columns=COLUMNS)
+            table = table.filter(pc.is_in(table['episode_index'], value_set=ids))
+            episode_column = table['episode_index'].to_numpy()
+            index_column = table['index'].to_numpy()
+            frame_column = table['frame_index'].to_numpy()
+            task_column = table['task_index'].to_numpy()
+            timestamps = table['timestamp'].to_numpy()
+            states = _matrix(table['observation.state'])
+            actions = _matrix(table['action'])
+            for position in positions:
+                ep = self.episodes[position]
+                rows = np.flatnonzero(episode_column == ep['episode_index'])
+                rows = rows[np.argsort(index_column[rows], kind='stable')]
+                if (len(rows) != ep['length'] or
+                        not np.array_equal(index_column[rows], np.arange(ep['dataset_from_index'], ep['dataset_to_index'])) or
+                        not np.array_equal(frame_column[rows], np.arange(ep['length'])) or
+                        not np.all(task_column[rows] == ep['task_index'])):
+                    raise ValueError(f'Corrupt episode/frame bounds for episode {ep["episode_index"]} in {path}')
+                target = slice(int(self.starts[position]), int(self.ends[position]))
+                timestamp[target] = timestamps[rows]
+                state[target] = states[rows]
+                action[target] = actions[rows]
+                filled[target] = True
+        if not filled.all():
+            raise ValueError('Selected episodes missing from their Parquet files')
+        if not (np.isfinite(action).all() and np.isfinite(state).all()):
+            raise ValueError('Non-finite actions or states in dataset')
+        self._table = {'timestamp': timestamp, 'state': state, 'action': action}
+        if self.frame_cache is not None:
+            rows = np.empty((count, len(VIDEO_KEYS)), dtype=np.int64)
+            for position, ep in enumerate(self.episodes):
+                target = slice(int(self.starts[position]), int(self.ends[position]))
+                for camera, key in enumerate(VIDEO_KEYS):
+                    offset = float(ep[f'videos/{key}/from_timestamp'])
+                    times = offset + timestamp[target]
+                    if times.min() < offset - self.timestamp_tolerance or times.max() >= ep[f'videos/{key}/to_timestamp']:
+                        raise ValueError(f'Timestamps outside episode {ep["episode_index"]} camera {key}')
+                    rows[target, camera] = self.frame_cache.positions(self.video_path(ep, key), times)
+            self._frame_rows = rows
+        return self._table
+
+    def _cached_sample(self, position, frame):
+        ep = self.episodes[position]
+        table = self._ensure_table()
+        begin = time.perf_counter() if self.profile_reads else 0
+        row = int(self.starts[position]) + frame
+        count = min(self.chunk_size, int(ep['length']) - frame)
+        actions = np.zeros((self.chunk_size, 23), dtype=np.float32)
+        actions[:count] = table['action'][row:row + count]
+        is_pad = np.arange(self.chunk_size) >= count
+        qpos = preprocess_state(table['state'][row], int(ep['task_index']), self.stats, self.task_map)
+        actions = (actions - np.asarray(self.stats['action_mean'])) / np.asarray(self.stats['action_std'])
+        middle = time.perf_counter() if self.profile_reads else 0
+        images = np.empty((len(VIDEO_KEYS), *self.image_size, 3), dtype=np.uint8)
+        for camera, key in enumerate(VIDEO_KEYS):
+            self.frame_cache.read(self.video_path(ep, key), int(self._frame_rows[row, camera]), out=images[camera])
+        if self.profile_reads:
+            self._read_timings = {'data/parquet_s': middle - begin, 'data/video_decode_s': 0.0,
+                                  'data/frame_cache_s': time.perf_counter() - middle}
+        return torch.from_numpy(images), qpos, torch.from_numpy(actions.astype(np.float32)), torch.from_numpy(is_pad)
+
     def sample_at(self, episode_id, frame):
         if self.stats is None:
             raise RuntimeError('Set dataset.stats before requesting normalized samples')
+        if self.frame_cache is not None:
+            ep = self.by_id[episode_id]
+            if not 0 <= frame < ep['length']:
+                raise IndexError(f'Frame {frame} outside episode {episode_id}')
+            return self._cached_sample(self.positions[int(episode_id)], frame)
         images, state, actions, is_pad, task_id = self.raw_sample(episode_id, frame)
         image = torch.stack([preprocess_image(x, self.image_size) for x in images])
         qpos = preprocess_state(state, task_id, self.stats, self.task_map)
@@ -281,8 +393,9 @@ class B1KDataset(torch.utils.data.Dataset):
         return sample
 
     def __getstate__(self):
+        # Loader workers reopen files and reload the in-memory table themselves.
         state = self.__dict__.copy()
-        state.update(_groups=OrderedDict(), _footers=OrderedDict(), _videos=OrderedDict())
+        state.update(_groups=OrderedDict(), _footers=OrderedDict(), _videos=OrderedDict(), _table=None, _frame_rows=None)
         return state
 
     def close(self):
@@ -291,6 +404,8 @@ class B1KDataset(torch.utils.data.Dataset):
         self._videos.clear()
         self._groups.clear()
         self._footers.clear()
+        if self.frame_cache is not None:
+            self.frame_cache.close()
 
     def compute_stats(self, max_frames=None):
         """Stream each selected file once; never decode video or retain all frames."""

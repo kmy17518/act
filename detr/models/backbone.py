@@ -55,13 +55,28 @@ class FrozenBatchNorm2d(torch.nn.Module):
         eps = 1e-5
         scale = w * (rv + eps).rsqrt()
         bias = b - rm * scale
-        return x * scale + bias
+        # Keep the affine in the activation dtype (no-op in fp32) so autocast bf16 activations are not
+        # promoted back to fp32 here; the frozen statistics stay in fp32.
+        return x * scale.to(x.dtype) + bias.to(x.dtype)
+
+
+FILM_INITS = ('random', 'identity')
 
 
 class FiLMLayer(nn.Module):
-    def __init__(self, channels):
+    """Per-block FiLM: relu((1 + gamma) * x + beta) with (beta, gamma) projected from the language embedding.
+
+    `init='identity'` zeroes the projection so beta = gamma = 0 and the layer starts as the identity on the
+    (already non-negative) residual-block output; `init='random'` keeps nn.Linear's default initialization.
+    """
+    def __init__(self, channels, init='random'):
         super().__init__()
+        if init not in FILM_INITS:
+            raise ValueError(f'Unsupported FiLM initialization {init!r}; expected one of {FILM_INITS}')
         self.lang_proj = nn.Linear(768, 2 * channels)
+        if init == 'identity':
+            nn.init.zeros_(self.lang_proj.weight)
+            nn.init.zeros_(self.lang_proj.bias)
 
     def forward(self, x, lang_emb):
         beta, gamma = self.lang_proj(lang_emb).unsqueeze(-1).unsqueeze(-1).chunk(2, dim=1)
@@ -69,11 +84,14 @@ class FiLMLayer(nn.Module):
 
 
 class FiLMIntermediateLayerGetter(IntermediateLayerGetter):
-    def __init__(self, backbone, return_layers):
+    def __init__(self, backbone, return_layers, film_init='random'):
         super().__init__(backbone, return_layers)
         self.film_layers = nn.ModuleDict({name: nn.ModuleList([
-            FiLMLayer(block.conv3.out_channels if hasattr(block, 'conv3') else block.conv2.out_channels)
+            FiLMLayer(block.conv3.out_channels if hasattr(block, 'conv3') else block.conv2.out_channels, film_init)
             for block in layer]) for name, layer in self.items() if name.startswith('layer')})
+        # Runtime option (not architecture/state): recompute each conditioned residual block's activations
+        # during backward instead of storing them (same math, less memory, extra forward work).
+        self.recompute = True
 
     @staticmethod
     def conditioned_block(block, film, x, lang_emb):
@@ -82,13 +100,14 @@ class FiLMIntermediateLayerGetter(IntermediateLayerGetter):
     def forward(self, x, lang_emb):
         if lang_emb is None or lang_emb.shape != (x.shape[0], 768):
             raise ValueError('CLIP FiLM requires language embeddings with shape (B, 768)')
+        recompute = self.recompute and self.training and torch.is_grad_enabled()
         out = OrderedDict()
         for name, layer in self.items():
             if name == 'film_layers':
                 continue
             if name in self.film_layers:
                 for block, film in zip(layer, self.film_layers[name]):
-                    if self.training and torch.is_grad_enabled():
+                    if recompute:
                         x = checkpoint(self.conditioned_block, block, film, x, lang_emb, use_reentrant=False)
                     else:
                         x = self.conditioned_block(block, film, x, lang_emb)
@@ -102,7 +121,7 @@ class FiLMIntermediateLayerGetter(IntermediateLayerGetter):
 class BackboneBase(nn.Module):
 
     def __init__(self, backbone: nn.Module, train_backbone: bool, num_channels: int,
-                 return_interm_layers: bool, language_conditioning: str = 'none'):
+                 return_interm_layers: bool, language_conditioning: str = 'none', film_init: str = 'random'):
         super().__init__()
         # for name, parameter in backbone.named_parameters(): # only train later layers # TODO do we want this?
         #     if not train_backbone or 'layer2' not in name and 'layer3' not in name and 'layer4' not in name:
@@ -114,8 +133,10 @@ class BackboneBase(nn.Module):
         if language_conditioning not in ('none', 'clip_film'):
             raise ValueError(f'Unsupported language conditioning {language_conditioning}')
         self.language_conditioning = language_conditioning
-        getter = FiLMIntermediateLayerGetter if language_conditioning == 'clip_film' else IntermediateLayerGetter
-        self.body = getter(backbone, return_layers=return_layers)
+        if language_conditioning == 'clip_film':
+            self.body = FiLMIntermediateLayerGetter(backbone, return_layers=return_layers, film_init=film_init)
+        else:
+            self.body = IntermediateLayerGetter(backbone, return_layers=return_layers)
         self.num_channels = num_channels
 
     def forward(self, tensor, lang_emb=None):
@@ -139,20 +160,29 @@ class Backbone(BackboneBase):
     def __init__(self, name: str,
                  train_backbone: bool,
                  return_interm_layers: bool,
-                 dilation: bool, pretrained: bool = True, language_conditioning: str = 'none'):
+                 dilation: bool, pretrained: bool = True, language_conditioning: str = 'none',
+                 film_init: str = 'random'):
         backbone = getattr(torchvision.models, name)(
             replace_stride_with_dilation=[False, False, dilation],
             pretrained=pretrained and is_main_process(), norm_layer=FrozenBatchNorm2d) # pretrained # TODO do we want frozen batch_norm??
         num_channels = 512 if name in ('resnet18', 'resnet34') else 2048
-        super().__init__(backbone, train_backbone, num_channels, return_interm_layers, language_conditioning)
+        super().__init__(backbone, train_backbone, num_channels, return_interm_layers, language_conditioning, film_init)
 
 
 class Joiner(nn.Sequential):
     def __init__(self, backbone, position_embedding):
         super().__init__(backbone, position_embedding)
+        # Runtime option (not architecture/state): run only the convolutional body under autocast with
+        # this dtype and hand fp32 features to the rest of the network. None keeps the caller's precision.
+        self.body_autocast_dtype = None
 
     def forward(self, tensor_list: NestedTensor, lang_emb=None):
-        xs = self[0](tensor_list, lang_emb=lang_emb)
+        if self.body_autocast_dtype is None:
+            xs = self[0](tensor_list, lang_emb=lang_emb)
+        else:
+            with torch.autocast(device_type=tensor_list.device.type, dtype=self.body_autocast_dtype):
+                xs = self[0](tensor_list, lang_emb=lang_emb)
+            xs = {name: x.float() for name, x in xs.items()}
         out: List[NestedTensor] = []
         pos = []
         for name, x in xs.items():
@@ -168,7 +198,8 @@ def build_backbone(args):
     train_backbone = args.lr_backbone > 0
     return_interm_layers = args.masks
     backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation,
-                        getattr(args, 'pretrained_backbone', True), getattr(args, 'language_conditioning', 'none'))
+                        getattr(args, 'pretrained_backbone', True), getattr(args, 'language_conditioning', 'none'),
+                        getattr(args, 'film_init', 'random'))
     model = Joiner(backbone, position_embedding)
     model.num_channels = backbone.num_channels
     return model
