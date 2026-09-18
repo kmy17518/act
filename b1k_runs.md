@@ -2,7 +2,7 @@
 
 ## Optimized CLIP/FiLM runs, random vs identity initialization — 2026-09-17
 
-The `lang` branch (this checkout, worktree `/tmp/dev/baselines/act-lang` with its own `.venv`) merged the `my` branch throughput work (frame cache, TF32, channels-last, fused AdamW, Triton stem pooling, skipped unused decoder layers, GPU batch assembly, `--compile regions-autotune`; see "Throughput (2026-09-17)" below). The merge added `--film-init random|identity` (saved as `model_config['film_init']`) and the runtime `--film-recompute/--no-film-recompute` switch; the FiLM layers are part of the compiled backbone region. CPU suite after the merge: **118 passed, 4 skipped** (`tests/`).
+The `lang_optimized` branch (formerly `lang`; this checkout, worktree `/tmp/dev/baselines/act-lang` with its own `.venv`) merged the `my` branch throughput work (frame cache, TF32, channels-last, fused AdamW, Triton stem pooling, skipped unused decoder layers, GPU batch assembly, `--compile regions-autotune`; see "Throughput (2026-09-17)" below). The merge added `--film-init random|identity` (saved as `model_config['film_init']`) and the runtime `--film-recompute/--no-film-recompute` switch; the FiLM layers are part of the compiled backbone region. CPU suite after the merge: **118 passed, 4 skipped** (`tests/`).
 
 Two 300,000-step runs launched on 2026-09-18 from this commit, identical to the unconditioned `outputs/turning-on-radio-act-bs1560-300k-opt20260917` recipe (batch **1,560**, TF32, fp32 weights/optimizer, same architecture, images, sampler seed 0 and checkpoint schedule) plus `--language-conditioning clip_film --prompt-source task_name`, which is the comparison they are meant for:
 
