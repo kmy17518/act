@@ -74,6 +74,29 @@ The forward precision itself barely matters (TF32-trained weights lose only 0.12
 
 Swapping only the statistics grouping on the same batch reproduces almost the whole gap (+48 % of the +56 %; the rest is the EMA), and the camera-batched model has the ordinary sub-percent BatchNorm train/eval difference. Per-camera normalization does fit the training batches a little better (0.1121 vs 0.1163), but that advantage does not exist in eval mode, where the camera-batched model is 33 % better (0.1170 vs 0.1747).
 
+### Shared BatchNorm statistics across cameras (`--backbone-camera-batch`) — 2026-09-18
+
+Two 240 px runs with `--backbone-camera-batch` (commit `b1f7477`; now the MT-ACT recipe default, `ACT_CAMERA_BATCH=0` restores RoboAgent's per-camera passes), otherwise identical to the per-camera runs above, stopped at 5,000 steps by the watcher (exit 130, `step_00005000.pt` saved, W&B runs finished):
+
+| Run (`outputs/turning-on-radio-mt-act-cambatch-240px-bs1560-300k-<tag>`) | `ACT_AUTOCAST` | GPU / cores | W&B id | s/step | peak GiB | stopped after |
+| --- | --- | --- | --- | --- | --- | --- |
+| `opt20260917` | `none` (TF32) | 1 / 0-29 | `actradio-mtact-cambatch-240px-opt20260917` | 0.497 | 196 | step 5,002 |
+| `opt20260917-bf16bb` | `bf16-backbone` | 2 / 30-59 | `actradio-mtact-cambatch-240px-opt20260917-bf16bb` | 0.423 | 156 | step 5,023 |
+
+Logs/exit files: `/tmp/dev/logs/act-radio-mt-act-cambatch-240px-300k-<tag>.{log,exit}`. Speed and memory are unchanged by the batching (0.497 vs 0.499, 0.423 vs 0.427 s/step). Same 16-batch evaluation as above (`/tmp/act-lang-probe/{cambatch_eval,baseline_eval}.py`, TF32 forward) for every step-5,000 checkpoint of the 240 px / batch-1,560 / seed-0 family, including the frozen-BatchNorm baselines:
+
+| Weights | eval mode (running statistics; how it is served) | BN batch statistics, no dropout | train mode (dropout) | training-log L1 4,901–5,000 |
+| --- | --- | --- | --- | --- |
+| unconditioned ACT `opt20260917` (frozen BN, ImageNet) | **0.1080** | — | 0.1161 | 0.1165 |
+| MT-ACT camera-batch, TF32 | **0.1162** | 0.1161 | 0.1273 | 0.1280 |
+| MT-ACT camera-batch, `bf16-backbone` | 0.1170 | 0.1163 | 0.1273 | 0.1282 |
+| clip_film identity init (frozen BN) | 0.1184 | — | 0.1231 | 0.1235 |
+| clip_film random init (frozen BN) | 0.1267 | — | 0.1360 | 0.1366 |
+| MT-ACT per-camera, TF32 (RoboAgent-faithful) | 0.1747 | 0.1121 | 0.1227 | 0.1234 |
+| MT-ACT per-camera, `bf16-backbone` | 0.1745 | 0.1124 | 0.1227 | 0.1235 |
+
+Shared statistics remove the gap (eval 0.1162 vs batch-statistics 0.1161) and cut the served-mode error by a third (0.175 → 0.116) at identical cost; the per-camera runs' lower training-log L1 (0.1234 vs 0.1280) was the flattering effect of a normalization that serving cannot reproduce. Served, the from-scratch MT-ACT now sits between the ImageNet-initialized baseline and the CLIP FiLM variants; `bf16-backbone` stays within 0.7 % of TF32. Training losses on 24,960 samples at 1.7 % of the schedule; no rollout or convergence claim.
+
 ## Optimized CLIP/FiLM runs, random vs identity initialization — 2026-09-17
 
 The `lang` branch (this checkout, worktree `/tmp/dev/baselines/act-lang` with its own `.venv`) merged the `my` branch throughput work (frame cache, TF32, channels-last, fused AdamW, Triton stem pooling, skipped unused decoder layers, GPU batch assembly, `--compile regions-autotune`; see "Throughput (2026-09-17)" below). The merge added `--film-init random|identity` (saved as `model_config['film_init']`) and the runtime `--film-recompute/--no-film-recompute` switch; the FiLM layers are part of the compiled backbone region. CPU suite after the merge: **118 passed, 4 skipped** (`tests/`).
