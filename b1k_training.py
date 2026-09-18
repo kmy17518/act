@@ -448,10 +448,12 @@ def parser():
                    help='Frozen text encoder: clip (CLIP ViT-L/14, 768-d) or minilm (all-MiniLM-L6-v2 sentence '
                         'embeddings, 384-d, as MT-ACT). Default: minilm for mt_act, clip otherwise')
     p.add_argument('--prompt-source', choices=['task_name', 'task_description'], default='task_name', action=LanguageOption)
-    p.add_argument('--backbone-norm', choices=['frozen', 'batch'], default='frozen', action=LanguageOption,
-                   help='ResNet normalization: frozen ImageNet BatchNorm statistics (upstream ACT) or trainable '
+    p.add_argument('--backbone-norm', choices=['frozen', 'batch', 'batch_per_camera'], default='frozen', action=LanguageOption,
+                   help='ResNet normalization: frozen ImageNet BatchNorm statistics (upstream ACT); trainable '
                         'BatchNorm2d with batch statistics (MT-ACT trains its ResNet from scratch this way; combine '
-                        'with --no-pretrained-backbone for the faithful reproduction)')
+                        'with --no-pretrained-backbone for the faithful reproduction); or the same training computation '
+                        'with one set of running statistics per camera ("batch_per_camera"), so that eval mode normalizes '
+                        'each camera pass the way training did (saved model configuration; excludes --backbone-camera-batch)')
     p.add_argument('--backbone-camera-batch', dest='camera_batch', action=ExplicitBooleanOption, default=False,
                    help='Run the shared ResNet once over the images of all cameras instead of once per camera. '
                         'Same result for per-sample layers; with --backbone-norm batch the BatchNorm statistics are '
@@ -575,6 +577,11 @@ def _train(args, output, root, resources):
             raise ValueError('Position embeddings and pre-norm are ACT architecture options; CNNMLP does not use them')
         if args.policy_class == 'CNNMLP' and args.camera_batch:
             raise ValueError('--backbone-camera-batch applies to the shared ACT backbone; CNNMLP has one per camera')
+        if args.policy_class == 'CNNMLP' and args.backbone_norm == 'batch_per_camera':
+            raise ValueError('--backbone-norm batch_per_camera applies to the shared ACT backbone; CNNMLP has one per camera')
+        if args.camera_batch and args.backbone_norm == 'batch_per_camera':
+            raise ValueError('--backbone-camera-batch and --backbone-norm batch_per_camera are exclusive: per-camera '
+                             'statistics need one backbone pass per camera')
         if min(image_size) < 1:
             raise ValueError('--image-size dimensions must be positive')
         if args.policy_class == 'CNNMLP' and min(image_size) < 385:
