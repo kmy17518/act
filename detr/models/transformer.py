@@ -63,7 +63,7 @@ class Transformer(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None, additional_pos_embed=None,
-                decoder_layers=None):
+                decoder_layers=None, task_emb=None):
         # TODO flatten only when input has H and W
         if len(src.shape) == 4: # has H and W
             # flatten NxCxHxW to HWxNxC
@@ -77,6 +77,11 @@ class Transformer(nn.Module):
             pos_embed = torch.cat([additional_pos_embed, pos_embed], axis=0)
 
             addition_input = torch.stack([latent_input, proprio_input], axis=0)
+            if task_emb is not None:
+                # MT-ACT: the projected task embedding is a third extra encoder token (RoboAgent transformer.py)
+                addition_input = torch.cat([addition_input, task_emb.unsqueeze(0)], axis=0)
+            if addition_input.shape[0] != additional_pos_embed.shape[0]:
+                raise ValueError('One learned position embedding is required per extra encoder token')
             src = torch.cat([addition_input, src], axis=0)
         else:
             assert len(src.shape) == 3
