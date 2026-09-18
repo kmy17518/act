@@ -174,7 +174,7 @@ class DETRVAE(nn.Module):
                 all_cam_features = []
                 all_cam_pos = []
                 for cam_id, cam_name in enumerate(self.camera_names):
-                    features, pos = self.backbones[0](image[:, cam_id], lang_emb=lang_emb) # HARDCODED
+                    features, pos = self.backbones[0](image[:, cam_id], lang_emb=lang_emb, camera=cam_id) # HARDCODED
                     features = features[0] # take the last layer feature
                     pos = pos[0]
                     all_cam_features.append(self.input_proj(features))
@@ -307,6 +307,9 @@ def build_encoder(args):
 
 def build(args):
     state_dim = getattr(args, 'state_dim', 14)
+    if getattr(args, 'camera_batch', False) and getattr(args, 'backbone_norm', 'frozen') == 'batch_per_camera':
+        raise ValueError('Per-camera BatchNorm statistics need one backbone pass per camera; '
+                         'camera batching and backbone_norm batch_per_camera are exclusive')
 
     # From state
     # backbone = None # from state for now, no need for conv nets

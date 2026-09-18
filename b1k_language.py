@@ -28,7 +28,7 @@ ENCODERS = {
 # residual branch of ResNet stages 2-4, a shared learned text projection that also enters the transformer
 # encoder as a token, CVAE style encoder over actions only, no one-hot task input; see detr_vae.py).
 LANGUAGE_MODES = ('none', 'clip_film', 'mt_act')
-BACKBONE_NORMS = ('frozen', 'batch')
+BACKBONE_NORMS = ('frozen', 'batch', 'batch_per_camera')  # see detr/models/backbone.py PerCameraBatchNorm2d
 
 
 def language_mode(model_config):

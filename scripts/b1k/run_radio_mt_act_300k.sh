@@ -20,11 +20,14 @@
 # Runs the checkout it lives in (git worktree /tmp/dev/baselines/mt-act) with that checkout's .venv.
 # Overrides (environment variables, ACT_-prefixed as in run_radio_300k.sh; launch from a dedicated tmux
 # server, e.g. `tmux -L b1k-mt-act new-session -d -s mt-act-radio 'bash .../run_radio_mt_act_300k.sh'`):
-#   ACT_CAMERA_BATCH 1 (default): --backbone-camera-batch (shared BatchNorm statistics, "-cambatch" in the run name);
-#                    0: RoboAgent's per-camera backbone passes.
-#   ACT_RUN_TAG      default opt20260917; names outputs/turning-on-radio-mt-act[-cambatch]-${ACT_IMAGE_SIZE}px-bs${ACT_BATCH_SIZE}-300k-${ACT_RUN_TAG},
-#                    the log/exit files /tmp/dev/logs/act-radio-mt-act[-cambatch]-${ACT_IMAGE_SIZE}px-300k-${ACT_RUN_TAG}.{log,exit} and the
-#                    W&B run (ACT_WANDB_ID defaults to actradio-mtact[-cambatch]-${ACT_IMAGE_SIZE}px-${ACT_RUN_TAG}; the first 96 px
+#   ACT_BACKBONE_NORM batch (default): BatchNorm2d as RoboAgent; batch_per_camera: the same training computation
+#                    with one set of running statistics per camera (PerCameraBatchNorm2d, "-percam" in the run name;
+#                    eval mode then normalizes each camera pass as training did). Implies ACT_CAMERA_BATCH=0.
+#   ACT_CAMERA_BATCH 1 (default with batch): --backbone-camera-batch (shared BatchNorm statistics, "-cambatch" in
+#                    the run name); 0: RoboAgent's per-camera backbone passes.
+#   ACT_RUN_TAG      default opt20260917; names outputs/turning-on-radio-mt-act[-cambatch|-percam]-${ACT_IMAGE_SIZE}px-bs${ACT_BATCH_SIZE}-300k-${ACT_RUN_TAG},
+#                    the log/exit files /tmp/dev/logs/act-radio-mt-act[-cambatch|-percam]-${ACT_IMAGE_SIZE}px-300k-${ACT_RUN_TAG}.{log,exit} and the
+#                    W&B run (ACT_WANDB_ID defaults to actradio-mtact[-cambatch|-percam]-${ACT_IMAGE_SIZE}px-${ACT_RUN_TAG}; the first 96 px
 #                    per-camera run keeps its size-less names act-radio-mt-act-300k-<tag> / actradio-mtact-<tag>). A run resumes
 #                    its own latest.pt.
 #   ACT_GPU_UUID     default GPU 1 of the host provisioned 2026-09-17 (GPU-82d44829-...). One GPU per run.
@@ -51,11 +54,22 @@ CORES=${ACT_CORES:-0-29}
 IMAGE_SIZE=${ACT_IMAGE_SIZE:-96}
 DATASET=${ACT_DATASET:-/tmp/dev/datasets/2026-challenge-demos}
 CACHE=${ACT_FRAME_CACHE:-/tmp/dev/datasets/2026-challenge-demos-act-frame-cache-${IMAGE_SIZE}x${IMAGE_SIZE}}
-if [[ "${ACT_CAMERA_BATCH:-1}" == 1 ]]; then
-    CAMERA_FLAG=--backbone-camera-batch; VARIANT=-cambatch
-else
-    CAMERA_FLAG=--no-backbone-camera-batch; VARIANT=
-fi
+BACKBONE_NORM=${ACT_BACKBONE_NORM:-batch}
+case "$BACKBONE_NORM" in
+    batch_per_camera)
+        if [[ "${ACT_CAMERA_BATCH:-0}" == 1 ]]; then
+            printf 'ACT_BACKBONE_NORM=batch_per_camera needs one backbone pass per camera; unset ACT_CAMERA_BATCH\n' >&2
+            exit 2
+        fi
+        CAMERA_FLAG=--no-backbone-camera-batch; VARIANT=-percam ;;
+    batch)
+        if [[ "${ACT_CAMERA_BATCH:-1}" == 1 ]]; then
+            CAMERA_FLAG=--backbone-camera-batch; VARIANT=-cambatch
+        else
+            CAMERA_FLAG=--no-backbone-camera-batch; VARIANT=
+        fi ;;
+    *) printf 'ACT_BACKBONE_NORM must be batch or batch_per_camera, got %s\n' "$BACKBONE_NORM" >&2; exit 2 ;;
+esac
 STEM=turning-on-radio-mt-act${VARIANT}-${IMAGE_SIZE}px-bs${BATCH_SIZE}-300k-${RUN_TAG}
 RUN=outputs/$STEM
 WANDB_NAME=$STEM
@@ -97,7 +111,7 @@ taskset -c "$CORES" .venv/bin/python -u scripts/b1k/train_b1k.py \
     --dataset-path "$DATASET" --task-names turning_on_radio --frame-cache "$CACHE" \
     --output-dir "$RUN" --policy-class ACT --max-steps 300000 \
     --language-conditioning mt_act --language-encoder minilm --prompt-source task_description \
-    --no-pretrained-backbone --backbone-norm batch "$CAMERA_FLAG" \
+    --no-pretrained-backbone --backbone-norm "$BACKBONE_NORM" "$CAMERA_FLAG" \
     --hidden-dim 512 --dim-feedforward 3200 --enc-layers 4 --dec-layers 7 --nheads 8 \
     --chunk-size 100 --image-size "$IMAGE_SIZE" "$IMAGE_SIZE" --position-embedding sine --no-pre-norm \
     --kl-weight 10 --lr 1e-5 --lr-backbone 1e-5 --weight-decay 1e-4 \
