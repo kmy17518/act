@@ -19,6 +19,17 @@ tmux -L b1k-mt-act new-session -d -s mt-act-stop5k \
   'ACT_STOP_RUN_DIR=/tmp/dev/baselines/mt-act/outputs/turning-on-radio-mt-act-96px-bs1560-300k-opt20260917 ACT_STOP_EXIT_FILE=/tmp/dev/logs/act-radio-mt-act-300k-opt20260917.exit /tmp/dev/scripts/act-stop-run-at-step.sh'
 ```
 
+**Launched 2026-09-18 08:50 UTC from commit `a208ea5`, stopped at step 5,028 at 09:04 UTC** by the watcher (SIGINT after `step_00005000.pt` was saved; exit status 130, `latest.pt -> step_00005000.pt`, full checkpoints at steps 1 / 2,500 / 5,000, W&B run finished). Steady state **0.160 s/step**, 61 GiB peak, 0.23 h to 5,000 steps (vs 0.45 s/step and 0.63 h for the 240 px runs). Training-loss comparison with the three other `opt20260917` runs — same batch sequence (seed 0), mean over steps 4,901–5,000; lower is better:
+
+| Run | L1 | KL | loss | L1 (2,401–2,500) | L1 (901–1,000) | s/step | peak GiB |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| MT-ACT reproduction, 96 px, from scratch | **0.1135** | 0.0054 | **0.1674** | 0.1509 | 0.1934 | 0.160 | 61 |
+| unconditioned `opt20260917`, 240 px, ImageNet init | 0.1165 | 0.0057 | 0.1738 | 0.1549 | 0.2006 | 0.447 | 150 |
+| clip_film identity init, 240 px | 0.1235 | 0.0047 | 0.1700 | 0.1606 | 0.2028 | 0.455 | 165 |
+| clip_film random init, 240 px | 0.1366 | 0.0047 | 0.1831 | 0.1689 | 0.2061 | 0.455 | 165 |
+
+The MT-ACT variant fits the training actions slightly faster than the pretrained frozen-BN baseline despite the 6.25× smaller images and the from-scratch ResNet (three confounded differences at once: architecture, trainable BatchNorm, resolution). These are training losses at 1.7 % of the schedule with different image resolutions, not held-out or simulator results; no convergence or success claim. Resume with `bash scripts/b1k/run_radio_mt_act_300k.sh` after archiving the `.exit` file.
+
 ## Optimized CLIP/FiLM runs, random vs identity initialization — 2026-09-17
 
 The `lang` branch (this checkout, worktree `/tmp/dev/baselines/act-lang` with its own `.venv`) merged the `my` branch throughput work (frame cache, TF32, channels-last, fused AdamW, Triton stem pooling, skipped unused decoder layers, GPU batch assembly, `--compile regions-autotune`; see "Throughput (2026-09-17)" below). The merge added `--film-init random|identity` (saved as `model_config['film_init']`) and the runtime `--film-recompute/--no-film-recompute` switch; the FiLM layers are part of the compiled backbone region. CPU suite after the merge: **118 passed, 4 skipped** (`tests/`).
