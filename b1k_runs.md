@@ -53,6 +53,18 @@ Logs/exit files: `/tmp/dev/logs/act-radio-mt-act-240px-300k-<tag>.{log,exit}`. S
 
 Where the time goes (b1k.md "Throughput of the MT-ACT architecture"): the MT-ACT modules themselves are free; trainable BatchNorm costs +0.05 s/step and +40 GiB over frozen BatchNorm (the same network with `--backbone-norm frozen` runs at 0.452 s/step — a speed-only diagnostic). Both precision options recover that and more: `bf16-backbone` is 14 % faster at an L1 deviation inside the ±0.3 % dropout noise floor measured for the CLIP runs, `bf16` is 33 % faster at +0.5 % L1. At 240 px the from-scratch MT-ACT trails the ImageNet-initialized baseline at this early point (0.1234 vs 0.1165) and its own 96 px run (0.1135); the smaller images also let it run 3× faster. Training losses only; no convergence or simulator claim.
 
+**Does bf16 hurt the weights or only the measurement?** The three step-5000 checkpoints were evaluated on the same 16 batches (steps 5001–5016 of the shared sampler, 24,960 samples, teacher-forced L1 with an identical style-latent sample) under each forward precision and BatchNorm mode (`/tmp/act-lang-probe/{precision_eval,bn_mode_eval,bn_recal_eval}.py`, outside git):
+
+| Weights \ evaluation | TF32 forward, BN batch statistics, no dropout | TF32 forward, full train mode | eval mode (running statistics) |
+| --- | --- | --- | --- |
+| TF32-trained | **0.1121** | 0.1227 | 0.1747 |
+| `bf16-backbone`-trained | 0.1124 (+0.25 %) | 0.1227 (±0) | 0.1745 |
+| `bf16`-trained | 0.1181 (**+5.3 %**) | 0.1240 (+1.1 %) | 0.1773 (+1.5 %) |
+
+The forward precision itself barely matters (TF32-trained weights lose only 0.12 % L1 when run under bf16), so the `bf16` run's gap is in the learned weights: full-bf16 training of this from-scratch network is measurably behind at 5,000 steps, while `bf16-backbone` weights are indistinguishable from TF32 ones. Recommendation: `ACT_AUTOCAST=bf16-backbone` for MT-ACT; keep TF32 for like-for-like comparisons; do not use full `bf16` here.
+
+**BatchNorm train/eval gap (all precisions).** In eval mode — running statistics, which is how the checkpoint is served — the same weights score L1 **0.175 instead of 0.112** (+56 %). Re-estimating the running statistics from the current weights over all 48 camera passes does not help (0.178), so this is not EMA lag: RoboAgent's backbone normalizes each camera pass with that camera's own batch statistics, whereas a single running mean/variance can only hold a mixture over the three cameras, so eval-mode activations differ from anything seen in training. The frozen-BatchNorm baselines have no such gap. For a deployable MT-ACT reproduction the cameras should share BatchNorm statistics in training as well (one backbone call over all camera images — a deliberate deviation from RoboAgent's per-camera loop), or the backbone should keep frozen/ImageNet statistics; not changed yet.
+
 ## Optimized CLIP/FiLM runs, random vs identity initialization — 2026-09-17
 
 The `lang` branch (this checkout, worktree `/tmp/dev/baselines/act-lang` with its own `.venv`) merged the `my` branch throughput work (frame cache, TF32, channels-last, fused AdamW, Triton stem pooling, skipped unused decoder layers, GPU batch assembly, `--compile regions-autotune`; see "Throughput (2026-09-17)" below). The merge added `--film-init random|identity` (saved as `model_config['film_init']`) and the runtime `--film-recompute/--no-film-recompute` switch; the FiLM layers are part of the compiled backbone region. CPU suite after the merge: **118 passed, 4 skipped** (`tests/`).
