@@ -206,6 +206,68 @@ def test_film_formula_and_checkpointed_gradient_parity():
             assert p.grad.abs().sum() > 0
 
 
+def test_film_identity_init_matches_unconditioned_and_recompute_is_runtime_only(tiny_root, tmp_path, fake_clip):
+    torch.set_num_threads(1)
+    with pytest.raises(ValueError, match='FiLM initialization'):
+        FiLMLayer(3, init='other')
+    film = FiLMLayer(3, init='identity')
+    assert not film.lang_proj.weight.any() and not film.lang_proj.bias.any()
+    x = torch.rand(2, 3, 4, 4)
+    torch.testing.assert_close(film(x, torch.randn(2, 768)), x, atol=0, rtol=0)
+    config = dict(small_model_config(), language_conditioning='clip_film')
+    torch.manual_seed(21)
+    baseline = make_policy(dict(config, language_conditioning='none'), 'cpu')
+    torch.manual_seed(21)
+    identity = make_policy(dict(config, film_init='identity'), 'cpu')
+    torch.manual_seed(21)
+    random_film = make_policy(dict(config, film_init='random'), 'cpu')
+    assert all(not value.any() for key, value in identity.state_dict().items() if 'lang_proj' in key)
+    assert any(value.any() for key, value in random_film.state_dict().items() if 'lang_proj' in key)
+    mismatch = identity.load_state_dict(baseline.state_dict(), strict=False)
+    assert not mismatch.unexpected_keys and all('lang_proj' in key for key in mismatch.missing_keys)
+    qpos, images, language = torch.randn(2, 27), torch.rand(2, 3, 3, 32, 32), torch.randn(2, 768)
+    baseline.eval()
+    identity.eval()
+    with torch.no_grad():
+        torch.testing.assert_close(identity(qpos, images, lang_emb=language), baseline(qpos, images), atol=0, rtol=0)
+    with pytest.raises(ValueError, match='Unsupported FiLM initialization'):
+        make_policy(dict(config, film_init='other'), 'cpu')
+    # Recomputation is a runtime attribute: same outputs and gradients, checkpoint() only when enabled.
+    stored = make_policy(config, 'cpu', film_recompute=False)
+    recomputed = copy.deepcopy(stored)
+    for backbone in recomputed.model.backbones:
+        backbone[0].body.recompute = True
+    assert all(backbone[0].body.recompute is False for backbone in stored.model.backbones)
+    actions, pad = torch.randn(2, 4, 23), torch.zeros(2, 4, dtype=torch.bool)
+    torch.manual_seed(3)
+    with patch('detr.models.backbone.checkpoint', side_effect=AssertionError('must not checkpoint')):
+        stored(qpos, images, actions, pad, lang_emb=language)['loss'].backward()
+    torch.manual_seed(3)
+    recomputed(qpos, images, actions, pad, lang_emb=language)['loss'].backward()
+    for (name, p), (other, q) in zip(stored.named_parameters(), recomputed.named_parameters()):
+        assert name == other and (p.grad is None) == (q.grad is None)
+        if p.grad is not None:
+            torch.testing.assert_close(p.grad, q.grad, atol=0, rtol=0)
+        assert p.grad is not None or 'is_pad_head' in name  # the unused pad head is the only gradient-free parameter
+    # Trainer: the initialization is saved model configuration; recomputation is not.
+    common = ['--dataset-path', str(tiny_root), '--batch-size', '2', '--num-workers', '0', '--torch-threads', '1',
+              '--device', 'cpu', '--chunk-size', '4', '--image-size', '32', '32', '--hidden-dim', '32',
+              '--dim-feedforward', '64', '--enc-layers', '1', '--dec-layers', '1', '--nheads', '4',
+              '--no-pretrained-backbone', '--save-every', '1', '--output-dir', str(tmp_path / 'run')]
+    with pytest.raises(ValueError, match='requires --language-conditioning clip_film'):
+        train(parser().parse_args(common + ['--max-steps', '1', '--film-init', 'identity']))
+    path = train(parser().parse_args(common + ['--max-steps', '1', '--language-conditioning', 'clip_film',
+                                              '--film-init', 'identity', '--no-film-recompute']))
+    saved = load_checkpoint(path)
+    assert saved['model_config']['film_init'] == 'identity'
+    assert 'film_init' not in saved['train_config'] or saved['train_config']['film_init'] == 'identity'
+    assert saved['train_config']['film_recompute'] is False and 'film_recompute' not in saved['model_config']
+    with pytest.raises(ValueError, match='--film-init differs from checkpoint'):
+        train(parser().parse_args(common + ['--max-steps', '2', '--resume', str(path), '--film-init', 'random']))
+    unconditioned = train(parser().parse_args(common[:-2] + ['--output-dir', str(tmp_path / 'none'), '--max-steps', '1']))
+    assert 'film_init' not in load_checkpoint(unconditioned)['model_config']
+
+
 def test_conditioned_act_language_sensitivity_gradients_and_missing_input():
     torch.set_num_threads(1)
     torch.manual_seed(6)

@@ -218,7 +218,10 @@ def test_200_episode_split_and_fixed_128_eval_distribution():
     dataset.episodes = [{'episode_index': i * 3, 'length': 100 + i} for i in range(200)]
     dataset.by_id = {ep['episode_index']: ep for ep in dataset.episodes}
     dataset._videos, dataset._groups, dataset._footers = {}, {}, {}
+    dataset.frame_cache = dataset._table = dataset._frame_rows = None
     evaluation, split = comparison.split_dataset(dataset)
+    assert evaluation.positions == {ep['episode_index']: i for i, ep in enumerate(evaluation.episodes)}
+    assert dataset.positions == {ep['episode_index']: i for i, ep in enumerate(dataset.episodes)}
     assert split['eval_episode_ids'] == [i * 3 for i in range(9, 200, 10)]
     assert len(split['train_episode_ids']) == 180 and len(split['eval_episode_ids']) == 20
     assert not set(split['train_episode_ids']).intersection(split['eval_episode_ids'])
