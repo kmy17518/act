@@ -23,6 +23,8 @@ from b1k_frame_cache import dequantize_images
 from detr.models.maxpool_nhwc import MaxPool3x3NHWC, replaces
 from detr.models.transformer import use_fused_attention
 from policy import ACTPolicy, CNNMLPPolicy
+from b1k_language import (ENCODERS, build_language_cache, language_dim, language_embedding_table, language_encoder,
+                          language_for_qpos, language_mode, validate_resume_prompts)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -43,6 +45,7 @@ def load_checkpoint(path):
     name = policy_class(checkpoint['model_config'])
     if name == 'CNNMLP' and checkpoint['model_config'].get('image_size', [480, 640]) != adapter['image_size']:
         raise ValueError('CNNMLP checkpoint model/adapter image sizes differ')
+    language_embedding_table(checkpoint['model_config'], checkpoint['task_map'], checkpoint.get('language_cache'))
     return checkpoint
 
 
@@ -50,24 +53,28 @@ def policy_class(model_config):
     name = model_config.get('policy_class', 'ACT')
     if name not in ('ACT', 'CNNMLP'):
         raise ValueError(f'Unsupported policy class {name}')
+    language_mode(model_config)
     if name == 'CNNMLP' and model_config.get('num_queries', 1) != 1:
         raise ValueError('CNNMLP predicts one action, not an action chunk')
     return name
 
 
 def make_policy(model_config, device, restoring=False, fused_optimizer=False, skip_unused_decoder_layers=True,
-                attention='auto', backbone_autocast_dtype=None, fast_maxpool=False):
+                attention='auto', backbone_autocast_dtype=None, fast_maxpool=False, film_recompute=True):
     """Build the upstream policy.
 
-    `fused_optimizer`, `skip_unused_decoder_layers`, `attention`, `backbone_autocast_dtype` and
-    `fast_maxpool` are runtime execution choices, not saved model configuration. ACT consumes only the
+    `fused_optimizer`, `skip_unused_decoder_layers`, `attention`, `backbone_autocast_dtype`, `fast_maxpool`
+    and `film_recompute` are runtime execution choices, not saved model configuration. ACT consumes only the
     first stacked decoder output, so with the skip enabled the remaining decoder layers are not executed;
     predictions and every gradient are unchanged (see `unused_gradients` for the optimizer side).
     `attention` selects the nn.MultiheadAttention path (`detr.models.transformer.use_fused_attention`).
     `backbone_autocast_dtype` runs only the convolutional bodies under autocast and returns fp32 features.
     `fast_maxpool` swaps the stateless ResNet stem pooling for the bit-identical channels-last kernels.
+    `film_recompute` recomputes the CLIP FiLM-conditioned residual blocks in backward (memory for time);
+    the FiLM initialization itself (`model_config['film_init']`) is saved model configuration.
     """
-    config = dict(model_config, programmatic=True, device=str(device), fused_optimizer=fused_optimizer)
+    config = dict(model_config, programmatic=True, device=str(device), fused_optimizer=fused_optimizer,
+                  language_dim=language_dim(model_config))  # derived from the encoder, not saved
     if restoring:
         config['pretrained_backbone'] = False
     policy_type = ACTPolicy if policy_class(config) == 'ACT' else CNNMLPPolicy
@@ -82,6 +89,8 @@ def make_policy(model_config, device, restoring=False, fused_optimizer=False, sk
         backbone.body_autocast_dtype = backbone_autocast_dtype
         if fast_maxpool and replaces(getattr(backbone[0].body, 'maxpool', None)):
             backbone[0].body.maxpool = MaxPool3x3NHWC()
+        if hasattr(backbone[0].body, 'recompute'):
+            backbone[0].body.recompute = film_recompute
     return policy
 
 
@@ -188,7 +197,8 @@ def save_eval_checkpoint(run, policy, step, output):
                             ('step', 'model_config', 'adapter_config', 'task_map', 'normalization'))
         same_model = previous['model'].keys() == saved['model'].keys() and all(
             torch.equal(previous['model'][key], value) for key, value in saved['model'].items())
-        if not same_metadata or not same_model:
+        same_language = previous.get('language_cache') == saved.get('language_cache')
+        if not same_metadata or not same_model or not same_language:
             raise FileExistsError(f'Existing eval export differs at step {step}; use another output directory')
         return path
     atomic_save(saved, path)
@@ -399,6 +409,19 @@ def wandb_run(args, output, checkpoint):
         tracked.finish()
 
 
+class LanguageOption(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f'_{self.dest}_explicit', True)
+
+
+class ExplicitBooleanOption(argparse.BooleanOptionalAction):
+    """--flag/--no-flag that also records whether it was given (saved model options adopted on resume)."""
+    def __call__(self, parser, namespace, values, option_string=None):
+        super().__call__(parser, namespace, values, option_string)
+        setattr(namespace, f'_{self.dest}_explicit', True)
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--dataset-path', '--dataset-root', dest='dataset_path', required=True)
@@ -417,6 +440,31 @@ def parser():
     p.add_argument('--resume', type=Path)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--policy-class', choices=['ACT', 'CNNMLP'], default='ACT')
+    p.add_argument('--language-conditioning', choices=['none', 'clip_film', 'mt_act'], default='none', action=LanguageOption,
+                   help='clip_film: FiLM after every ResNet block (b1k.md); mt_act: RoboAgent MT-ACT reproduction '
+                        '(FiLM inside the residual branch of ResNet stages 2-4 from a learned text projection that '
+                        'also enters the transformer as a token, style encoder over actions only, no one-hot input)')
+    p.add_argument('--language-encoder', choices=sorted(ENCODERS), default=None, action=LanguageOption,
+                   help='Frozen text encoder: clip (CLIP ViT-L/14, 768-d) or minilm (all-MiniLM-L6-v2 sentence '
+                        'embeddings, 384-d, as MT-ACT). Default: minilm for mt_act, clip otherwise')
+    p.add_argument('--prompt-source', choices=['task_name', 'task_description'], default='task_name', action=LanguageOption)
+    p.add_argument('--backbone-norm', choices=['frozen', 'batch', 'batch_per_camera'], default='frozen', action=LanguageOption,
+                   help='ResNet normalization: frozen ImageNet BatchNorm statistics (upstream ACT); trainable '
+                        'BatchNorm2d with batch statistics (MT-ACT trains its ResNet from scratch this way; combine '
+                        'with --no-pretrained-backbone for the faithful reproduction); or the same training computation '
+                        'with one set of running statistics per camera ("batch_per_camera"), so that eval mode normalizes '
+                        'each camera pass the way training did (saved model configuration; excludes --backbone-camera-batch)')
+    p.add_argument('--backbone-camera-batch', dest='camera_batch', action=ExplicitBooleanOption, default=False,
+                   help='Run the shared ResNet once over the images of all cameras instead of once per camera. '
+                        'Same result for per-sample layers; with --backbone-norm batch the BatchNorm statistics are '
+                        'then shared across cameras in training, matching the running statistics used when serving '
+                        '(saved model configuration)')
+    p.add_argument('--film-init', choices=['random', 'identity'], default='random', action=LanguageOption,
+                   help='clip_film projection initialization: nn.Linear default ("random") or zeros so every FiLM '
+                        'layer starts as the identity ("identity"); saved in the checkpoint model configuration')
+    p.add_argument('--film-recompute', action=argparse.BooleanOptionalAction, default=True,
+                   help='Recompute the FiLM-conditioned ResNet blocks during backward instead of storing their '
+                        'activations (same math; less memory, more compute). Runtime choice, not saved')
     p.add_argument('--chunk-size', type=int, default=100, help='ACT prediction length; CNNMLP always uses one action')
     p.add_argument('--image-size', type=int, nargs=2, metavar=('HEIGHT', 'WIDTH'),
                    help='Default: ACT 240 240; CNNMLP 480 640 (original convolution/flatten path)')
@@ -515,12 +563,25 @@ def _train(args, output, root, resources):
         adapter = checkpoint['adapter_config']
         model_config = dict(checkpoint['model_config'])
         model_config.setdefault('policy_class', 'ACT')
+        for key, default in [('language_conditioning', 'none'), ('prompt_source', 'task_name'), ('film_init', 'random'),
+                             ('language_encoder', 'clip'), ('backbone_norm', 'frozen'), ('camera_batch', False)]:
+            saved_value = model_config.get(key, default)
+            if getattr(args, f'_{key}_explicit', False) and getattr(args, key) != saved_value:
+                raise ValueError(f'--{key.replace("_", "-")} differs from checkpoint')
+            setattr(args, key, saved_value)
         task_names = args.task_names or list(checkpoint['task_map'].values())
         args.seed = checkpoint['train_config']['seed']
     else:
         image_size = args.image_size or ([240, 240] if args.policy_class == 'ACT' else [480, 640])
         if args.policy_class == 'CNNMLP' and (args.pre_norm or args.position_embedding != 'sine'):
             raise ValueError('Position embeddings and pre-norm are ACT architecture options; CNNMLP does not use them')
+        if args.policy_class == 'CNNMLP' and args.camera_batch:
+            raise ValueError('--backbone-camera-batch applies to the shared ACT backbone; CNNMLP has one per camera')
+        if args.policy_class == 'CNNMLP' and args.backbone_norm == 'batch_per_camera':
+            raise ValueError('--backbone-norm batch_per_camera applies to the shared ACT backbone; CNNMLP has one per camera')
+        if args.camera_batch and args.backbone_norm == 'batch_per_camera':
+            raise ValueError('--backbone-camera-batch and --backbone-norm batch_per_camera are exclusive: per-camera '
+                             'statistics need one backbone pass per camera')
         if min(image_size) < 1:
             raise ValueError('--image-size dimensions must be positive')
         if args.policy_class == 'CNNMLP' and min(image_size) < 385:
@@ -540,7 +601,15 @@ def _train(args, output, root, resources):
                         'weight_decay': args.weight_decay, 'backbone': 'resnet18',
                         'pretrained_backbone': args.pretrained_backbone, 'camera_names': CAMERAS,
                         'position_embedding': args.position_embedding, 'pre_norm': args.pre_norm,
+                        'language_conditioning': args.language_conditioning, 'prompt_source': args.prompt_source,
+                        'backbone_norm': args.backbone_norm, 'camera_batch': args.camera_batch,
                         'dilation': False, 'masks': False, 'action_dim': 23}
+        if args.language_conditioning != 'none':
+            model_config['film_init'] = args.film_init
+            args.language_encoder = args.language_encoder or ('minilm' if args.language_conditioning == 'mt_act' else 'clip')
+            model_config['language_encoder'] = args.language_encoder
+        elif getattr(args, '_film_init_explicit', False) or args.language_encoder is not None:
+            raise ValueError('--film-init and --language-encoder require --language-conditioning clip_film or mt_act')
         if args.policy_class == 'CNNMLP':
             model_config['image_size'] = list(image_size)
     if policy_class(model_config) == 'ACT':
@@ -556,7 +625,16 @@ def _train(args, output, root, resources):
     resources.callback(dataset.close)
     if checkpoint and dataset.task_map != checkpoint['task_map']:
         raise ValueError('Resume task map differs from checkpoint')
-    model_config['state_dim'] = len(STATE_INDICES) + len(dataset.task_map)
+    # The adapter always appends the one-hot task category to qpos (it selects the language embedding);
+    # MT-ACT does not feed it to the network, so its state_dim covers the proprioception only.
+    model_config['state_dim'] = len(STATE_INDICES) + (0 if language_mode(model_config) == 'mt_act' else len(dataset.task_map))
+    language_cache = checkpoint.get('language_cache') if checkpoint else None
+    if checkpoint:
+        validate_resume_prompts(root, dataset.task_map, language_cache)
+    elif language_mode(model_config) != 'none':
+        language_cache = build_language_cache(root, dataset.task_map, model_config['prompt_source'],
+                                              language_encoder(model_config))
+    language_embeddings = language_embedding_table(model_config, dataset.task_map, language_cache)
     fingerprint = dataset.fingerprint()
     output.mkdir(parents=True, exist_ok=True)
     if checkpoint:
@@ -585,11 +663,13 @@ def _train(args, output, root, resources):
     torch.set_float32_matmul_precision(args.matmul_precision)
     if cuda:
         torch.backends.cudnn.benchmark = args.cudnn_benchmark
+    if language_embeddings is not None:
+        language_embeddings = language_embeddings.to(device)
     policy = make_policy(model_config, device, restoring=checkpoint is not None,
                          fused_optimizer=args.fused_optimizer and cuda,
                          skip_unused_decoder_layers=not args.compute_unused_decoder_layers, attention=args.attention,
                          backbone_autocast_dtype=torch.bfloat16 if args.autocast == 'bf16-backbone' and cuda else None,
-                         fast_maxpool=args.fast_maxpool and cuda)
+                         fast_maxpool=args.fast_maxpool and cuda, film_recompute=args.film_recompute)
     if args.channels_last:
         policy.to(memory_format=torch.channels_last)  # only 4-D (convolution) weights change layout
     optimizer = policy.configure_optimizers()
@@ -605,11 +685,13 @@ def _train(args, output, root, resources):
             torch.cuda.set_rng_state(checkpoint['cuda_rng'], device)
     if args.max_steps <= start:
         raise ValueError(f'--max-steps must exceed resumed step {start}')
-    train_config = vars(args).copy()
+    train_config = {key: value for key, value in vars(args).items() if not key.startswith('_')}
     train_config['resume'] = str(args.resume) if args.resume else None
     train_config['frame_cache'] = str(args.frame_cache) if args.frame_cache else None
     run = {'model_config': model_config, 'adapter_config': adapter, 'train_config': train_config,
            'task_map': dataset.task_map, 'normalization': stats, 'wandb': wandb_identity}
+    if language_cache is not None:
+        run['language_cache'] = language_cache
     atomic_json(run, output / ('resume_run.json' if checkpoint else 'run.json'))
     if tracked:
         tracked.config.update(run, allow_val_change=True)
@@ -631,10 +713,16 @@ def _train(args, output, root, resources):
     copy_stream = torch.cuda.Stream(device) if cuda else None
     LOGGER.info('Training %d -> %d steps on %s with real upstream %s (matmul %s, autocast %s, attention %s, '
                 'channels_last %s, fused optimizer %s, fast maxpool %s, compile %s, frame cache %s, '
-                'skipped unused decoder parameters %d)',
+                'skipped unused decoder parameters %d, language %s/%s/%s, film init %s, film recompute %s, '
+                'backbone norm %s, pretrained backbone %s, camera batch %s)',
                 start, args.max_steps, device, policy_class(model_config), args.matmul_precision, args.autocast,
                 args.attention, args.channels_last, args.fused_optimizer and cuda, args.fast_maxpool and cuda,
-                args.compile, bool(args.frame_cache), sum(parameter.numel() for parameter, _ in zero_gradients))
+                args.compile, bool(args.frame_cache), sum(parameter.numel() for parameter, _ in zero_gradients),
+                language_mode(model_config), language_encoder(model_config) if language_embeddings is not None else None,
+                model_config.get('prompt_source', 'task_name'), model_config.get('film_init'),
+                args.film_recompute and language_mode(model_config) == 'clip_film',
+                model_config.get('backbone_norm', 'frozen'), model_config.get('pretrained_backbone', True),
+                model_config.get('camera_batch', False))
     begin = time.monotonic()
     previous_end = begin
     batches = optimizer_batches(loader, args.batch_size, args.loader_batch_size, device=device, stream=copy_stream)
@@ -651,8 +739,10 @@ def _train(args, output, root, resources):
                 torch.cuda.reset_peak_memory_stats(device)
             optimizer.zero_grad(set_to_none=True)
             images, qpos, actions, is_pad, timings = consume_batch(batch, copy_stream, args.channels_last)
+            lang_emb = language_for_qpos(qpos, language_embeddings)
+            kwargs = {'lang_emb': lang_emb} if lang_emb is not None else {}
             with autocast():
-                losses = policy(qpos, images, actions, is_pad)
+                losses = policy(qpos, images, actions, is_pad, **kwargs)
             losses['loss'].backward()
             for parameter, zeros in zero_gradients:
                 parameter.grad = zeros
@@ -699,7 +789,7 @@ def _train(args, output, root, resources):
             LOGGER.info('%s', json.dumps(record))
             if tracked:
                 tracked.log(record, step=step)
-            del images, qpos, actions, is_pad, losses, grad_norm, batch, timings
+            del images, qpos, actions, is_pad, losses, grad_norm, batch, timings, lang_emb, kwargs
             previous_end = time.monotonic()
     return path
 

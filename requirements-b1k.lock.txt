@@ -1,6 +1,8 @@
 # Exact versions of the verified environment (uv pip freeze, 2026-09-17): CPython 3.10, aarch64 Linux,
 # CUDA 13 wheels from https://download.pytorch.org/whl/cu130. Install with scripts/b1k/setup_venv.sh; on other
 # platforms/CUDA versions install torch/torchvision for that target and fall back to requirements-b1k.txt.
+# transformers (+ regex, safetensors, tokenizers) is needed only to initialize a fresh --language-conditioning
+# clip_film run (the frozen CLIP text encoder); resume and serving never import it.
 annotated-types==0.8.0
 asttokens==3.0.2
 av==16.1.0
@@ -66,14 +68,18 @@ pydantic-core==2.46.5
 pygments==2.21.0
 pytest==9.1.1
 pyyaml==6.0.3
+regex==2026.9.10
 requests==2.34.2
+safetensors==0.8.0
 stack-data==0.6.3
 sympy==1.14.0
+tokenizers==0.22.2
 tomli==2.4.1
 torch==2.10.0+cu130
 torchvision==0.25.0+cu130
 tqdm==4.70.1
 traitlets==5.16.1
+transformers==4.57.6
 triton==3.6.0
 typing-extensions==4.16.0
 typing-inspection==0.4.4

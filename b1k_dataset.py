@@ -84,7 +84,8 @@ class B1KDataset(torch.utils.data.Dataset):
         self.stats = None
         tasks = pq.read_table(self.root / 'meta/tasks.parquet').to_pylist()
         names = {int(row['task_index']): row.get('task', row.get('__index_level_0__')) for row in tasks}
-        if any(not isinstance(name, str) for name in names.values()) or len(set(names.values())) != len(names):
+        if (len(names) != len(tasks) or any(not isinstance(name, str) for name in names.values())
+                or len(set(names.values())) != len(names)):
             raise ValueError('meta/tasks.parquet must contain unique task names and task_index values')
         if isinstance(task_names, str):
             task_names = [task_names]

@@ -177,6 +177,14 @@ def test_partial_noncontiguous_ids_task_filters(tiny_root):
     dataset.close()
 
 
+def test_duplicate_task_index_rejected(tiny_root):
+    path = tiny_root / 'meta/tasks.parquet'
+    rows = pq.read_table(path).to_pylist()
+    pq.write_table(pa.Table.from_pylist(rows + [rows[0]]), path)
+    with pytest.raises(ValueError, match='unique task names and task_index'):
+        B1KDataset(tiny_root)
+
+
 def test_episode_task_name_fallback(tiny_root):
     path = tiny_root / 'meta/episodes/chunk-042/file-000.parquet'
     rows = pq.read_table(path).to_pylist()

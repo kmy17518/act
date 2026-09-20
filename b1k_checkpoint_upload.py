@@ -6,10 +6,12 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
 import time
+import traceback
 import uuid
 
 
@@ -24,6 +26,46 @@ class SafetyError(RuntimeError):
 
 class RetryableError(RuntimeError):
     """An operation whose durable intent can be retried."""
+
+
+def redact_credentials(value):
+    text = str(value)
+    for name in ('HF_TOKEN', 'WANDB_API_KEY'):
+        secret = os.environ.get(name)
+        if secret:
+            text = text.replace(secret, '[REDACTED]')
+    # Retry errors can contain relative signed URLs as well as absolute URLs.
+    text = re.sub(r'''\?[^\s'"<>)]*''', '?[REDACTED]', text)
+    text = re.sub(r'(?i)\b(Bearer|Basic)\s+[^\s\'"<>),;]+', r'\1 [REDACTED]', text)
+    return re.sub(r'\bhf_[A-Za-z0-9]+\b', '[REDACTED]', text)
+
+
+class CredentialFilter(logging.Filter):
+    def filter(self, record):
+        record.msg = redact_credentials(record.getMessage())
+        record.args = ()
+        if record.exc_info:
+            record.exc_text = redact_credentials(''.join(traceback.format_exception(*record.exc_info)))
+            record.exc_info = None
+        elif record.exc_text:
+            record.exc_text = redact_credentials(record.exc_text)
+        if record.stack_info:
+            record.stack_info = redact_credentials(record.stack_info)
+        return True
+
+
+def configure_safe_logging():
+    redactor = CredentialFilter()
+    loggers = [logging.getLogger()]
+    loggers.extend(logger for name, logger in logging.Logger.manager.loggerDict.items()
+                   if isinstance(logger, logging.Logger)
+                   and name.split('.')[0] in ('huggingface_hub', 'urllib3', 'requests'))
+    for logger in loggers:
+        logger.addFilter(redactor)
+        for handler in logger.handlers:
+            handler.addFilter(redactor)
+    if logging.lastResort:
+        logging.lastResort.addFilter(redactor)
 
 
 def now():
@@ -99,6 +141,7 @@ def make_api(http_timeout=120):
             return super().request(method, url, **kwargs)
 
     configure_http_backend(backend_factory=BoundedSession)
+    configure_safe_logging()
     return HfApi(token=os.environ.get('HF_TOKEN'))
 
 
@@ -178,7 +221,7 @@ class CheckpointUploader:
 
     def record_error(self, exc):
         self.state['error_count'] += 1
-        self.state['last_error'] = f'{type(exc).__name__}: {exc}'
+        self.state['last_error'] = redact_credentials(f'{type(exc).__name__}: {exc}')
         self.save()
         self.status('fatal' if isinstance(exc, SafetyError) else 'retrying')
 
@@ -554,11 +597,11 @@ def main(argv=None):
                     complete = uploader.run_once()
                 except SafetyError as exc:
                     uploader.record_error(exc)
-                    print(json.dumps({'event': 'fatal', 'error': str(exc)}), flush=True)
+                    print(json.dumps({'event': 'fatal', 'error': redact_credentials(exc)}), flush=True)
                     return 2
                 except Exception as exc:
                     uploader.record_error(exc)
-                    print(json.dumps({'event': 'retrying', 'error': str(exc)}), flush=True)
+                    print(json.dumps({'event': 'retrying', 'error': redact_credentials(exc)}), flush=True)
                     if args.once:
                         return 1
                 else:
@@ -568,7 +611,7 @@ def main(argv=None):
                         return 0
                 time.sleep(args.poll_seconds)
     except SafetyError as exc:
-        print(json.dumps({'event': 'fatal', 'error': str(exc)}), flush=True)
+        print(json.dumps({'event': 'fatal', 'error': redact_credentials(exc)}), flush=True)
         return 2
 
 

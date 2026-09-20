@@ -33,7 +33,8 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, action_dim=None):
+    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, action_dim=None,
+                 mt_act_language_dim=None, camera_batch=False):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -42,16 +43,30 @@ class DETRVAE(nn.Module):
             num_queries: number of object queries, ie detection slot. This is the maximal number of objects
                          DETR can detect in a single image. For COCO, we recommend 100 queries.
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
+            mt_act_language_dim: text-embedding width for the RoboAgent MT-ACT variant (None: upstream ACT).
+                MT-ACT projects the frozen text embedding with one learned `proj_text_emb` linear layer to the
+                transformer width; that vector conditions the ResNet through FiLM (see backbone.py) and enters
+                the transformer encoder as a third extra token next to the latent and proprioception tokens.
+                Its CVAE style encoder sees [CLS, actions] only (no proprioception token), and `qpos` beyond the
+                first `state_dim` entries (the adapter's one-hot task category) is ignored.
+            camera_batch: run the shared backbone once over the images of all cameras (camera-major batch) instead
+                of once per camera. Per-sample layers give the same result either way; trainable BatchNorm then
+                computes its batch statistics over all cameras jointly, which is what its running statistics
+                describe at evaluation time (per-camera passes normalize each camera by its own statistics, which
+                eval mode cannot reproduce).
         """
         super().__init__()
         self.num_queries = num_queries
         self.camera_names = camera_names
+        self.camera_batch = camera_batch
         self.transformer = transformer
         self.encoder = encoder
         # forward() consumes only the first stacked decoder output (`hs[0]`), so the remaining decoder
         # layers never influence predictions or gradients. `decoder_layers_used = 1` skips computing
         # them; None runs every layer as upstream does. Plain attribute: not saved, not architecture.
         self.decoder_layers_used = None
+        self.mt_act = mt_act_language_dim is not None
+        self.state_dim = state_dim
         hidden_dim = transformer.d_model
         action_dim = state_dim if action_dim is None else action_dim
         self.action_head = nn.Linear(hidden_dim, action_dim)
@@ -72,15 +87,23 @@ class DETRVAE(nn.Module):
         self.latent_dim = 32 # final size of latent z # TODO tune
         self.cls_embed = nn.Embedding(1, hidden_dim) # extra cls token embedding
         self.encoder_action_proj = nn.Linear(action_dim, hidden_dim) # project action to embedding
-        self.encoder_joint_proj = nn.Linear(state_dim, hidden_dim)  # project qpos to embedding
+        if self.mt_act:
+            # RoboAgent: encoder_proj over actions only, pos_table(num_queries + 1)
+            self.register_buffer('pos_table', get_sinusoid_encoding_table(1+num_queries, hidden_dim)) # [CLS], a_seq
+        else:
+            self.encoder_joint_proj = nn.Linear(state_dim, hidden_dim)  # project qpos to embedding
+            self.register_buffer('pos_table', get_sinusoid_encoding_table(1+1+num_queries, hidden_dim)) # [CLS], qpos, a_seq
         self.latent_proj = nn.Linear(hidden_dim, self.latent_dim*2) # project hidden state to latent std, var
-        self.register_buffer('pos_table', get_sinusoid_encoding_table(1+1+num_queries, hidden_dim)) # [CLS], qpos, a_seq
 
         # decoder extra parameters
         self.latent_out_proj = nn.Linear(self.latent_dim, hidden_dim) # project latent sample to embedding
-        self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent
+        if self.mt_act:
+            self.proj_text_emb = nn.Linear(mt_act_language_dim, hidden_dim) # project text embedding to hidden_dim
+            self.additional_pos_embed = nn.Embedding(3, hidden_dim) # learned position embedding for proprio, latent and text
+        else:
+            self.additional_pos_embed = nn.Embedding(2, hidden_dim) # learned position embedding for proprio and latent
 
-    def forward(self, qpos, image, env_state, actions=None, is_pad=None):
+    def forward(self, qpos, image, env_state, actions=None, is_pad=None, lang_emb=None):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
@@ -89,18 +112,31 @@ class DETRVAE(nn.Module):
         """
         is_training = actions is not None # train or val
         bs, _ = qpos.shape
+        task_emb = None
+        if self.mt_act:
+            if lang_emb is None:
+                raise ValueError('MT-ACT requires language embeddings')
+            if qpos.shape[1] < self.state_dim:
+                raise ValueError(f'MT-ACT expects at least {self.state_dim} proprioception values')
+            qpos = qpos[:, :self.state_dim]  # the adapter's trailing one-hot task category is not an input
+            task_emb = self.proj_text_emb(lang_emb)
+            lang_emb = task_emb  # FiLM is generated from the projected embedding
         ### Obtain latent z from action sequence
         if is_training:
             # project action sequence to embedding dim, and concat with a CLS token
             action_embed = self.encoder_action_proj(actions) # (bs, seq, hidden_dim)
-            qpos_embed = self.encoder_joint_proj(qpos)  # (bs, hidden_dim)
-            qpos_embed = torch.unsqueeze(qpos_embed, axis=1)  # (bs, 1, hidden_dim)
             cls_embed = self.cls_embed.weight # (1, hidden_dim)
             cls_embed = torch.unsqueeze(cls_embed, axis=0).repeat(bs, 1, 1) # (bs, 1, hidden_dim)
-            encoder_input = torch.cat([cls_embed, qpos_embed, action_embed], axis=1) # (bs, seq+1, hidden_dim)
+            if self.mt_act:
+                encoder_input = torch.cat([cls_embed, action_embed], axis=1) # (bs, seq+1, hidden_dim)
+                cls_joint_is_pad = torch.full((bs, 1), False, device=qpos.device) # False: not a padding
+            else:
+                qpos_embed = self.encoder_joint_proj(qpos)  # (bs, hidden_dim)
+                qpos_embed = torch.unsqueeze(qpos_embed, axis=1)  # (bs, 1, hidden_dim)
+                encoder_input = torch.cat([cls_embed, qpos_embed, action_embed], axis=1) # (bs, seq+2, hidden_dim)
+                cls_joint_is_pad = torch.full((bs, 2), False, device=qpos.device) # False: not a padding
             encoder_input = encoder_input.permute(1, 0, 2) # (seq+1, bs, hidden_dim)
             # do not mask cls token
-            cls_joint_is_pad = torch.full((bs, 2), False, device=qpos.device) # False: not a padding
             is_pad = torch.cat([cls_joint_is_pad, is_pad], axis=1)  # (bs, seq+1)
             # obtain position embedding
             pos_embed = self.pos_table.clone().detach()
@@ -122,22 +158,37 @@ class DETRVAE(nn.Module):
 
         if self.backbones is not None:
             # Image observation features and position embeddings
-            all_cam_features = []
-            all_cam_pos = []
-            for cam_id, cam_name in enumerate(self.camera_names):
-                features, pos = self.backbones[0](image[:, cam_id]) # HARDCODED
-                features = features[0] # take the last layer feature
+            ncam = len(self.camera_names)
+            if self.camera_batch:
+                # One backbone pass over every camera: (bs, ncam, 3, H, W) -> (ncam * bs, 3, H, W), camera-major so
+                # each camera's slice stays the dense block the loader produced.
+                flat = image[:, :ncam].transpose(0, 1).reshape(ncam * bs, *image.shape[2:])
+                features, pos = self.backbones[0](flat, lang_emb=None if lang_emb is None else lang_emb.repeat(ncam, 1))
+                features = self.input_proj(features[0]) # (ncam * bs, hidden, h, w)
+                # fold camera dimension into width dimension, in camera order (same layout as the per-camera cat)
+                src = features.view(ncam, bs, *features.shape[1:]).permute(1, 2, 3, 0, 4).reshape(
+                    bs, features.shape[1], features.shape[2], ncam * features.shape[3])
                 pos = pos[0]
-                all_cam_features.append(self.input_proj(features))
-                all_cam_pos.append(pos)
+                pos = torch.cat([pos if pos.shape[0] == 1 else pos[:bs]] * ncam, axis=3)
+            else:
+                all_cam_features = []
+                all_cam_pos = []
+                for cam_id, cam_name in enumerate(self.camera_names):
+                    features, pos = self.backbones[0](image[:, cam_id], lang_emb=lang_emb, camera=cam_id) # HARDCODED
+                    features = features[0] # take the last layer feature
+                    pos = pos[0]
+                    all_cam_features.append(self.input_proj(features))
+                    all_cam_pos.append(pos)
+                # fold camera dimension into width dimension
+                src = torch.cat(all_cam_features, axis=3)
+                pos = torch.cat(all_cam_pos, axis=3)
             # proprioception features
             proprio_input = self.input_proj_robot_state(qpos)
-            # fold camera dimension into width dimension
-            src = torch.cat(all_cam_features, axis=3)
-            pos = torch.cat(all_cam_pos, axis=3)
             hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight,
-                                  decoder_layers=self.decoder_layers_used)[0]
+                                  decoder_layers=self.decoder_layers_used, task_emb=task_emb)[0]
         else:
+            if self.mt_act:
+                raise ValueError('MT-ACT requires image backbones')
             qpos = self.input_proj_robot_state(qpos)
             env_state = self.input_proj_env_state(env_state)
             transformer_input = torch.cat([qpos, env_state], axis=1) # seq length = 2
@@ -256,6 +307,9 @@ def build_encoder(args):
 
 def build(args):
     state_dim = getattr(args, 'state_dim', 14)
+    if getattr(args, 'camera_batch', False) and getattr(args, 'backbone_norm', 'frozen') == 'batch_per_camera':
+        raise ValueError('Per-camera BatchNorm statistics need one backbone pass per camera; '
+                         'camera batching and backbone_norm batch_per_camera are exclusive')
 
     # From state
     # backbone = None # from state for now, no need for conv nets
@@ -268,6 +322,7 @@ def build(args):
 
     encoder = build_encoder(args)
 
+    mt_act = getattr(args, 'language_conditioning', 'none') == 'mt_act'
     model = DETRVAE(
         backbones,
         transformer,
@@ -276,6 +331,8 @@ def build(args):
         action_dim=getattr(args, 'action_dim', 14),
         num_queries=args.num_queries,
         camera_names=args.camera_names,
+        mt_act_language_dim=getattr(args, 'language_dim', 768) if mt_act else None,
+        camera_batch=bool(getattr(args, 'camera_batch', False)),
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -284,6 +341,8 @@ def build(args):
     return model
 
 def build_cnnmlp(args):
+    if getattr(args, 'language_conditioning', 'none') != 'none':
+        raise ValueError('CLIP FiLM language conditioning is only supported for ACT, not CNNMLP')
     state_dim = getattr(args, 'state_dim', 14)
 
     # From state
