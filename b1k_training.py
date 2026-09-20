@@ -18,17 +18,46 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from b1k_dataset import B1KDataset, CAMERAS, OBS_KEYS, STATE_INDICES, VIDEO_KEYS, SplitBatchSampler, StepBatchSampler
+from b1k_dataset import (B1KDataset, CAMERAS, GOAL_OBS_KEYS, GOAL_SOURCES, GOAL_VIDEO_KEYS, OBS_KEYS, STATE_INDICES,
+                         VIDEO_KEYS, SplitBatchSampler, StepBatchSampler, goal_views_to_indices)
 from b1k_frame_cache import dequantize_images
+from detr.models.detr_vae import GOAL_ENCODERS, GOAL_FUSIONS
 from detr.models.maxpool_nhwc import MaxPool3x3NHWC, replaces
 from detr.models.transformer import use_fused_attention
 from policy import ACTPolicy, CNNMLPPolicy
 from b1k_language import (ENCODERS, build_language_cache, language_dim, language_embedding_table, language_encoder,
-                          language_for_qpos, language_mode, validate_resume_prompts)
+                          language_for_tasks, language_mode, validate_resume_prompts)
 
 
 LOGGER = logging.getLogger(__name__)
 CHECKPOINT_VERSION = 1
+# Conditioning regimes (b1k.md "Goal-image conditioning"): which task-specifying modalities the policy receives.
+#   none           N  observation/proprioception only (no task id, no language, no goal)
+#   language       L  task-dependent language (mt_act or clip_film), no goal
+#   image          I  goal image(s), no task-dependent language
+#   image_language LI both
+# Task identity never enters the network through the state in any regime unless --task-onehot is passed
+# explicitly (that is a separate task-ID experiment, recorded as such).
+REGIMES = ('none', 'language', 'image', 'image_language')
+
+
+def goal_config(model_config):
+    """Validated goal-conditioning fields of a model config (defaults = the goal-free base policy)."""
+    fusion = model_config.get('goal_fusion', 'none')
+    if fusion not in GOAL_FUSIONS:
+        raise ValueError(f'Unsupported goal_fusion {fusion!r}')
+    views = list(model_config.get('goal_views', []))
+    goal_views_to_indices(views)
+    encoder = model_config.get('goal_encoder', 'shared_base')
+    if encoder not in GOAL_ENCODERS:
+        raise ValueError(f'Unsupported goal_encoder {encoder!r}')
+    if fusion == 'none' and views:
+        raise ValueError('goal_views require goal_fusion early or late')
+    if fusion != 'none' and not views:
+        raise ValueError('goal_fusion early/late requires goal_views')
+    return {'goal_fusion': fusion, 'goal_views': views, 'goal_encoder': encoder,
+            'goal_role_embedding': bool(model_config.get('goal_role_embedding', True)),
+            'language_on_goal_encoder': bool(model_config.get('language_on_goal_encoder', False))}
 
 
 def load_checkpoint(path):
@@ -42,9 +71,14 @@ def load_checkpoint(path):
         raise ValueError('Unsupported checkpoint camera mapping')
     if adapter['action_transform'] != 'identity' or adapter['action_shift'] != 0:
         raise ValueError('Unsupported checkpoint action semantics')
+    if adapter.get('task_conditioning', 'onehot') not in ('onehot', 'none'):
+        raise ValueError('Unsupported checkpoint task conditioning')
     name = policy_class(checkpoint['model_config'])
     if name == 'CNNMLP' and checkpoint['model_config'].get('image_size', [480, 640]) != adapter['image_size']:
         raise ValueError('CNNMLP checkpoint model/adapter image sizes differ')
+    goal = goal_config(checkpoint['model_config'])
+    if adapter.get('goal_views', []) != goal['goal_views'] or adapter.get('goal_source', 'episode_last') not in GOAL_SOURCES:
+        raise ValueError('Checkpoint goal views/source do not match its model configuration')
     language_embedding_table(checkpoint['model_config'], checkpoint['task_map'], checkpoint.get('language_cache'))
     return checkpoint
 
@@ -75,6 +109,8 @@ def make_policy(model_config, device, restoring=False, fused_optimizer=False, sk
     """
     config = dict(model_config, programmatic=True, device=str(device), fused_optimizer=fused_optimizer,
                   language_dim=language_dim(model_config))  # derived from the encoder, not saved
+    config.update(goal_config(model_config))
+    config['goal_camera_indices'] = goal_views_to_indices(config['goal_views'])  # derived, not saved
     if restoring:
         config['pretrained_backbone'] = False
     policy_type = ACTPolicy if policy_class(config) == 'ACT' else CNNMLPPolicy
@@ -205,13 +241,16 @@ def save_eval_checkpoint(run, policy, step, output):
     return path
 
 
-def optimizer_batches(loader, batch_size, loader_batch_size, device=None, stream=None):
-    """Yield one ordered optimizer batch per step: (images, qpos, actions, is_pad, per-sample timings).
+BATCH_COLUMNS = 6  # images, qpos, actions, is_pad, goal, task_id -- then the per-sample timings dict
 
-    Worker slices are reassembled in sampler order. With a CUDA `device`, the four tensors are
-    allocated on the device and each pinned slice is copied straight into place (`stream`, when given,
-    carries the copies so they overlap the previous step's compute; consume with `consume_batch`).
-    Without a device the batch is assembled on the host exactly as before.
+
+def optimizer_batches(loader, batch_size, loader_batch_size, device=None, stream=None):
+    """Yield one ordered optimizer batch per step: (images, qpos, actions, is_pad, goal, task_id, per-sample timings).
+
+    Worker slices are reassembled in sampler order. With a CUDA `device`, the tensors are allocated on the
+    device and each pinned slice is copied straight into place (`stream`, when given, carries the copies so
+    they overlap the previous step's compute; consume with `consume_batch`). Without a device the batch is
+    assembled on the host exactly as before.
     """
     on_device = device is not None and torch.device(device).type == 'cuda'
     context = torch.cuda.stream(stream) if on_device and stream is not None else nullcontext()
@@ -223,10 +262,11 @@ def optimizer_batches(loader, batch_size, loader_batch_size, device=None, stream
 
     if not loader_batch_size or loader_batch_size >= batch_size:
         for batch in loader:
+            columns = len(batch) - 1
             if on_device:
                 with context:
-                    tensors = [value.to(device, non_blocking=True) for value in batch[:4]]
-                yield (*tensors, batch[4])
+                    tensors = [value.to(device, non_blocking=True) for value in batch[:columns]]
+                yield (*tensors, batch[columns])
                 del tensors
             else:
                 yield batch
@@ -237,9 +277,10 @@ def optimizer_batches(loader, batch_size, loader_batch_size, device=None, stream
     for batch in loader:
         slices.append(batch)
         if len(slices) == parts:
+            columns = len(slices[0]) - 1
             tensors = []
             with context:
-                for column in range(4):
+                for column in range(columns):
                     merged = allocate(slices[0][column])
                     offset = 0
                     for part in slices:
@@ -249,7 +290,7 @@ def optimizer_batches(loader, batch_size, loader_batch_size, device=None, stream
                     if offset != batch_size:
                         raise RuntimeError('Incorrect optimizer batch size from data loader')
                     tensors.append(merged)
-            timings = {key: torch.cat([part[4][key] for part in slices]) for key in slices[0][4]}
+            timings = {key: torch.cat([part[columns][key] for part in slices]) for key in slices[0][columns]}
             slices.clear()
             yield (*tensors, timings)
             del tensors, timings, merged, value, part, batch
@@ -330,15 +371,29 @@ def prepare_images(images, channels_last=True):
     return images
 
 
+def prepare_goals(goal, channels_last=True):
+    """Loader goal images (batch, views, H, W, 3) uint8 to float (batch, views, 3, H, W) in [0, 1]; None without views."""
+    if goal is None or goal.shape[1] == 0:
+        return None
+    return prepare_images(goal, channels_last)
+
+
 def consume_batch(batch, stream=None, channels_last=True):
-    """Hand a prefetched batch to the current stream and convert its images for the forward pass."""
-    images, qpos, actions, is_pad, timings = batch
+    """Hand a prefetched batch to the current stream and convert its images for the forward pass.
+
+    Returns (images, qpos, actions, is_pad, goal, task_id, timings); `goal` is None when the dataset carries no
+    goal views.
+    """
+    if len(batch) == BATCH_COLUMNS:  # dataset built without profile_reads: no timings dict
+        batch = (*batch, {})
+    images, qpos, actions, is_pad, goal, task_id, timings = batch
     if stream is not None:
         current = torch.cuda.current_stream(images.device)
         current.wait_stream(stream)
-        for tensor in (images, qpos, actions, is_pad):
+        for tensor in (images, qpos, actions, is_pad, goal, task_id):
             tensor.record_stream(current)
-    return prepare_images(images, channels_last), qpos, actions, is_pad, timings
+    return (prepare_images(images, channels_last), qpos, actions, is_pad, prepare_goals(goal, channels_last), task_id,
+            timings)
 
 
 def configure_cpu_threads(worker_id=None, torch_threads=1, arrow_threads=1, opencv_threads=1):
@@ -422,6 +477,92 @@ class ExplicitBooleanOption(argparse.BooleanOptionalAction):
         setattr(namespace, f'_{self.dest}_explicit', True)
 
 
+def source_commit():
+    """Git commit of this checkout (None outside a repository); recorded with every run for provenance."""
+    import subprocess
+    try:
+        result = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=Path(__file__).resolve().parent,
+                                capture_output=True, text=True, check=False, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() or None
+
+
+def conditioning_record(model_config, adapter, dataset, root):
+    """Resolved conditioning configuration saved with run.json and every checkpoint (b1k.md, plan section 9)."""
+    goal = goal_config(model_config)
+    language = language_mode(model_config)
+    regime = model_config.get('regime')
+    return {
+        'regime': regime, 'source_commit': source_commit(), 'dataset_root': str(root),
+        'task_map': dataset.task_map, 'episodes': len(dataset.episodes), 'frames': len(dataset), 'data_split': 'all',
+        'language': {'implementation': language, 'encoder': language_encoder(model_config) if language != 'none' else None,
+                     'prompt_source': model_config.get('prompt_source', 'task_name') if language != 'none' else None,
+                     'film_init': model_config.get('film_init') if language != 'none' else None,
+                     'encoder_trainability': 'frozen_text_encoder_cached' if language != 'none' else None,
+                     'on_goal_encoder': goal['language_on_goal_encoder'] if goal['goal_fusion'] == 'late' else None},
+        'goal': {'fusion': goal['goal_fusion'], 'views': goal['goal_views'], 'encoder': goal['goal_encoder'],
+                 'role_embedding': goal['goal_role_embedding'] if goal['goal_fusion'] == 'late' else None,
+                 'source': adapter.get('goal_source') if goal['goal_views'] else None,
+                 'sampling_policy': 'fixed_terminal_frame_per_episode' if goal['goal_views'] else None,
+                 'hindsight_probability': 0.0, 'dropout_probability': 0.0},
+        'task_onehot': adapter.get('task_conditioning', 'onehot') == 'onehot',
+        'pretrained_encoder': 'torchvision_resnet18_IMAGENET1K_V1' if model_config.get('pretrained_backbone', True) else None,
+        'auxiliary_pose_weight': 0.0, 'guidance_scale': 1.0,
+    }
+
+
+def resolve_regime(args):
+    """Validate the conditioning flags against --regime and fill the regime's defaults (fresh runs only).
+
+    The regime is the experiment's declared modality availability; the mechanism flags must agree with it, so a
+    misconfigured run fails here instead of silently training a different condition:
+      none            language none, goal none, no one-hot
+      language        language mt_act|clip_film (default mt_act), goal none
+      image           language none, goal early|late (default late), head goal view
+      image_language  language + goal as above
+    Without --regime the historical defaults stand (one-hot task input on, everything else as given), and any
+    goal flags still apply; a multi-task run without a regime, language or goal keeps its one-hot task input.
+    """
+    if args.task_onehot is None:
+        args.task_onehot = args.regime is None
+    if args.goal_fusion != 'none' and args.goal_views is None:
+        args.goal_views = [CAMERAS[0]]
+    if args.goal_fusion == 'none' and args.goal_views:
+        raise ValueError('--goal-views require --goal-fusion early or late')
+    if args.goal_fusion == 'none':
+        args.goal_views = []
+        if getattr(args, '_goal_encoder_explicit', False) or getattr(args, '_goal_role_embedding_explicit', False) or \
+                getattr(args, '_language_on_goal_encoder_explicit', False) or getattr(args, '_goal_source_explicit', False):
+            raise ValueError('--goal-encoder/--goal-role-embedding/--language-on-goal-encoder/--goal-source require --goal-fusion')
+    if args.goal_fusion == 'early' and args.goal_encoder != 'shared_base':
+        raise ValueError('--goal-fusion early pairs the goal with its camera stem; --goal-encoder must be shared_base')
+    if args.language_on_goal_encoder and args.language_conditioning == 'none':
+        raise ValueError('--language-on-goal-encoder requires language conditioning')
+    if args.regime is None:
+        return
+    wants_language = args.regime in ('language', 'image_language')
+    wants_goal = args.regime in ('image', 'image_language')
+    if wants_language:
+        if not getattr(args, '_language_conditioning_explicit', False):
+            args.language_conditioning = 'mt_act'
+        if args.language_conditioning == 'none':
+            raise ValueError(f'--regime {args.regime} requires --language-conditioning mt_act or clip_film')
+    elif args.language_conditioning != 'none':
+        raise ValueError(f'--regime {args.regime} excludes task-dependent language; drop --language-conditioning')
+    if wants_goal:
+        if not getattr(args, '_goal_fusion_explicit', False):
+            args.goal_fusion = 'late'
+            args.goal_views = args.goal_views or [CAMERAS[0]]
+        if args.goal_fusion == 'none':
+            raise ValueError(f'--regime {args.regime} requires --goal-fusion early or late')
+    elif args.goal_fusion != 'none':
+        raise ValueError(f'--regime {args.regime} excludes goal images; drop --goal-fusion')
+    if args.task_onehot:
+        LOGGER.warning('--task-onehot with --regime %s: the task id enters the state; this is a task-ID experiment, '
+                       'not the plain %s condition', args.regime, args.regime)
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--dataset-path', '--dataset-root', dest='dataset_path', required=True)
@@ -465,6 +606,31 @@ def parser():
     p.add_argument('--film-recompute', action=argparse.BooleanOptionalAction, default=True,
                    help='Recompute the FiLM-conditioned ResNet blocks during backward instead of storing their '
                         'activations (same math; less memory, more compute). Runtime choice, not saved')
+    # --- conditioning regime and goal-image conditioning (b1k.md "Goal-image conditioning") ---
+    p.add_argument('--regime', choices=REGIMES, default=None, action=LanguageOption,
+                   help='Conditioning regime: none (N: no task id, language or goal), language (L), image (I) or '
+                        'image_language (LI). Validates the language/goal/one-hot flags against the regime and, unless '
+                        '--task-onehot is given explicitly, keeps the task id out of the state in every regime. '
+                        'Omitted: the historical behaviour (one-hot task input, no regime record)')
+    p.add_argument('--task-onehot', action=ExplicitBooleanOption, default=None,
+                   help='Append the one-hot task category to the state (the pre-regime default). With --regime the '
+                        'default is off; passing --task-onehot with a regime records a task-ID experiment')
+    p.add_argument('--goal-fusion', choices=list(GOAL_FUSIONS), default='none', action=LanguageOption,
+                   help='Goal-image conditioning: early (goal channel-stacked with its camera before the ResNet stem, '
+                        'BridgeData V2 style, zero-initialised goal stem) or late (goal encoded by the RGB backbone, its '
+                        'spatial tokens appended to the transformer encoder memory with a learned goal identity)')
+    p.add_argument('--goal-views', nargs='+', choices=CAMERAS, default=None, action=LanguageOption,
+                   help='Cameras whose goal image is supplied (default: zed_link, the head camera, with --goal-fusion)')
+    p.add_argument('--goal-source', choices=list(GOAL_SOURCES), default='episode_last', action=LanguageOption,
+                   help='episode_last: last frame of the episode\'s own camera stream (any LeRobot v3 root); goal_key: '
+                        'the dataset\'s observation.goal_rgb.<camera>_camera_0 stream (saved in the adapter config)')
+    p.add_argument('--goal-encoder', choices=list(GOAL_ENCODERS), default='shared_base', action=LanguageOption,
+                   help='Late fusion: encode the goal with the shared RGB backbone (default) or an identical separate copy')
+    p.add_argument('--goal-role-embedding', action=ExplicitBooleanOption, default=True,
+                   help='Late fusion: learned per-view goal identity added to the goal tokens\' positions (zero-initialised)')
+    p.add_argument('--language-on-goal-encoder', action=ExplicitBooleanOption, default=False,
+                   help='Late fusion with language: also FiLM-modulate the goal pass with the language embedding. Default '
+                        'off: the goal is encoded with the FiLM layers at the identity (gamma = beta = 0)')
     p.add_argument('--chunk-size', type=int, default=100, help='ACT prediction length; CNNMLP always uses one action')
     p.add_argument('--image-size', type=int, nargs=2, metavar=('HEIGHT', 'WIDTH'),
                    help='Default: ACT 240 240; CNNMLP 480 640 (original convolution/flatten path)')
@@ -564,14 +730,22 @@ def _train(args, output, root, resources):
         model_config = dict(checkpoint['model_config'])
         model_config.setdefault('policy_class', 'ACT')
         for key, default in [('language_conditioning', 'none'), ('prompt_source', 'task_name'), ('film_init', 'random'),
-                             ('language_encoder', 'clip'), ('backbone_norm', 'frozen'), ('camera_batch', False)]:
+                             ('language_encoder', 'clip'), ('backbone_norm', 'frozen'), ('camera_batch', False),
+                             ('regime', None), ('task_onehot', True), ('goal_fusion', 'none'), ('goal_views', []),
+                             ('goal_encoder', 'shared_base'), ('goal_role_embedding', True),
+                             ('language_on_goal_encoder', False)]:
             saved_value = model_config.get(key, default)
             if getattr(args, f'_{key}_explicit', False) and getattr(args, key) != saved_value:
                 raise ValueError(f'--{key.replace("_", "-")} differs from checkpoint')
             setattr(args, key, saved_value)
+        saved_source = adapter.get('goal_source', 'episode_last')
+        if getattr(args, '_goal_source_explicit', False) and args.goal_source != saved_source:
+            raise ValueError('--goal-source differs from checkpoint')
+        args.goal_source = saved_source
         task_names = args.task_names or list(checkpoint['task_map'].values())
         args.seed = checkpoint['train_config']['seed']
     else:
+        resolve_regime(args)
         image_size = args.image_size or ([240, 240] if args.policy_class == 'ACT' else [480, 640])
         if args.policy_class == 'CNNMLP' and (args.pre_norm or args.position_embedding != 'sine'):
             raise ValueError('Position embeddings and pre-norm are ACT architecture options; CNNMLP does not use them')
@@ -588,9 +762,16 @@ def _train(args, output, root, resources):
             raise ValueError('CNNMLP requires images at least 385x385; default is 480x640')
         adapter = {'image_size': list(image_size), 'state_indices': STATE_INDICES,
                    'video_keys': VIDEO_KEYS, 'observation_keys': OBS_KEYS, 'action_dim': 23,
-                   'action_transform': 'identity', 'action_shift': 0, 'task_conditioning': 'onehot',
+                   'action_transform': 'identity', 'action_shift': 0,
+                   'task_conditioning': 'onehot' if args.task_onehot else 'none',
                    'timestamp_tolerance': args.timestamp_tolerance, 'image_resize': 'bilinear_antialias',
-                   'image_normalization': f'rgb_div255_then_imagenet_in_{args.policy_class}Policy'}
+                   'image_normalization': f'rgb_div255_then_imagenet_in_{args.policy_class}Policy',
+                   # goal images: one per view, no history axis; wire keys `goal::<camera observation key>`
+                   'goal_views': list(args.goal_views), 'goal_source': args.goal_source,
+                   'goal_video_keys': [GOAL_VIDEO_KEYS[view] if args.goal_source == 'goal_key' else VIDEO_KEYS[CAMERAS.index(view)]
+                                       for view in args.goal_views],
+                   'goal_observation_keys': [GOAL_OBS_KEYS[view] for view in args.goal_views],
+                   'goal_image_normalization': 'same_as_cameras' if args.goal_views else None}
         task_names = args.task_names
         model_config = {'policy_class': args.policy_class,
                         'num_queries': args.chunk_size if args.policy_class == 'ACT' else 1,
@@ -603,6 +784,10 @@ def _train(args, output, root, resources):
                         'position_embedding': args.position_embedding, 'pre_norm': args.pre_norm,
                         'language_conditioning': args.language_conditioning, 'prompt_source': args.prompt_source,
                         'backbone_norm': args.backbone_norm, 'camera_batch': args.camera_batch,
+                        'regime': args.regime, 'task_onehot': bool(args.task_onehot),
+                        'goal_fusion': args.goal_fusion, 'goal_views': list(args.goal_views),
+                        'goal_encoder': args.goal_encoder, 'goal_role_embedding': bool(args.goal_role_embedding),
+                        'language_on_goal_encoder': bool(args.language_on_goal_encoder),
                         'dilation': False, 'masks': False, 'action_dim': 23}
         if args.language_conditioning != 'none':
             model_config['film_init'] = args.film_init
@@ -618,16 +803,22 @@ def _train(args, output, root, resources):
     tracked, wandb_identity = resources.enter_context(wandb_run(args, output, checkpoint))
     configure_cpu_threads(torch_threads=args.torch_threads or torch.get_num_threads(),
                           arrow_threads=args.arrow_threads, opencv_threads=args.opencv_threads)
+    goal = goal_config(model_config)
+    task_onehot = adapter.get('task_conditioning', 'onehot') == 'onehot'
     dataset = B1KDataset(root, task_names, model_config['num_queries'], adapter['image_size'],
                          cache_row_groups=args.cache_row_groups, profile_reads=True,
                          timestamp_tolerance=adapter['timestamp_tolerance'],
-                         frame_cache=args.frame_cache.resolve() if args.frame_cache else None)
+                         frame_cache=args.frame_cache.resolve() if args.frame_cache else None,
+                         goal_views=goal['goal_views'], goal_source=adapter.get('goal_source', 'episode_last'),
+                         task_onehot=task_onehot)
     resources.callback(dataset.close)
     if checkpoint and dataset.task_map != checkpoint['task_map']:
         raise ValueError('Resume task map differs from checkpoint')
-    # The adapter always appends the one-hot task category to qpos (it selects the language embedding);
-    # MT-ACT does not feed it to the network, so its state_dim covers the proprioception only.
-    model_config['state_dim'] = len(STATE_INDICES) + (0 if language_mode(model_config) == 'mt_act' else len(dataset.task_map))
+    # With the one-hot task input the adapter appends the task category to qpos; MT-ACT never feeds it to the
+    # network (state_dim covers the proprioception only), and neither does any run whose task_conditioning is
+    # 'none' (regimes N/L/I/LI): task identity then reaches the network only through language or the goal image.
+    model_config['state_dim'] = len(STATE_INDICES) + (
+        len(dataset.task_map) if task_onehot and language_mode(model_config) != 'mt_act' else 0)
     language_cache = checkpoint.get('language_cache') if checkpoint else None
     if checkpoint:
         validate_resume_prompts(root, dataset.task_map, language_cache)
@@ -689,7 +880,8 @@ def _train(args, output, root, resources):
     train_config['resume'] = str(args.resume) if args.resume else None
     train_config['frame_cache'] = str(args.frame_cache) if args.frame_cache else None
     run = {'model_config': model_config, 'adapter_config': adapter, 'train_config': train_config,
-           'task_map': dataset.task_map, 'normalization': stats, 'wandb': wandb_identity}
+           'task_map': dataset.task_map, 'normalization': stats, 'wandb': wandb_identity,
+           'conditioning': conditioning_record(model_config, adapter, dataset, root)}
     if language_cache is not None:
         run['language_cache'] = language_cache
     atomic_json(run, output / ('resume_run.json' if checkpoint else 'run.json'))
@@ -714,7 +906,8 @@ def _train(args, output, root, resources):
     LOGGER.info('Training %d -> %d steps on %s with real upstream %s (matmul %s, autocast %s, attention %s, '
                 'channels_last %s, fused optimizer %s, fast maxpool %s, compile %s, frame cache %s, '
                 'skipped unused decoder parameters %d, language %s/%s/%s, film init %s, film recompute %s, '
-                'backbone norm %s, pretrained backbone %s, camera batch %s)',
+                'backbone norm %s, pretrained backbone %s, camera batch %s, regime %s, task onehot %s, goal %s %s '
+                'source %s encoder %s role %s language_on_goal %s, %d parameters)',
                 start, args.max_steps, device, policy_class(model_config), args.matmul_precision, args.autocast,
                 args.attention, args.channels_last, args.fused_optimizer and cuda, args.fast_maxpool and cuda,
                 args.compile, bool(args.frame_cache), sum(parameter.numel() for parameter, _ in zero_gradients),
@@ -722,7 +915,10 @@ def _train(args, output, root, resources):
                 model_config.get('prompt_source', 'task_name'), model_config.get('film_init'),
                 args.film_recompute and language_mode(model_config) == 'clip_film',
                 model_config.get('backbone_norm', 'frozen'), model_config.get('pretrained_backbone', True),
-                model_config.get('camera_batch', False))
+                model_config.get('camera_batch', False), model_config.get('regime'), task_onehot, goal['goal_fusion'],
+                goal['goal_views'], adapter.get('goal_source', 'episode_last'), goal['goal_encoder'],
+                goal['goal_role_embedding'], goal['language_on_goal_encoder'],
+                sum(parameter.numel() for parameter in policy.parameters()))
     begin = time.monotonic()
     previous_end = begin
     batches = optimizer_batches(loader, args.batch_size, args.loader_batch_size, device=device, stream=copy_stream)
@@ -738,9 +934,11 @@ def _train(args, output, root, resources):
             if cuda:
                 torch.cuda.reset_peak_memory_stats(device)
             optimizer.zero_grad(set_to_none=True)
-            images, qpos, actions, is_pad, timings = consume_batch(batch, copy_stream, args.channels_last)
-            lang_emb = language_for_qpos(qpos, language_embeddings)
+            images, qpos, actions, is_pad, goal, task_id, timings = consume_batch(batch, copy_stream, args.channels_last)
+            lang_emb = language_for_tasks(task_id, language_embeddings, dataset.task_map)
             kwargs = {'lang_emb': lang_emb} if lang_emb is not None else {}
+            if goal is not None:
+                kwargs['goal'] = goal
             with autocast():
                 losses = policy(qpos, images, actions, is_pad, **kwargs)
             losses['loss'].backward()
@@ -789,7 +987,7 @@ def _train(args, output, root, resources):
             LOGGER.info('%s', json.dumps(record))
             if tracked:
                 tracked.log(record, step=step)
-            del images, qpos, actions, is_pad, losses, grad_norm, batch, timings, lang_emb, kwargs
+            del images, qpos, actions, is_pad, goal, task_id, losses, grad_norm, batch, timings, lang_emb, kwargs
             previous_end = time.monotonic()
     return path
 

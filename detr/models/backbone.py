@@ -65,6 +65,43 @@ FILM_INITS = ('random', 'identity')
 BACKBONE_NORMS = ('frozen', 'batch', 'batch_per_camera')
 
 
+class PairedConv2d(nn.Conv2d):
+    """Stem convolution accepting a camera image channel-stacked with its goal image (goal-image early fusion).
+
+    For a 6-channel input `[current; goal]` it computes `conv(current) + conv_goal(goal)`, which is exactly one
+    6-channel convolution with weights `[W_obs, W_goal]` (BridgeData V2's channel stacking for ACT). `W_goal`
+    (`goal_weight`) starts at zero and `W_obs` keeps the stem's (ImageNet) weights, so at initialization the
+    paired stem computes what the unpaired stem computes and a zero goal image is an exact "absent goal". A
+    3-channel input (other cameras, goal-free passes) runs the plain convolution. State-dict keys stay
+    `weight`/`bias`; `goal_weight` is the only addition. The zero initialization is our controlled engineering
+    choice, not a claim about BridgeData's unpublished details.
+    """
+    def __init__(self, conv):
+        super().__init__(conv.in_channels, conv.out_channels, conv.kernel_size, conv.stride, conv.padding,
+                         conv.dilation, conv.groups, conv.bias is not None, conv.padding_mode)
+        with torch.no_grad():
+            self.weight.copy_(conv.weight)
+            if conv.bias is not None:
+                self.bias.copy_(conv.bias)
+        self.goal_weight = nn.Parameter(torch.zeros_like(self.weight))
+
+    def forward(self, x):
+        if x.shape[1] == self.in_channels:
+            return super().forward(x)
+        if x.shape[1] != 2 * self.in_channels:
+            raise ValueError(f'PairedConv2d expects {self.in_channels} or {2 * self.in_channels} input channels, '
+                             f'got {x.shape[1]}')
+        weight = torch.cat([self.weight, self.goal_weight.to(self.weight.dtype)], dim=1)
+        return self._conv_forward(x, weight, self.bias)
+
+
+def pair_stem(body):
+    """Replace a ResNet body's `conv1` with a PairedConv2d (idempotent); returns the paired stem."""
+    if not isinstance(body.conv1, PairedConv2d):
+        body.conv1 = PairedConv2d(body.conv1)
+    return body.conv1
+
+
 class PerCameraBatchNorm2d(nn.Module):
     """BatchNorm2d with one set of running statistics per camera (domain-specific BatchNorm).
 
@@ -170,14 +207,16 @@ class FiLMIntermediateLayerGetter(IntermediateLayerGetter):
         return film(block(x), lang_emb)
 
     def forward(self, x, lang_emb):
-        if lang_emb is None or lang_emb.shape != (x.shape[0], self.lang_dim):
+        # lang_emb=None is the explicit identity pass (gamma = beta = 0, i.e. relu(x) = x on the block outputs):
+        # used for goal images encoded without language modulation (language_on_goal_encoder=False).
+        if lang_emb is not None and lang_emb.shape != (x.shape[0], self.lang_dim):
             raise ValueError(f'CLIP FiLM requires language embeddings with shape (B, {self.lang_dim})')
         recompute = self.recompute and self.training and torch.is_grad_enabled()
         out = OrderedDict()
         for name, layer in self.items():
             if name == 'film_layers':
                 continue
-            if name in self.film_layers:
+            if name in self.film_layers and lang_emb is not None:
                 for block, film in zip(layer, self.film_layers[name]):
                     if recompute:
                         x = checkpoint(self.conditioned_block, block, film, x, lang_emb, use_reentrant=False)
@@ -233,12 +272,14 @@ class ResidualFiLMBody(nn.Module):
         return block.relu(out + identity)
 
     def forward(self, x, cond):
-        if cond is None or cond.shape != (x.shape[0], self.cond_dim):
+        # cond=None is the explicit identity pass (gamma = beta = 0 in every modulated block), used for goal
+        # images encoded without language modulation (language_on_goal_encoder=False).
+        if cond is not None and cond.shape != (x.shape[0], self.cond_dim):
             raise ValueError(f'MT-ACT FiLM requires projected task embeddings with shape (B, {self.cond_dim})')
         x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
         for name in ('layer1', 'layer2', 'layer3', 'layer4'):
             layer = getattr(self, name)
-            if name not in self.film_generators:
+            if name not in self.film_generators or cond is None:
                 x = layer(x)
                 continue
             # RoboAgent: film_feat.view(-1, 2, num_blocks, planes) -> gamma first, beta second
@@ -282,8 +323,16 @@ class BackboneBase(nn.Module):
         for module in self.per_camera_norms:
             module.camera = camera
 
-    def forward(self, tensor, lang_emb=None):
+    def pair_stem(self):
+        """Goal-image early fusion: make the stem accept `[current; goal]` 6-channel inputs (see PairedConv2d)."""
+        return pair_stem(self.body)
+
+    def forward(self, tensor, lang_emb=None, film_identity=False):
         if self.language_conditioning != 'none':
+            if lang_emb is None and not film_identity:
+                raise ValueError(f'{self.language_conditioning} requires language embeddings; a deliberate identity '
+                                 'pass (gamma = beta = 0, e.g. goal images without language) must set film_identity')
+            # film_identity: the FiLM body runs as the identity (goal images encoded without language).
             return self.body(tensor, lang_emb)
         if lang_emb is not None:
             raise ValueError('Language embeddings require clip_film or mt_act conditioning')
@@ -331,16 +380,16 @@ class Joiner(nn.Sequential):
         # this dtype and hand fp32 features to the rest of the network. None keeps the caller's precision.
         self.body_autocast_dtype = None
 
-    def forward(self, tensor_list: NestedTensor, lang_emb=None, camera=None):
+    def forward(self, tensor_list: NestedTensor, lang_emb=None, camera=None, film_identity=False):
         if camera is not None:
             self[0].select_camera(camera)
         elif self[0].per_camera_norms:
             raise ValueError('Per-camera BatchNorm statistics need the camera index of this pass')
         if self.body_autocast_dtype is None:
-            xs = self[0](tensor_list, lang_emb=lang_emb)
+            xs = self[0](tensor_list, lang_emb=lang_emb, film_identity=film_identity)
         else:
             with torch.autocast(device_type=tensor_list.device.type, dtype=self.body_autocast_dtype):
-                xs = self[0](tensor_list, lang_emb=lang_emb)
+                xs = self[0](tensor_list, lang_emb=lang_emb, film_identity=film_identity)
             xs = {name: x.float() for name, x in xs.items()}
         out: List[NestedTensor] = []
         pos = []

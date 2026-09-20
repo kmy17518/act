@@ -11,12 +11,26 @@ import torch
 import websockets.asyncio.server as websocket_server
 from websockets.exceptions import ConnectionClosed
 
-from b1k_dataset import OBS_KEYS, preprocess_image, preprocess_state
-from b1k_training import load_checkpoint, make_policy, policy_class
-from b1k_language import language_embedding_table, language_for_qpos
+from b1k_dataset import CAMERAS, GOAL_OBS_KEYS, OBS_KEYS, preprocess_image, preprocess_state
+from b1k_training import goal_config, load_checkpoint, make_policy, policy_class
+from b1k_language import language_embedding_table, language_for_tasks
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def load_goal_images(specs):
+    """`--goal-image CAMERA=PATH` values to {camera: uint8 HWC RGB array} (PNG/JPEG via PyAV, no extra dependency)."""
+    import av
+    goals = {}
+    for spec in specs or []:
+        camera, _, path = spec.partition('=')
+        if camera not in CAMERAS or not path:
+            raise ValueError(f'--goal-image expects CAMERA=PATH with CAMERA in {CAMERAS}, got {spec!r}')
+        with av.open(path) as container:
+            frame = next(container.decode(video=0))
+            goals[camera] = frame.to_ndarray(format='rgb24')
+    return goals
 
 
 def pack_array(value):
@@ -55,15 +69,26 @@ class PolicyPredictor:
         embeddings = language_embedding_table(checkpoint['model_config'], checkpoint['task_map'],
                                                checkpoint.get('language_cache'))
         self.language_embeddings = embeddings.to(self.device) if embeddings is not None else None
+        self.task_map = checkpoint['task_map']
+        self.goal_views = goal_config(checkpoint['model_config'])['goal_views']
         self.policy = make_policy(checkpoint['model_config'], self.device, restoring=True)
         self.policy.load_state_dict(checkpoint['model'])
         self.policy.eval()
 
     @torch.inference_mode()
-    def __call__(self, qpos, images):
+    def __call__(self, qpos, images, task_ids=None, goal=None):
+        """Denormalized actions for a batch; `task_ids` (B,) select the cached prompt, `goal` is (B, views, 3, H, W)."""
         qpos, images = qpos.to(self.device), images.to(self.device)
-        lang_emb = language_for_qpos(qpos, self.language_embeddings)
-        kwargs = {'lang_emb': lang_emb} if lang_emb is not None else {}
+        kwargs = {}
+        if self.language_embeddings is not None:
+            if task_ids is None:
+                raise ValueError('Language-conditioned checkpoints need task ids to select the prompt')
+            kwargs['lang_emb'] = language_for_tasks(torch.as_tensor(np.asarray(task_ids), device=self.device),
+                                                    self.language_embeddings, self.task_map)
+        if self.goal_views:
+            if goal is None:
+                raise ValueError(f'Goal-conditioned checkpoint needs goal images for views {self.goal_views}')
+            kwargs['goal'] = goal.to(self.device)
         actions = self.policy(qpos, images, **kwargs).cpu().numpy()
         stats = self.checkpoint['normalization']
         return (actions * np.asarray(stats['action_std'], dtype=np.float32) +
@@ -75,11 +100,19 @@ ACTPredictor = PolicyPredictor
 
 
 class Session:
-    def __init__(self, predictor, checkpoint, action_horizon=None, task_name=None, temporal_agg=False):
+    def __init__(self, predictor, checkpoint, action_horizon=None, task_name=None, temporal_agg=False,
+                 fixed_goals=None):
         self.predictor = predictor
         self.task_map = checkpoint['task_map']
         self.stats = checkpoint['normalization']
-        self.image_size = checkpoint['adapter_config']['image_size']
+        adapter = checkpoint['adapter_config']
+        self.image_size = adapter['image_size']
+        self.task_onehot = adapter.get('task_conditioning', 'onehot') == 'onehot'
+        # Goal images: per request under the `goal::<camera observation key>` keys, else the fixed images given at
+        # server start (--goal-image CAMERA=PATH; an externally supplied target image), else the request is rejected.
+        self.goal_views = list(adapter.get('goal_views', []))
+        self.goal_keys = {view: GOAL_OBS_KEYS[view] for view in self.goal_views}
+        self.fixed_goals = {view: np.asarray(image) for view, image in (fixed_goals or {}).items() if view in self.goal_views}
         self.policy_class = policy_class(checkpoint['model_config'])
         self.chunk_size = checkpoint['model_config']['num_queries']
         self.temporal_agg = temporal_agg
@@ -130,24 +163,27 @@ class Session:
             raise ValueError('robot_r1::proprio must have shape (61,) or (B,61)')
         batch_size = len(state)
         task_ids = self.resolve_tasks(observation.get('task_id'), batch_size)
-        qpos = torch.stack([preprocess_state(s, int(task), self.stats, self.task_map)
+        qpos = torch.stack([preprocess_state(s, int(task), self.stats, self.task_map, self.task_onehot)
                             for s, task in zip(state, task_ids)])
-        cameras = []
-        for key in OBS_KEYS:
-            camera = np.asarray(observation[key])
-            if camera.ndim == 3:
-                camera = camera[None]
-            if camera.ndim != 4 or camera.shape[0] != batch_size:
-                raise ValueError(f'{key} must have shape (B,H,W,3|4) with B={batch_size}')
-            cameras.append(torch.stack([preprocess_image(image, self.image_size) for image in camera]))
-        images = torch.stack(cameras, dim=1)
+        images = self.batch_images(observation, OBS_KEYS, batch_size)
+        goal = None
+        if self.goal_views:
+            goal_batch = {}
+            for view, key in self.goal_keys.items():
+                if key in observation:
+                    goal_batch[key] = observation[key]
+                elif view in self.fixed_goals:
+                    goal_batch[key] = np.broadcast_to(self.fixed_goals[view], (batch_size, *self.fixed_goals[view].shape))
+                else:
+                    raise ValueError(f'Goal-conditioned checkpoint needs {key} in the observation (or --goal-image {view}=PATH)')
+            goal = self.batch_images(goal_batch, list(self.goal_keys.values()), batch_size)
         if self.policy_class == 'CNNMLP':
-            predictions = self.predictor(qpos, images)
+            predictions = self.predictor(qpos, images, task_ids)
             self.validate_predictions(predictions, (batch_size, 23))
             self.task_ids = task_ids
             return predictions.astype(np.float32)
         if self.temporal_agg:
-            return self.aggregate(qpos, images, task_ids)
+            return self.aggregate(qpos, images, task_ids, goal)
         if self.plans is None or len(self.plans) != batch_size:
             plans = np.zeros((batch_size, self.action_horizon, 23), dtype=np.float32)
             positions = np.full(batch_size, self.action_horizon, dtype=np.int64)
@@ -157,7 +193,8 @@ class Session:
             positions[task_ids != self.task_ids] = self.action_horizon
         needs_plan = positions >= self.action_horizon
         if needs_plan.any():
-            predictions = self.predictor(qpos[needs_plan], images[needs_plan])
+            predictions = self.predictor(qpos[needs_plan], images[needs_plan], task_ids[needs_plan],
+                                         None if goal is None else goal[torch.from_numpy(needs_plan)])
             expected = (int(needs_plan.sum()), self.chunk_size, 23)
             self.validate_predictions(predictions, expected)
             plans[needs_plan] = predictions[:, :self.action_horizon]
@@ -166,13 +203,25 @@ class Session:
         self.plans, self.positions, self.task_ids = plans, positions + 1, task_ids
         return action.astype(np.float32)
 
+    def batch_images(self, observation, keys, batch_size):
+        """uint8 (B,H,W,3|4) arrays under `keys` to one float (B, len(keys), 3, H, W) tensor at the training size."""
+        cameras = []
+        for key in keys:
+            camera = np.asarray(observation[key])
+            if camera.ndim == 3:
+                camera = camera[None]
+            if camera.ndim != 4 or camera.shape[0] != batch_size:
+                raise ValueError(f'{key} must have shape (B,H,W,3|4) with B={batch_size}')
+            cameras.append(torch.stack([preprocess_image(image, self.image_size) for image in camera]))
+        return torch.stack(cameras, dim=1)
+
     @staticmethod
     def validate_predictions(predictions, expected):
         if predictions.shape != expected or not np.isfinite(predictions).all():
             raise ValueError(f'Invalid model output; expected finite {expected}, got {predictions.shape}')
 
-    def aggregate(self, qpos, images, task_ids):
-        predictions = self.predictor(qpos, images)
+    def aggregate(self, qpos, images, task_ids, goal=None):
+        predictions = self.predictor(qpos, images, task_ids, goal)
         batch_size = len(task_ids)
         self.validate_predictions(predictions, (batch_size, self.chunk_size, 23))
         history = []
@@ -196,13 +245,15 @@ class Session:
 
 class B1KServer:
     def __init__(self, checkpoint, predictor, host='0.0.0.0', port=8000, action_horizon=None,
-                 task_name=None, temporal_agg=False):
+                 task_name=None, temporal_agg=False, fixed_goals=None):
         self.checkpoint, self.predictor = checkpoint, predictor
         self.host, self.port = host, port
-        session = Session(predictor, checkpoint, action_horizon, task_name, temporal_agg)
+        self.fixed_goals = fixed_goals or {}
+        session = Session(predictor, checkpoint, action_horizon, task_name, temporal_agg, self.fixed_goals)
         self.action_horizon, self.task_name = session.action_horizon, task_name
         self.temporal_agg = temporal_agg
         mode = 'single_action' if session.policy_class == 'CNNMLP' else ('temporal_aggregation' if temporal_agg else 'chunked')
+        goal = goal_config(checkpoint['model_config'])
         self.metadata = {'policy': session.policy_class, 'protocol': 'behavior-numpy-msgpack', 'action_dim': 23,
                          'action_horizon': self.action_horizon, 'chunk_size': session.chunk_size,
                          'execution_mode': mode, 'temporal_agg': temporal_agg,
@@ -213,10 +264,17 @@ class B1KServer:
                          'language_encoder': (checkpoint['model_config'].get('language_encoder', 'clip')
                                               if checkpoint['model_config'].get('language_conditioning', 'none') != 'none'
                                               else None),
-                         'prompt_source': checkpoint['model_config'].get('prompt_source', 'task_name')}
+                         'prompt_source': checkpoint['model_config'].get('prompt_source', 'task_name'),
+                         'regime': checkpoint['model_config'].get('regime'),
+                         'task_conditioning': checkpoint['adapter_config'].get('task_conditioning', 'onehot'),
+                         'goal_fusion': goal['goal_fusion'], 'goal_views': goal['goal_views'],
+                         'goal_observation_keys': [GOAL_OBS_KEYS[view] for view in goal['goal_views']],
+                         'goal_source': checkpoint['adapter_config'].get('goal_source') if goal['goal_views'] else None,
+                         'fixed_goal_views': sorted(self.fixed_goals)}
 
     async def handler(self, websocket):
-        session = Session(self.predictor, self.checkpoint, self.action_horizon, self.task_name, self.temporal_agg)
+        session = Session(self.predictor, self.checkpoint, self.action_horizon, self.task_name, self.temporal_agg,
+                          self.fixed_goals)
         await websocket.send(packb(self.metadata))
         try:
             async for message in websocket:
@@ -262,9 +320,12 @@ def main():
                    help='Cached ACT actions (default min(16, chunk size)); CNNMLP/aggregation require 1')
     p.add_argument('--temporal-agg', action='store_true', help='ACT only: query each step and aggregate overlapping chunks')
     p.add_argument('--task-name', help='Default task if task_id is absent; must exist in checkpoint')
+    p.add_argument('--goal-image', action='append', metavar='CAMERA=PATH',
+                   help='Goal-conditioned checkpoints: fixed goal image (PNG/JPEG, RGB) for a camera view, used when a '
+                        'request carries no goal::<camera key> image; repeat per view')
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     checkpoint = load_checkpoint(args.model_path)
     server = B1KServer(checkpoint, PolicyPredictor(checkpoint, args.device), args.host, args.port,
-                       args.action_horizon, args.task_name, args.temporal_agg)
+                       args.action_horizon, args.task_name, args.temporal_agg, load_goal_images(args.goal_image))
     asyncio.run(server.run())

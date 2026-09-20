@@ -226,5 +226,22 @@ def validate_resume_prompts(root, task_map, cache):
 def language_for_qpos(qpos, embeddings):
     if embeddings is None:
         return None
-    # The adapter appends one-hot categories in sorted task-ID order.
+    # The adapter appends one-hot categories in sorted task-ID order (task_onehot=True checkpoints only).
     return embeddings[qpos[:, -len(embeddings):].argmax(dim=-1)]
+
+
+def language_for_tasks(task_ids, embeddings, task_map):
+    """Embeddings (B, D) selected by dataset task ids (B,), independent of the one-hot state input.
+
+    The embedding table rows follow sorted task-ID order (see `language_embedding_table`); this works for
+    every conditioning regime, including those that keep task identity out of the state vector.
+    """
+    if embeddings is None:
+        return None
+    ordered = sorted(task_map)
+    if len(ordered) != len(embeddings):
+        raise ValueError('Embedding table and task map sizes differ')
+    # No host synchronization: the dataset/server already validated every task id against the task map.
+    lookup = torch.zeros(max(ordered) + 1, dtype=torch.long, device=task_ids.device)
+    lookup[torch.tensor(ordered, device=task_ids.device)] = torch.arange(len(ordered), device=task_ids.device)
+    return embeddings[lookup[task_ids.long()]]

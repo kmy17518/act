@@ -70,7 +70,7 @@ def batch_iterator(dataset, args, device, seed, start):
     loader_sampler = SplitBatchSampler(sampler, args.loader_batch_size) if args.loader_batch_size else sampler
     loader = DataLoader(dataset, batch_sampler=loader_sampler, **loader_kwargs)
     for batch in optimizer_batches(loader, args.batch_size, args.loader_batch_size, device=device):
-        images, qpos, actions, is_pad, _ = consume_batch(batch, None, args.channels_last)
+        images, qpos, actions, is_pad = consume_batch(batch, None, args.channels_last)[:4]
         yield images, qpos, actions, is_pad
 
 

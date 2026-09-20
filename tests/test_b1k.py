@@ -455,7 +455,7 @@ def test_data_timing_worker_caps_and_prefetch(tiny_root, monkeypatch):
                 torch_threads=1, arrow_threads=1, opencv_threads=1))
     batches = list(loader)
     assert len(batches) == 5
-    assert all(batch[4]['data/sample_s'].min() > 0 for batch in batches)
+    assert all(batch[-1]['data/sample_s'].min() > 0 for batch in batches)
     cv2 = MagicMock()
     monkeypatch.setitem(sys.modules, 'cv2', cv2)
     configure_cpu_threads(torch_threads=1, arrow_threads=1, opencv_threads=1)
@@ -520,7 +520,7 @@ def test_frame_cache_matches_native_decoding_and_detects_stale_entries(tiny_root
         assert torch.equal(actual[0], torch.stack([torch.from_numpy(quantize_image(image)) for image in expected[0]]))
         for column in (1, 2, 3):
             torch.testing.assert_close(expected[column], actual[column], atol=0, rtol=0)
-        assert actual[4]['data/video_decode_s'] == 0 and actual[4]['data/frame_cache_s'] > 0
+        assert actual[-1]['data/video_decode_s'] == 0 and actual[-1]['data/frame_cache_s'] > 0
     # Camera offsets: cached frames are the same frames the native reader selects (raw pixels differ per camera).
     raw, _, _, _, _ = native.raw_sample(99, 1)
     assert [int(x[0, 0, 0]) for x in raw] == [100, 121, 142]
@@ -855,7 +855,8 @@ def test_image_layouts_optimizer_state_layout_and_batch_assembly(tiny_root):
         for tensor, other in zip(consumed[1:4], expected[1:4]):
             torch.testing.assert_close(tensor, other, atol=0, rtol=0)
         torch.testing.assert_close(consumed[0], expected[0], atol=0, rtol=0)
-        assert set(consumed[4]) == set(expected[4]) and len(consumed[4]['data/sample_s']) == 5
+        assert consumed[4] is None and torch.equal(consumed[5], expected[5])  # no goal views; task ids
+        assert set(consumed[6]) == set(expected[6]) and len(consumed[6]['data/sample_s']) == 5
     dataset.close()
 
 
@@ -878,13 +879,14 @@ def test_device_batch_assembly_on_side_stream_matches_host(tiny_root, tmp_path):
         for expected in host:
             batch = upcoming
             upcoming = next(batches, None)  # prefetched while the previous batch is consumed
-            images, qpos, actions, is_pad, timings = consume_batch(batch, stream, channels_last=True)
+            images, qpos, actions, is_pad, goal, task_id, timings = consume_batch(batch, stream, channels_last=True)
             assert images.device.type == 'cuda' and images[:, 0].is_contiguous(memory_format=torch.channels_last)
+            assert goal is None and task_id.device.type == 'cuda'
             # true division by a 0-dim tensor: bit-identical to the CPU uint8 / 255 path
             torch.testing.assert_close(images.cpu(), prepare_images(expected[0]), atol=0, rtol=0)
             for tensor, other in zip((qpos, actions, is_pad), expected[1:4]):
                 torch.testing.assert_close(tensor.cpu(), other, atol=0, rtol=0)
-            assert timings['data/sample_s'].shape == expected[4]['data/sample_s'].shape and timings['data/sample_s'].min() > 0
+            assert timings['data/sample_s'].shape == expected[6]['data/sample_s'].shape and timings['data/sample_s'].min() > 0
         assert upcoming is None
     dataset.close()
 
@@ -1013,7 +1015,7 @@ def test_policy_selection_rejects_invalid_modes_and_preserves_act_default():
         make_policy(dict(small_model_config(), policy_class='CNNMLP'), 'cpu')
     checkpoint = checkpoint_stub()
     checkpoint['model_config'] = {'policy_class': 'CNNMLP', 'num_queries': 1}
-    predictor = lambda qpos, images: np.zeros((len(qpos), 23), dtype=np.float32)
+    predictor = lambda qpos, images, *_: np.zeros((len(qpos), 23), dtype=np.float32)
     server = B1KServer(checkpoint, predictor)
     assert server.metadata['policy'] == 'CNNMLP'
     assert server.metadata['execution_mode'] == 'single_action'
@@ -1038,7 +1040,7 @@ class CountingPredictor:
     def __init__(self):
         self.calls = []
 
-    def __call__(self, qpos, images):
+    def __call__(self, qpos, images, task_ids=None, goal=None):
         self.calls.append((qpos.clone(), images.clone()))
         base = qpos[:, 1].numpy()[:, None, None]
         return np.broadcast_to(base + np.arange(4, dtype=np.float32)[None, :, None], (len(qpos), 4, 23)).copy()
@@ -1090,10 +1092,10 @@ def test_preprocessing_session_replan_batch_tasks_and_transaction():
 
 
 def test_temporal_aggregation_upstream_weights_zeros_expiry_and_transactions():
-    zero_session = Session(lambda qpos, images: np.zeros((len(qpos), 4, 23)),
+    zero_session = Session(lambda qpos, images, *_: np.zeros((len(qpos), 4, 23)),
                            checkpoint_stub(), temporal_agg=True)
     assert not zero_session.act(observation()).any()
-    zero_session.predictor = lambda qpos, images: np.ones((len(qpos), 4, 23))
+    zero_session.predictor = lambda qpos, images, *_: np.ones((len(qpos), 4, 23))
     np.testing.assert_allclose(zero_session.act(observation()), np.exp(-.01) / (1 + np.exp(-.01)))
     session = Session(CountingPredictor(), checkpoint_stub(), temporal_agg=True)
     history = []
@@ -1101,7 +1103,7 @@ def test_temporal_aggregation_upstream_weights_zeros_expiry_and_transactions():
         value = 0 if step == 0 else step * 10
         predictions = np.broadcast_to(value + np.arange(4)[:, None], (4, 23)).copy()
         predictions[:, 0] = 0
-        session.predictor = lambda qpos, images, p=predictions: np.repeat(p[None], len(qpos), axis=0)
+        session.predictor = lambda qpos, images, *_, p=predictions: np.repeat(p[None], len(qpos), axis=0)
         history.append(predictions)
         candidates = np.stack([plan[step - i] for i, plan in enumerate(history) if step - i < 4])
         weights = np.exp(-.01 * np.arange(len(candidates)))
@@ -1111,7 +1113,7 @@ def test_temporal_aggregation_upstream_weights_zeros_expiry_and_transactions():
         np.testing.assert_allclose(actual, expected, rtol=1e-6)
         assert actual[0] == 0 and len(session.history) <= 3
     saved = [(p.copy(), v.copy()) for p, v in session.history]
-    session.predictor = lambda qpos, images: np.full((len(qpos), 4, 23), np.nan)
+    session.predictor = lambda qpos, images, *_: np.full((len(qpos), 4, 23), np.nan)
     with pytest.raises(ValueError, match='Invalid model output'):
         session.act(observation())
     for (p, v), (expected_p, expected_v) in zip(session.history, saved):

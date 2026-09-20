@@ -15,16 +15,22 @@ class ACTPolicy(nn.Module):
         self.kl_weight = args_override['kl_weight']
         print(f'KL Weight {self.kl_weight}')
 
-    def __call__(self, qpos, image, actions=None, is_pad=None, lang_emb=None):
+    def __call__(self, qpos, image, actions=None, is_pad=None, lang_emb=None, goal=None, goal_valid=None):
         env_state = None
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
         image = normalize(image)
+        goal_kwargs = {}
+        if goal is not None and goal.shape[1] > 0:
+            # Goal images (B, views, 3, H, W) in [0, 1]: the same ImageNet normalization as the camera images, applied
+            # before any channel stacking or goal encoding.
+            goal_kwargs = {'goal': normalize(goal), 'goal_valid': goal_valid}
         if actions is not None: # training time
             actions = actions[:, :self.model.num_queries]
             is_pad = is_pad[:, :self.model.num_queries]
 
-            a_hat, is_pad_hat, (mu, logvar) = self.model(qpos, image, env_state, actions, is_pad, lang_emb=lang_emb)
+            a_hat, is_pad_hat, (mu, logvar) = self.model(qpos, image, env_state, actions, is_pad, lang_emb=lang_emb,
+                                                         **goal_kwargs)
             total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
             loss_dict = dict()
             all_l1 = F.l1_loss(actions, a_hat, reduction='none')
@@ -34,7 +40,7 @@ class ACTPolicy(nn.Module):
             loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight
             return loss_dict
         else: # inference time
-            a_hat, _, (_, _) = self.model(qpos, image, env_state, lang_emb=lang_emb) # no action, sample from prior
+            a_hat, _, (_, _) = self.model(qpos, image, env_state, lang_emb=lang_emb, **goal_kwargs) # no action, sample from prior
             return a_hat
 
     def configure_optimizers(self):

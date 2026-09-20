@@ -595,8 +595,8 @@ def _compare(args, output, root, device, resources):
             del transferred
             for arm, record in records.items():
                 record.update({'timing/data_wait_s': ready - previous, 'elapsed_s': time.monotonic() - begin})
-                if len(batch) > 4:
-                    record.update({key: float(value.mean()) for key, value in batch[4].items()})
+                if isinstance(batch[-1], dict):  # per-sample loader timings follow the tensor columns
+                    record.update({key: float(value.mean()) for key, value in batch[-1].items()})
                 history[arm].append(record)
             write_records(metrics, records)
             eval_records = {}
