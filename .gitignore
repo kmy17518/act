@@ -138,4 +138,7 @@ celerybeat.pid
 dmypy.json
 
 # Pyre type checker
-.pyre/.venv
+.pyre/
+
+# Project-local environment, also as a symlink (variant worktrees share the goal worktree's .venv)
+.venv
