@@ -1,5 +1,31 @@
 # ACT radio training run — 2026-09-16
 
+## Goal-image conditioning smoke matrix on the nav + pickup mixture — 2026-09-20
+
+Branch `goal` (worktree `/tmp/dev/baselines/act-goal`; base `my@6cf7718` + `lang_optimized_mt_act@1d5140d`; b1k.md "Goal-image conditioning") and its variant branches `goal-image-early`, `goal-image-late`, `goal-image-language-early`, `goal-image-language-late` (worktrees `/tmp/dev/baselines/act-goal-<variant>`, each pinning one condition in `scripts/b1k/run_variant_smoke.sh`, `.venv` shared with `act-goal`). Dataset: `/tmp/dev/datasets/2026-challenge-demos-radio-navpickup-goal` — the merge of the two skill-segment goal datasets (`scripts/b1k/merge_lerobot_roots.py --shared-video-root /tmp/dev/datasets/2026-challenge-demos --shared-video-prefix observation.rgb. --shared-video-prefix observation.depth_linear. --verify`): 400 episodes, 257,818 frames, tasks `turning_on_radio-navigate_to_radio` (0) and `turning_on_radio-pick_up_radio` (1); camera videos hard-linked from the challenge demos, so the existing 240 px frame cache validated without a rebuild (max |Δ| 0.5/255 vs native decoding, as documented). Language = the task name; goal image = the last frame of the episode's head camera (`--goal-source episode_last`).
+
+Recipe `scripts/b1k/run_navpickup_conditioning_smoke.sh`: **5,000 steps**, batch **1,560**, the radio architecture/optimizer (hidden 512, ff 3200, 4/7 layers, chunk 100, KL 10, LR 1e-5, AdamW wd 1e-4, 240 px, seed 0), frame cache, TF32, `--compile regions-autotune`, checkpoints at 1 / 2,500 / 5,000, eval export at 5,000, W&B project `b1k-challenge-2026-act` (ids `actnp-<condition>-20260920`). One GPU and 30 cores per run; launched at 01:00 PDT in the requested order — vanilla and language first (GPUs 0 and 2), then image-only, then image + language (each queued behind the previous run on the same GPU). Logs/exit files: `/tmp/dev/logs/navpickup-act-<condition>-bs1560-5k-20260920.{log,exit}`; run directories `outputs/navpickup-act-<condition>-bs1560-5k-20260920/` inside the checkout that trained them (`trainer_commit.txt` records the commit).
+
+| Condition | Checkout / commit | Conditioning | Result |
+| --- | --- | --- | --- |
+| vanilla | `/tmp/dev/baselines/act` (`my@6cf7718`) | one-hot task id appended to the state (the `my` adapter always does; on two tasks this is the **task-ID-conditioned** baseline, not the plan's strict N) | see table below |
+| language | `/tmp/dev/baselines/mt-act` (`lang_optimized_mt_act@1d5140d`) | `--language-conditioning mt_act --language-encoder minilm --prompt-source task_name` on the base backbone (ImageNet init, frozen BatchNorm, 240 px), so only the language path differs from vanilla; MT-ACT keeps the one-hot out of the network | see table below |
+| image-early / image-late | `goal-image-early` / `goal-image-late` | `--regime image`: no task id in the state, no language; head goal, BridgeData-style paired stem / goal tokens | see table below |
+| image_language-early / -late | `goal-image-language-early` / `-late` | `--regime image_language`: mt_act (task name) + the same goal path; goal pass with FiLM at the identity | see table below |
+
+Training-loss table (`scripts/b1k/summarize_runs.py`; means over the last 100 steps of the identical seed-0 batch sequence; no held-out or simulator evaluation is implied — these are 5,000-step smoke runs, 1.7 % of the radio schedule):
+
+| Run | commit | steps | L1 (4,901–5,000) | KL | loss | L1 (1–100) | s/step | peak GiB | hours |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| vanilla (`my`, one-hot task id) | `6cf7718` | 5000 | 0.0936 | 0.0055 | 0.1486 | 0.4665 | 0.446 | 150 | 0.64 |
+| language (mt_act, task name) | `1d5140d` | 5000 | 0.0940 | 0.0055 | 0.1489 | 0.4677 | 0.455 | 157 | 0.65 |
+| image-early (regime image) | `be4ad07` | running | | | | | 0.465 | 154 | |
+| image-late (regime image) | `cdd5ebb` | running | | | | | 0.607 | 194 | |
+| image_language-early | `275d056` | queued | | | | | | | |
+| image_language-late | `706fc2a` | queued | | | | | | | |
+
+On this two-task mixture the one-hot (vanilla) and the MT-ACT language path (language) identify the task equally well — their step-5,000 training L1 differ by 0.4 %. The early-fusion stem costs 4 % per step (one 6-channel convolution); late fusion costs 36 % (a fourth backbone pass plus 33 % more encoder memory tokens) and 44 GiB more activation memory at batch 1,560.
+
 ## MT-ACT reproduction at 96 px — 2026-09-18
 
 Branch `lang_optimized_mt_act` (formerly `mt-act`; worktree `/tmp/dev/baselines/mt-act`, own `.venv`, branched from `lang_optimized`) adds `--language-conditioning mt_act` (see b1k.md "Optional MT-ACT reproduction"). One run, launched from this commit with `scripts/b1k/run_radio_mt_act_300k.sh`, on the same batch (**1,560**), optimizer, transformer, sampler seed 0, 300,000-step schedule and checkpoint cadence as the `opt20260917` runs, to be **stopped at 5,000 steps** like them:
