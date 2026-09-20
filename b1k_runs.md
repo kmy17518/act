@@ -13,18 +13,23 @@ Recipe `scripts/b1k/run_navpickup_conditioning_smoke.sh`: **5,000 steps**, batch
 | image-early / image-late | `goal-image-early` / `goal-image-late` | `--regime image`: no task id in the state, no language; head goal, BridgeData-style paired stem / goal tokens | see table below |
 | image_language-early / -late | `goal-image-language-early` / `-late` | `--regime image_language`: mt_act (task name) + the same goal path; goal pass with FiLM at the identity | see table below |
 
-Training-loss table (`scripts/b1k/summarize_runs.py`; means over the last 100 steps of the identical seed-0 batch sequence; no held-out or simulator evaluation is implied — these are 5,000-step smoke runs, 1.7 % of the radio schedule):
+Training-loss table (`scripts/b1k/summarize_runs.py`; means over the last 100 steps of the identical seed-0 batch sequence; the `none` row is the plan's strict N control, added after the requested eight runs on a freed GPU). All seven runs completed 5,000 steps with exit status 0. These are 5,000-step smoke runs (1.7 % of the radio schedule) with training losses only — no held-out or simulator evaluation is implied:
 
-| Run | commit | steps | L1 (4,901–5,000) | KL | loss | L1 (1–100) | s/step | peak GiB | hours |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| vanilla (`my`, one-hot task id) | `6cf7718` | 5000 | 0.0936 | 0.0055 | 0.1486 | 0.4665 | 0.446 | 150 | 0.64 |
-| language (mt_act, task name) | `1d5140d` | 5000 | 0.0940 | 0.0055 | 0.1489 | 0.4677 | 0.455 | 157 | 0.65 |
-| image-early (regime image) | `be4ad07` | running | | | | | 0.465 | 154 | |
-| image-late (regime image) | `cdd5ebb` | running | | | | | 0.607 | 194 | |
-| image_language-early | `275d056` | queued | | | | | | | |
-| image_language-late | `706fc2a` | queued | | | | | | | |
+| Run | commit | regime | steps | L1 (4,901–5,000) | KL | loss | L1 (1–100) | s/step | peak GiB | hours | parameters |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| vanilla (`my`, one-hot task id) | `6cf7718` | — | 5000 | 0.0936 | 0.0055 | 0.1486 | 0.4665 | 0.446 | 150 | 0.64 | 83.95 M |
+| none (strict N: no task id, language or goal) | `79ec64e` | none | 5000 | 0.0972 | 0.0053 | 0.1504 | 0.4663 | 0.448 | 150 | 0.63 | 83.94 M |
+| language (mt_act, task name) | `1d5140d` | — | 5000 | 0.0940 | 0.0055 | 0.1489 | 0.4677 | 0.455 | 157 | 0.65 | 85.97 M |
+| image-early (regime image) | `be4ad07` | image | 5000 | 0.0967 | 0.0053 | 0.1500 | 0.4661 | 0.465 | 154 | 0.66 | 83.95 M |
+| image-late (regime image) | `cdd5ebb` | image | 5000 | 0.1000 | 0.0053 | 0.1533 | 0.4649 | 0.601 | 197 | 0.87 | 83.94 M |
+| image_language-early | `275d056` | image_language | 5000 | 0.0939 | 0.0055 | 0.1488 | 0.4676 | 0.470 | 162 | 0.67 | 85.98 M |
+| image_language-late | `706fc2a` | image_language | 5000 | 0.0995 | 0.0055 | 0.1543 | 0.4660 | 0.599 | 204 | 0.87 | 85.97 M |
 
-On this two-task mixture the one-hot (vanilla) and the MT-ACT language path (language) identify the task equally well — their step-5,000 training L1 differ by 0.4 %. The early-fusion stem costs 4 % per step (one 6-channel convolution); late fusion costs 36 % (a fourth backbone pass plus 33 % more encoder memory tokens) and 44 GiB more activation memory at batch 1,560.
+Observations (training loss at 1.7 % of the schedule; single seed):
+
+- Every condition trains stably at the base batch. The paired stem costs 4 % per step (one 6-channel convolution, +9.4 k parameters); late fusion costs 35 % (a fourth backbone pass and 33 % more encoder memory tokens) and 47–50 GiB more activation memory at batch 1,560; the MT-ACT language path adds 2.0 M parameters (text projection, FiLM generators, task token) and 2 % per step.
+- The task-identifying conditions (vanilla one-hot, language, image_language-early) reach the same L1 (0.0936–0.0940); the strict N control without any task signal is 3.8 % worse (0.0972), i.e. on this two-task mixture the observation already identifies the task for most frames. image-early sits at the N level (0.0967): its zero-initialized goal stem has barely started to use the goal at 5,000 steps (below). The late-fusion runs are 6–7 % above their early counterparts in training L1 at this point despite using the goal strongly — the appended goal tokens change the optimization early on; whether this persists is a 300k-step question, not a smoke-run one.
+- `scripts/b1k/goal_sensitivity_probe.py` (offline, 8 training frames, own goal vs. the other task's goal vs. goal masked out, language held constant; normalized action units): image-early 0.067 / 0.069 / —, image_language-early 0.061 / 0.061 / —, **image-late 0.075 / 0.322 / 0.153**, **image_language-late 0.069 / 0.366 / 0.174**. The late-fusion policies read the goal after 5,000 steps (predictions move by up to 3 normalized units when the goal is swapped and degrade when it is masked); the zero-initialized early stems have not yet (max prediction change ≤ 0.3), exactly the "do not require immediate goal sensitivity from a deliberately zero-initialized goal stem" caveat of the plan. This is a diagnostic of goal use, not goal-following evidence (no rollouts, training frames, zero inference latent).
 
 ## MT-ACT reproduction at 96 px — 2026-09-18
 
