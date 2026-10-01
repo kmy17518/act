@@ -759,6 +759,58 @@ def test_fast_maxpool_swaps_stem_pooling_and_falls_back_on_cpu():
         torch.testing.assert_close(policy(qpos, images), reference(qpos, images), atol=0, rtol=0)
 
 
+def test_fast_stem_is_the_same_convolution():
+    from detr.models.backbone import PairedConv2d, SpaceToDepthStem, replaces_stem
+    torch.manual_seed(2)
+    # The rewrite is the same sums in another order: exact to fp64 rounding, even and odd sizes alike.
+    for shape in [(2, 3, 240, 240), (1, 3, 97, 95), (2, 3, 224, 224), (1, 3, 96, 96), (1, 3, 31, 33)]:
+        conv = torch.nn.Conv2d(3, 8, 7, 2, 3, bias=False).double()
+        stem = SpaceToDepthStem(conv)
+        x = torch.randn(*shape, dtype=torch.float64)
+        expected = conv(x)
+        actual = stem(x)
+        assert actual.shape == expected.shape
+        torch.testing.assert_close(actual, expected, atol=1e-12, rtol=1e-12)
+        expected.square().sum().backward()
+        reference_grad = conv.weight.grad.clone()
+        conv.weight.grad = None
+        actual.square().sum().backward()
+        torch.testing.assert_close(conv.weight.grad, reference_grad, atol=1e-10, rtol=1e-10)
+    assert replaces_stem(torch.nn.Conv2d(3, 64, 7, 2, 3, bias=False))
+    assert not replaces_stem(torch.nn.Conv2d(3, 64, 7, 2, 3)) and not replaces_stem(torch.nn.Conv2d(3, 64, 3, 1, 1, bias=False))
+    assert not replaces_stem(PairedConv2d(torch.nn.Conv2d(3, 64, 7, 2, 3, bias=False))) and not replaces_stem(None)
+    # As a runtime replacement of the ResNet stem: same parameters, same state dict, same predictions and gradients.
+    torch.manual_seed(1)
+    reference = make_policy(small_model_config(), 'cpu')
+    torch.manual_seed(1)
+    policy = make_policy(small_model_config(), 'cpu', fast_stem=True)
+    body, reference_body = policy.model.backbones[0][0].body, reference.model.backbones[0][0].body
+    assert isinstance(body.conv1, SpaceToDepthStem) and isinstance(reference_body.conv1, torch.nn.Conv2d)
+    assert body.conv1.weight is dict(policy.named_parameters())['model.backbones.0.0.body.conv1.weight']
+    assert list(body.keys()) == list(reference_body.keys()) and list(policy.state_dict()) == list(reference.state_dict())
+    qpos, images = torch.rand(2, 27), torch.rand(2, 3, 3, 32, 32)
+    actions = torch.randn(2, 4, 23)
+    pad = torch.tensor([[False, False, True, True], [False, False, False, False]])
+    for model in (reference, policy):
+        model.eval()
+        torch.manual_seed(5)
+        model(qpos, images, actions, pad)['loss'].backward()
+    with torch.no_grad():
+        torch.testing.assert_close(policy(qpos, images), reference(qpos, images), atol=1e-5, rtol=1e-5)
+    for (name, expected), (_, actual) in zip(reference.named_parameters(), policy.named_parameters()):
+        if expected.grad is not None:
+            torch.testing.assert_close(actual.grad, expected.grad, atol=1e-5, rtol=1e-4, msg=name)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA device required')
+def test_make_policy_disables_the_cudnn_sdpa_backend():
+    # Its backward is wrong for a key padding mask with dropout on Blackwell (see make_policy).
+    torch.backends.cuda.enable_cudnn_sdp(True)
+    make_policy(small_model_config(), 'cuda')
+    assert not torch.backends.cuda.cudnn_sdp_enabled()
+    assert torch.backends.cuda.flash_sdp_enabled() and torch.backends.cuda.mem_efficient_sdp_enabled()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA device required')
 def test_fast_maxpool_kernels_match_aten_bitwise():
     from detr.models.maxpool_nhwc import MaxPool3x3NHWC, max_pool3x3_nhwc

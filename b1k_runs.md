@@ -1,5 +1,28 @@
 # ACT radio training run — 2026-09-16
 
+## Goal-image-late step time at batch 1,024 — 2026-09-29
+
+Recipe of the image-late condition (`run_navpickup_conditioning_smoke.sh`: 240 px, TF32, `--compile regions-autotune`) on `/tmp/dev/datasets/2026-challenge-demos-radio-pickup-goal` (its own 240 px frame cache), GPU 2, 100-step probes, mean wall clock per optimizer step over steps 21–99 (`/tmp/dev/scripts/act-image-late-bench.py`):
+
+| Configuration | s/step | samples/s | peak GiB | change |
+| --- | --- | --- | --- | --- |
+| before (TF32, explicit attention, cuDNN 7x7 stem) | 0.3946 | 2,595 | 127.6 | — |
+| `--fast-stem` (default on): space-to-depth stem, exact | 0.3822 | 2,679 | 127.6 | −3 % |
+| + `--autocast bf16-backbone` (**recommended recipe**) | **0.3119** | **3,283** | 114.7 | **−21 %, 1.27x** |
+| (rejected) + bf16 flash attention | 0.2624 | 3,903 | 87.5 | 1.50x, degrades the policy (below) |
+
+Where the 395 ms went (torch.profiler over 5 steady-state steps; GPU 97 % busy, so CPU launch overhead is not a factor): ResNet18 backbone 173 ms (45 %; 132 ms cuDNN convolutions at 35 % of the TF32 peak, of which the 3-channel 7x7 stem alone 35 ms at ~5 % of peak plus its 15 GB fp32 output feeding maxpool and BN/ReLU passes), transformer 152 ms (39 %; explicit attention writes 8x258x258 fp32 score matrices per sample and re-reads them for softmax, dropout and backward: ~60 ms), CVAE encoder 40 ms, elementwise passes (LayerNorm, dropout, BN/ReLU, maxpool) ~110 ms in total at 2–5 TB/s, optimizer and loader < 3 %. Roofline at 2,250 TFLOP/s (bf16) and 8 TB/s: 96 TFLOPs and ~1.2 TB of traffic per step, i.e. memory-bound (80 FLOP/byte vs the 281 FLOP/byte balance); floors 43 ms (compute) and ~150 ms (memory).
+
+Correctness evidence for the recommended recipe (fast stem + bf16-backbone), all against the unchanged TF32 recipe:
+
+- Fixed batch of 64 real samples, initial weights, strict fp32: the stem rewrite leaves every loss component bit-identical and gradients within 7.8e-7 overall (the cuDNN algorithm noise floor; worst tensor 6.7e-4). bf16-backbone alone: L1 4e-4, gradients 7e-4 overall — the TF32 recipe itself sits at L1 4e-5 / gradients 1.1e-3 from strict fp32.
+- 300 steps resumed from the navpickup step-5,000 checkpoint at batch 1,024, identical batches: training L1 +0.05 %, KL +0.00 %, loss +0.04 %, gradient norm +0.95 %. The resulting weights, evaluated on 4,096 fixed samples with strict fp32 zero-latent inference (the serving path): baseline 0.10730 (eager-kernel baseline with another dropout stream 0.10730, start 0.10902), recipe 0.10701.
+- 1,000 steps from initialization at batch 1,024: loss components within 0.02 % over steps 501–1,000; step-1,000 weights evaluate to 0.14253 (baseline) vs 0.14280 (recipe), while the eager-kernel baseline (another dropout stream) evaluates to 0.14196 — the recipe sits inside the dropout-seed noise.
+
+Rejected: fused low-precision attention (q/k/v cast to bf16 or fp16 for `scaled_dot_product_attention`, flash / memory-efficient kernels, projections fp32; 2.1x faster attention, −49 ms per step). After the same 300 resumed steps the zero-latent inference L1 is 0.1136 (bf16) / 0.1141 (fp16) compiled and 0.1087 with eager kernels vs 0.1073 for the baseline — +6 % / +1.3 % — although its training L1 only moved +0.23 %; the CVAE style encoder moved 1.3–3x further from the checkpoint than in the baseline. Operator-level checks (200-draw expected gradients with and without the padding mask, eager and compiled) found no kernel bug except one: PyTorch's cuDNN SDPA backend, which the default dispatch selects for the masked bf16 attention with dropout, returns q/k gradients 13 % off in expectation; `make_policy` now disables it for every mode. The remaining degradation is not explained and the option was not merged. Full `--autocast bf16` (which routes attention through the same fused path) was already measured as not neutral on 2026-09-17; the cuDNN backend is a candidate cause worth re-measuring.
+
+*2026-10-01:* the host was re-provisioned before this work was committed; it was re-applied from the notes above (CPU suite 138 passed / 6 skipped), the pickup frame cache rebuilt (192 sampled frames verified identical to native decoding) and the step time re-measured on the new host's GPU 2: `--no-fast-stem` 0.4003 s/step, default (fast stem) 0.3840, with `--autocast bf16-backbone` **0.3258 s/step** (3,143 samples/s, 1.23x).
+
 ## Goal-image conditioning smoke matrix on the nav + pickup mixture — 2026-09-20
 
 Branch `goal` (worktree `/tmp/dev/baselines/act-goal`; base `my@6cf7718` + `lang_optimized_mt_act@1d5140d`; b1k.md "Goal-image conditioning") and its variant branches `goal-image-early`, `goal-image-late`, `goal-image-language-early`, `goal-image-language-late` (worktrees `/tmp/dev/baselines/act-goal-<variant>`, each pinning one condition in `scripts/b1k/run_variant_smoke.sh`, `.venv` shared with `act-goal`). Dataset: `/tmp/dev/datasets/2026-challenge-demos-radio-navpickup-goal` — the merge of the two skill-segment goal datasets (`scripts/b1k/merge_lerobot_roots.py --shared-video-root /tmp/dev/datasets/2026-challenge-demos --shared-video-prefix observation.rgb. --shared-video-prefix observation.depth_linear. --verify`): 400 episodes, 257,818 frames, tasks `turning_on_radio-navigate_to_radio` (0) and `turning_on_radio-pick_up_radio` (1); camera videos hard-linked from the challenge demos, so the existing 240 px frame cache validated without a rebuild (max |Δ| 0.5/255 vs native decoding, as documented). Language = the task name; goal image = the last frame of the episode's head camera (`--goal-source episode_last`).

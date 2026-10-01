@@ -102,6 +102,54 @@ def pair_stem(body):
     return body.conv1
 
 
+def replaces_stem(module):
+    """Whether `module` is the plain ResNet stem SpaceToDepthStem computes: 7x7, stride 2, padding 3, no bias."""
+    return (isinstance(module, nn.Conv2d) and not isinstance(module, PairedConv2d) and module.kernel_size == (7, 7)
+            and module.stride == (2, 2) and module.padding == (3, 3) and module.dilation == (1, 1)
+            and module.groups == 1 and module.bias is None and module.padding_mode == 'zeros')
+
+
+class SpaceToDepthStem(nn.Module):
+    """The ResNet stem convolution (7x7, stride 2, padding 3, no bias) as a 4x4 stride-1 convolution over a 2x2
+    space-to-depth rearrangement of the image.
+
+    Every output is the same sum of the same products: the image is shifted by one pixel and zero-padded so that its
+    2x2 phases line up with the stride-2 taps, the 7x7 kernel is zero-padded to 8x8 and its 2x2 phase blocks become
+    the input channels of a 4x4 kernel (3 channels x 4 phases = 12, zero-padded to 16 for aligned loads). The result
+    differs from `F.conv2d` only by floating-point summation order. cuDNN has no efficient kernel for a 3-channel 7x7
+    stride-2 convolution (at batch 1024 x 240 px it ran at about 5 % of the TF32 peak, slower still in bf16); the
+    rewritten stem runs 1.5x (TF32) to 2.7x (bf16) faster including the rearrangement. A runtime replacement of
+    `conv1` (`--fast-stem`): the parameter stays `conv1.weight` with its (out, 3, 7, 7) shape, so state dicts,
+    checkpoints and the ImageNet initialization are untouched.
+    """
+    def __init__(self, conv):
+        super().__init__()
+        if not replaces_stem(conv):
+            raise ValueError('SpaceToDepthStem replaces a bias-free 7x7 / stride 2 / padding 3 convolution')
+        self.weight = conv.weight  # the same Parameter, registered under the same name
+        self.in_channels, self.out_channels = conv.in_channels, conv.out_channels
+        self.kernel_size, self.stride, self.padding = conv.kernel_size, conv.stride, conv.padding
+        self.dilation, self.groups, self.bias = conv.dilation, conv.groups, None
+        self.channels = -(-4 * conv.in_channels // 16) * 16
+
+    def forward(self, x):
+        if x.dim() != 4 or x.shape[1] != self.in_channels:
+            raise ValueError(f'SpaceToDepthStem expects (N, {self.in_channels}, H, W) images, got {tuple(x.shape)}')
+        height, width = x.shape[-2:]
+        out_h, out_w = (height - 1) // 2 + 1, (width - 1) // 2 + 1  # F.conv2d(x, w, stride=2, padding=3)
+        x = F.pad(x, (1, (width + 1) % 2, 1, (height + 1) % 2))  # shift by one pixel, make the size even
+        n, c, h, w = x.shape
+        x = x.view(n, c, h // 2, 2, w // 2, 2).permute(0, 1, 3, 5, 2, 4).reshape(n, 4 * c, h // 2, w // 2)
+        x = F.pad(x, (1, out_w + 2 - w // 2, 1, out_h + 2 - h // 2, 0, self.channels - 4 * c))
+        x = x.contiguous(memory_format=torch.channels_last)
+        weight = F.pad(self.weight, (0, 1, 0, 1)).view(self.out_channels, c, 4, 2, 4, 2).permute(0, 1, 3, 5, 2, 4)
+        weight = F.pad(weight.reshape(self.out_channels, 4 * c, 4, 4), (0, 0, 0, 0, 0, self.channels - 4 * c))
+        return F.conv2d(x, weight.contiguous(memory_format=torch.channels_last))
+
+    def extra_repr(self):
+        return f'{self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}, stride={self.stride}, padding={self.padding}'
+
+
 class PerCameraBatchNorm2d(nn.Module):
     """BatchNorm2d with one set of running statistics per camera (domain-specific BatchNorm).
 

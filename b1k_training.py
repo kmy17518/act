@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 from b1k_dataset import (B1KDataset, CAMERAS, GOAL_OBS_KEYS, GOAL_SOURCES, GOAL_VIDEO_KEYS, OBS_KEYS, STATE_INDICES,
                          VIDEO_KEYS, SplitBatchSampler, StepBatchSampler, goal_views_to_indices)
 from b1k_frame_cache import dequantize_images
+from detr.models.backbone import SpaceToDepthStem, replaces_stem
 from detr.models.detr_vae import GOAL_ENCODERS, GOAL_FUSIONS
 from detr.models.maxpool_nhwc import MaxPool3x3NHWC, replaces
 from detr.models.transformer import use_fused_attention
@@ -94,16 +95,19 @@ def policy_class(model_config):
 
 
 def make_policy(model_config, device, restoring=False, fused_optimizer=False, skip_unused_decoder_layers=True,
-                attention='auto', backbone_autocast_dtype=None, fast_maxpool=False, film_recompute=True):
+                attention='auto', backbone_autocast_dtype=None, fast_maxpool=False, film_recompute=True,
+                fast_stem=False):
     """Build the upstream policy.
 
-    `fused_optimizer`, `skip_unused_decoder_layers`, `attention`, `backbone_autocast_dtype`, `fast_maxpool`
-    and `film_recompute` are runtime execution choices, not saved model configuration. ACT consumes only the
-    first stacked decoder output, so with the skip enabled the remaining decoder layers are not executed;
+    `fused_optimizer`, `skip_unused_decoder_layers`, `attention`, `backbone_autocast_dtype`, `fast_maxpool`,
+    `film_recompute` and `fast_stem` are runtime execution choices, not saved model configuration. ACT consumes
+    only the first stacked decoder output, so with the skip enabled the remaining decoder layers are not executed;
     predictions and every gradient are unchanged (see `unused_gradients` for the optimizer side).
     `attention` selects the nn.MultiheadAttention path (`detr.models.transformer.use_fused_attention`).
     `backbone_autocast_dtype` runs only the convolutional bodies under autocast and returns fp32 features.
     `fast_maxpool` swaps the stateless ResNet stem pooling for the bit-identical channels-last kernels.
+    `fast_stem` computes the plain 7x7 stem convolution as the exactly equivalent space-to-depth 4x4 convolution
+    (`detr.models.backbone.SpaceToDepthStem`; same parameter, summation order aside).
     `film_recompute` recomputes the CLIP FiLM-conditioned residual blocks in backward (memory for time);
     the FiLM initialization itself (`model_config['film_init']`) is saved model configuration.
     """
@@ -121,10 +125,19 @@ def make_policy(model_config, device, restoring=False, fused_optimizer=False, sk
     for module in policy.modules():
         if hasattr(module, 'attention'):
             module.attention = attention
-    for backbone in policy.model.backbones:
+    if torch.cuda.is_available():
+        # torch 2.10 on Blackwell dispatches a bf16/fp16 attention with a key padding mask and dropout (the CVAE
+        # encoder under autocast, fused path) to the cuDNN SDPA backend, whose backward returns q/k gradients about
+        # 13 % off in expectation (flash, memory-efficient and math agree with the explicit path). Never use it;
+        # the explicit path is unaffected, fused paths keep flash / memory-efficient.
+        torch.backends.cuda.enable_cudnn_sdp(False)
+    goal_backbone = getattr(policy.model, 'goal_backbone', None)  # late fusion's separate copy, when configured
+    for backbone in list(policy.model.backbones) + ([goal_backbone] if goal_backbone is not None else []):
         backbone.body_autocast_dtype = backbone_autocast_dtype
         if fast_maxpool and replaces(getattr(backbone[0].body, 'maxpool', None)):
             backbone[0].body.maxpool = MaxPool3x3NHWC()
+        if fast_stem and replaces_stem(getattr(backbone[0].body, 'conv1', None)):
+            backbone[0].body.conv1 = SpaceToDepthStem(backbone[0].body.conv1)
         if hasattr(backbone[0].body, 'recompute'):
             backbone[0].body.recompute = film_recompute
     return policy
@@ -676,6 +689,9 @@ def parser():
                    help='Let cuDNN autotune convolution algorithms for the fixed batch shape')
     p.add_argument('--fast-maxpool', action=argparse.BooleanOptionalAction, default=True,
                    help='Bit-identical channels-last Triton kernels for the ResNet stem max pooling on CUDA')
+    p.add_argument('--fast-stem', action=argparse.BooleanOptionalAction, default=True,
+                   help='Compute the 7x7 ResNet stem convolution as the exactly equivalent 4x4 convolution over a 2x2 '
+                        'space-to-depth rearrangement of the image on CUDA (same sums, cuDNN kernels 1.5-2.7x faster)')
     p.add_argument('--compile', choices=['none', 'backbone', 'regions', 'regions-autotune', 'default',
                                          'max-autotune-no-cudagraphs'], default='none',
                    help='torch.compile on CUDA: "backbone" compiles the ResNet bodies only (fuses frozen-BN/ReLU/'
@@ -860,7 +876,8 @@ def _train(args, output, root, resources):
                          fused_optimizer=args.fused_optimizer and cuda,
                          skip_unused_decoder_layers=not args.compute_unused_decoder_layers, attention=args.attention,
                          backbone_autocast_dtype=torch.bfloat16 if args.autocast == 'bf16-backbone' and cuda else None,
-                         fast_maxpool=args.fast_maxpool and cuda, film_recompute=args.film_recompute)
+                         fast_maxpool=args.fast_maxpool and cuda, film_recompute=args.film_recompute,
+                         fast_stem=args.fast_stem and cuda)
     if args.channels_last:
         policy.to(memory_format=torch.channels_last)  # only 4-D (convolution) weights change layout
     optimizer = policy.configure_optimizers()
@@ -904,13 +921,14 @@ def _train(args, output, root, resources):
                 else nullcontext)
     copy_stream = torch.cuda.Stream(device) if cuda else None
     LOGGER.info('Training %d -> %d steps on %s with real upstream %s (matmul %s, autocast %s, attention %s, '
-                'channels_last %s, fused optimizer %s, fast maxpool %s, compile %s, frame cache %s, '
+                'channels_last %s, fused optimizer %s, fast maxpool %s, fast stem %s, compile %s, frame cache %s, '
                 'skipped unused decoder parameters %d, language %s/%s/%s, film init %s, film recompute %s, '
                 'backbone norm %s, pretrained backbone %s, camera batch %s, regime %s, task onehot %s, goal %s %s '
                 'source %s encoder %s role %s language_on_goal %s, %d parameters)',
                 start, args.max_steps, device, policy_class(model_config), args.matmul_precision, args.autocast,
                 args.attention, args.channels_last, args.fused_optimizer and cuda, args.fast_maxpool and cuda,
-                args.compile, bool(args.frame_cache), sum(parameter.numel() for parameter, _ in zero_gradients),
+                args.fast_stem and cuda, args.compile, bool(args.frame_cache),
+                sum(parameter.numel() for parameter, _ in zero_gradients),
                 language_mode(model_config), language_encoder(model_config) if language_embeddings is not None else None,
                 model_config.get('prompt_source', 'task_name'), model_config.get('film_init'),
                 args.film_recompute and language_mode(model_config) == 'clip_film',
