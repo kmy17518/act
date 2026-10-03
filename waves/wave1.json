@@ -1,0 +1,202 @@
+{
+  "format": "isg-wave/v1",
+  "wave": 1,
+  "plan": "/tmp/dev/docs/isg-goal-conditioning-plan.md (sections 6.0 and 6.1)",
+  "description": "Goal-LR calibration as the first 10k steps of 50k-step wave-1 runs (constant LR, per-step seeded sampler: a 10k run is an exact prefix of a 50k run), then the wave-1 fusion-family slots of this machine. Machine 2 and the lab are not available on 2026-10-03.",
+  "dataset": "/tmp/dev/datasets/isg-init",
+  "frame_cache": "/tmp/dev/datasets/isg-init-act-frame-cache-224x224",
+  "train_split": "/tmp/dev/datasets/isg-init/isg_meta/train_split.json",
+  "tasks": [
+    "camera_relocalization-standard",
+    "configuration_matching-articulation_open_large_scale-dishwasher",
+    "configuration_matching-articulation_open_small_scale-blender_eyedvd-breakfast_table",
+    "alignment-axial-board_game-breakfast_table"
+  ],
+  "hf_owner": "kmy17518",
+  "hf_repo_prefix": "act-isg-",
+  "wandb": {
+    "entity": "kmy17518",
+    "project": "b1k-isg-goal"
+  },
+  "runs_root": "/tmp/dev/runs/isg",
+  "staging_root": "/tmp/dev/hf-staging/isg",
+  "logs_root": "/tmp/dev/logs/isg",
+  "tmux_server": "isg",
+  "common": {
+    "max_steps": 50000,
+    "eval_every": 10000,
+    "flags": [
+      "--settle-steps",
+      "0",
+      "--gripper-state",
+      "sum",
+      "--image-size",
+      "224",
+      "224",
+      "--regime",
+      "image",
+      "--goal-views",
+      "zed_link",
+      "--goal-source",
+      "episode_last",
+      "--policy-class",
+      "ACT",
+      "--hidden-dim",
+      "512",
+      "--dim-feedforward",
+      "3200",
+      "--enc-layers",
+      "4",
+      "--dec-layers",
+      "7",
+      "--nheads",
+      "8",
+      "--chunk-size",
+      "100",
+      "--position-embedding",
+      "sine",
+      "--no-pre-norm",
+      "--kl-weight",
+      "10",
+      "--dropout",
+      "0.1",
+      "--lr",
+      "1e-5",
+      "--lr-backbone",
+      "1e-5",
+      "--weight-decay",
+      "1e-4",
+      "--batch-size",
+      "1560",
+      "--loader-batch-size",
+      "128",
+      "--num-workers",
+      "8",
+      "--prefetch-factor",
+      "2",
+      "--torch-threads",
+      "2",
+      "--worker-threads",
+      "1",
+      "--arrow-threads",
+      "1",
+      "--opencv-threads",
+      "1",
+      "--device",
+      "cuda",
+      "--matmul-precision",
+      "high",
+      "--autocast",
+      "bf16-backbone",
+      "--compile",
+      "regions-autotune",
+      "--save-every",
+      "5000",
+      "--save-first-step",
+      "--save-total-limit",
+      "0",
+      "--export-every",
+      "10000",
+      "--wandb-mode",
+      "online"
+    ]
+  },
+  "runs": [
+    {
+      "name": "w1-early-zero-lrg1e-4-s0",
+      "gpu": 0,
+      "cores": "0-23",
+      "seed": 0,
+      "role": "goal-LR calibration (early, 1e-4) and the bf16-backbone arm of the bf16 check; continues as wave-1 slot 5 if 1e-4 is chosen",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "zero",
+        "--lr-goal",
+        "1e-4"
+      ]
+    },
+    {
+      "name": "w1-late-tagzero-lrg1e-5-s0",
+      "gpu": 1,
+      "cores": "24-47",
+      "seed": 0,
+      "role": "goal-LR calibration (late, 1e-5); continues as wave-1 slot 1 (baseline) if 1e-5 is chosen",
+      "flags": [
+        "--goal-fusion",
+        "late",
+        "--goal-tag-init",
+        "zero",
+        "--lr-goal",
+        "1e-5"
+      ]
+    },
+    {
+      "name": "w1-late-tagzero-lrg1e-4-s0",
+      "gpu": 2,
+      "cores": "48-71",
+      "seed": 0,
+      "role": "goal-LR calibration (late, 1e-4); continues as wave-1 slot 1 (baseline) if 1e-4 is chosen",
+      "flags": [
+        "--goal-fusion",
+        "late",
+        "--goal-tag-init",
+        "zero",
+        "--lr-goal",
+        "1e-4"
+      ]
+    },
+    {
+      "name": "pf-bf16check-early-zero-lrg1e-4-tf32-s0",
+      "gpu": 3,
+      "cores": "72-95",
+      "seed": 0,
+      "max_steps": 1000,
+      "upload": false,
+      "role": "bf16 check, TF32 arm: w1-early-zero-lrg1e-4-s0 with --autocast none, 1k steps",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "zero",
+        "--lr-goal",
+        "1e-4",
+        "--autocast",
+        "none",
+        "--save-every",
+        "1000"
+      ]
+    },
+    {
+      "name": "w1-early-zero-lrg1e-3-s0",
+      "gpu": 3,
+      "cores": "72-95",
+      "seed": 0,
+      "after": "pf-bf16check-early-zero-lrg1e-4-tf32-s0",
+      "role": "goal-LR calibration (early, 1e-3); continues as wave-1 slot 5 if 1e-3 is chosen",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "zero",
+        "--lr-goal",
+        "1e-3"
+      ]
+    }
+  ],
+  "deferred": [
+    {
+      "name": "w1-early-zero-lrg1e-5-s0",
+      "role": "goal-LR calibration (early, 1e-5): fifth calibration slot, runs when a GPU frees up",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "zero",
+        "--lr-goal",
+        "1e-5"
+      ]
+    }
+  ]
+}
