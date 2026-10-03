@@ -1,10 +1,14 @@
 """Read-only, bounded-memory ACT samples from local LeRobot v3 Parquet/video."""
 
 from collections import OrderedDict
+from decimal import Decimal
+from fractions import Fraction
 import hashlib
 import json
 import logging
+import math
 from pathlib import Path
+import re
 import time
 
 import av
@@ -21,7 +25,157 @@ CAMERAS = ['zed_link', 'left_realsense_link', 'right_realsense_link']
 VIDEO_KEYS = [f'observation.rgb.{camera}_camera_0' for camera in CAMERAS]
 OBS_KEYS = [f'robot_r1::robot_r1:{camera}:Camera:0::rgb' for camera in CAMERAS]
 COLUMNS = ['index', 'episode_index', 'frame_index', 'timestamp', 'task_index', 'observation.state', 'action']
+EPISODE_SPLIT_FILE = 'isg_meta/train_split.json'
+EPISODE_SPLIT_FORMAT = 'isg-episode-split/v1'
+TASK_GROUPS_FILE = 'isg_meta/task_groups.json'
+TASK_GROUPS_FORMAT = 'isg-task-groups/v1'
+SETTLE_WINDOWS_FILE = 'isg_meta/settle_windows.json'
+SETTLE_WINDOWS_FORMAT = 'isg-settle-windows/v1'
 LOGGER = logging.getLogger(__name__)
+
+
+def resolve_episode_split(dataset_path, spec='auto', task_names=None):
+    """Training episodes of `--episode-split SPEC` as a JSON-serializable record, or None without a split.
+
+    `auto` reads <root>/isg_meta/train_split.json when that file exists (no split otherwise), `none` disables
+    the split, any other value is the path of a split file. The selected tasks are `task_names` or, when omitted,
+    every task of the file; the episodes are the sorted union of their `train` lists.
+    """
+    if spec == 'none':
+        return None
+    path = Path(dataset_path) / EPISODE_SPLIT_FILE if spec == 'auto' else Path(spec)
+    if not path.is_file():
+        if spec == 'auto':
+            return None
+        raise FileNotFoundError(f'Episode split file {path} not found')
+    path = path.resolve()
+    content = path.read_bytes()
+    split = json.loads(content)
+    if split.get('format') != EPISODE_SPLIT_FORMAT or not isinstance(split.get('tasks'), dict):
+        raise ValueError(f'{path} is not an {EPISODE_SPLIT_FORMAT} episode split (format {split.get("format")!r})')
+    tasks = list(dict.fromkeys(task_names or split['tasks']))
+    missing = [name for name in tasks if name not in split['tasks']]
+    if missing:
+        raise ValueError(f'Selected tasks {missing} have no entry in episode split {path}')
+    episodes = sorted({int(episode) for name in tasks for episode in split['tasks'][name]['train']})
+    return {'file': str(path), 'sha256': hashlib.sha256(content).hexdigest(), 'format': split['format'],
+            'name': split.get('name'), 'subset': 'train', 'tasks': tasks, 'episodes': episodes}
+
+
+def describe_episode_split(split):
+    """One line for logs and errors: name, file, number of episodes and tasks of a split record."""
+    if split is None:
+        return 'no episode split'
+    return (f'{split["name"]} ({split["file"]}, sha256 {split["sha256"][:12]}): {len(split["episodes"])} '
+            f'{split["subset"]} episodes of tasks {split["tasks"]}')
+
+
+def expand_task_groups(dataset_path, task_names):
+    """`task_names` with every task group of <root>/isg_meta/task_groups.json replaced by the tasks it reaches.
+
+    A group lists task names and/or other groups. None (every task) stays None, and without a group file the names
+    are returned unchanged; otherwise the tasks come back without duplicates in order of first appearance.
+    """
+    if task_names is None:
+        return None
+    names = [task_names] if isinstance(task_names, str) else list(task_names)
+    path = Path(dataset_path) / TASK_GROUPS_FILE
+    if not path.is_file():
+        return names
+    content = json.loads(path.read_text())
+    groups = content.get('groups')
+    if content.get('format') != TASK_GROUPS_FORMAT or not isinstance(groups, dict):
+        raise ValueError(f'{path} is not an {TASK_GROUPS_FORMAT} task group file (format {content.get("format")!r})')
+    tasks = {row.get('task', row.get('__index_level_0__'))
+             for row in pq.read_table(Path(dataset_path) / 'meta/tasks.parquet').to_pylist()}
+
+    def expand(name, parents):
+        if name in tasks:
+            if name in groups:
+                raise ValueError(f'{name!r} is both a task and a task group in {path}')
+            return [name]
+        if name not in groups:
+            if parents:
+                raise ValueError(f'Task group {parents[-1]!r} in {path} lists unknown task or group {name!r}')
+            raise ValueError(f'Unknown task or task group {name!r}; groups in {path}: {sorted(groups)}; '
+                             f'tasks: {sorted(tasks)}')
+        if name in parents:
+            raise ValueError(f'Task group cycle {" -> ".join([*parents, name])} in {path}')
+        members = groups[name]
+        if not isinstance(members, list) or not members or not all(isinstance(member, str) for member in members):
+            raise ValueError(f'Task group {name!r} in {path} must be a nonempty list of task or group names')
+        return [task for member in members for task in expand(member, (*parents, name))]
+
+    return list(dict.fromkeys(task for name in names for task in expand(name, ())))
+
+
+def parse_settle_steps(spec):
+    """Canonical `--settle-steps` SPEC: `all`, a number of settle frames ('0', '10') or a decimal fraction of each
+    episode's program length ('0.2'; '1.0' is the whole program length, '1' one frame). Raises ValueError otherwise."""
+    text = str(spec).strip()
+    if text == 'all':
+        return text
+    if re.fullmatch(r'[0-9]+', text):
+        return str(int(text))
+    if re.fullmatch(r'[0-9]*\.[0-9]+|[0-9]+\.', text):
+        value = format(Decimal(text).normalize(), 'f')
+        return value if '.' in value else f'{value}.0'
+    raise ValueError(f'--settle-steps must be all, a number of frames (0, 10) or a decimal fraction of the program '
+                     f'length (0.1, 0.2); got {spec!r}')
+
+
+def settle_frames(spec, program_length):
+    """Settle frames that a canonical SPEC other than `all` requests after `program_length` program frames."""
+    return math.ceil(Fraction(spec) * program_length) if '.' in spec else int(spec)
+
+
+def apply_settle_steps(dataset_path, spec, episodes):
+    """Cut episodes (meta/episodes rows; `length` and `dataset_to_index` change in place) to `--settle-steps SPEC`.
+
+    `all` keeps every recorded frame and returns None. Otherwise each episode keeps its program -- the first
+    `program_length` frames listed by <root>/isg_meta/settle_windows.json -- followed by SPEC settle frames, capped
+    at the recorded window; returns the record saved with runs and checkpoints.
+    """
+    spec = parse_settle_steps(spec)
+    if spec == 'all':
+        return None
+    path = Path(dataset_path).resolve() / SETTLE_WINDOWS_FILE
+    if not path.is_file():
+        raise FileNotFoundError(f'--settle-steps {spec} needs {path}, the program length of every episode; only datasets '
+                                'whose episodes end with a recorded settle window ship it')
+    content = path.read_bytes()
+    windows = json.loads(content)
+    if windows.get('format') != SETTLE_WINDOWS_FORMAT or not isinstance(windows.get('episodes'), dict):
+        raise ValueError(f'{path} is not an {SETTLE_WINDOWS_FORMAT} file (format {windows.get("format")!r})')
+    recorded = settle = capped = 0
+    for ep in episodes:
+        entry = windows['episodes'].get(str(ep['episode_index']))
+        if not entry or entry.get('length') != ep['length'] or not 0 < entry.get('program_length', 0) <= ep['length']:
+            raise ValueError(f'{path} has no settle window for episode {ep["episode_index"]} of length {ep["length"]} '
+                             f'(entry {entry}); regenerate it for this dataset')
+        program = entry['program_length']
+        wanted = settle_frames(spec, program)
+        kept = min(wanted, ep['length'] - program)
+        capped += wanted > kept
+        recorded += ep['length']
+        settle += kept
+        ep['length'] = program + kept
+        ep['dataset_to_index'] = ep['dataset_from_index'] + ep['length']
+    if capped:
+        LOGGER.warning('--settle-steps %s exceeds the recorded settle window of %d of %d episodes; they keep their '
+                       'whole window', spec, capped, len(episodes))
+    return {'spec': spec, 'file': str(path), 'sha256': hashlib.sha256(content).hexdigest(),
+            'format': SETTLE_WINDOWS_FORMAT, 'frames': sum(ep['length'] for ep in episodes), 'settle_frames': settle,
+            'recorded_frames': recorded, 'capped_episodes': capped}
+
+
+def describe_settle_steps(settle):
+    """One line for logs and errors: kept, settle and recorded frames of a settle record."""
+    if settle is None:
+        return 'all (every recorded frame)'
+    return (f'{settle["spec"]} ({settle["file"]}, sha256 {settle["sha256"][:12]}): {settle["frames"]} of '
+            f'{settle["recorded_frames"]} recorded frames, {settle["settle_frames"]} of them settle frames; '
+            f'{settle["capped_episodes"]} episodes keep their whole recorded window')
 
 
 def preprocess_image(image, image_size):
@@ -62,10 +216,18 @@ class B1KDataset(torch.utils.data.Dataset):
     With a frame cache, images are returned as uint8 (camera, H, W, 3) tensors (see
     `b1k_frame_cache.dequantize_images`) and all scalar/state/action columns are held in memory once
     per process instead of filtering Parquet row groups per sample.
+
+    `episodes` (episode_index values, e.g. an episode split's `train` list) restricts the selected tasks to
+    exactly those episodes: a requested episode that is incomplete locally or not an episode of a selected task
+    fails instead of being skipped.
+
+    `settle_steps` (see `apply_settle_steps`) cuts every episode after its program plus that many settle frames
+    without rewriting the dataset: samples, action chunks (padded past the cut), statistics and the fingerprint
+    cover the kept frames only.
     """
     def __init__(self, dataset_path, task_names=None, chunk_size=100, image_size=(240, 240),
                  cache_row_groups=2, video_cache_size=3, timestamp_tolerance=0.008, profile_reads=False,
-                 frame_cache=None):
+                 frame_cache=None, episodes=None, settle_steps='all'):
         self.root = Path(dataset_path).resolve()
         self.info = json.loads((self.root / 'meta/info.json').read_text())
         if self.info.get('codebase_version') != 'v3.0':
@@ -93,6 +255,8 @@ class B1KDataset(torch.utils.data.Dataset):
         if unknown:
             raise ValueError(f'Unknown task names {sorted(unknown)}; available metadata tasks: {sorted(names.values())}')
         selected = {i for i, name in names.items() if not requested or name in requested}
+        wanted = None if episodes is None else sorted({int(episode) for episode in episodes})
+        owners = {}
         columns = ['episode_index', 'task_index', 'length', 'dataset_from_index', 'dataset_to_index',
                    'data/chunk_index', 'data/file_index']
         columns += [f'videos/{key}/{field}' for key in VIDEO_KEYS
@@ -117,6 +281,9 @@ class B1KDataset(torch.utils.data.Dataset):
                     task_ids.append(by_name[tasks[0]])
                 table = table.append_column('task_index', pa.array(task_ids))
                 table = table.select(columns)
+            if wanted is not None:
+                table = table.filter(pc.is_in(table['episode_index'], value_set=pa.array(wanted, pa.int64())))
+                owners.update(zip(table['episode_index'].to_pylist(), table['task_index'].to_pylist()))
             table = table.filter(pc.is_in(table['task_index'], value_set=pa.array(sorted(selected))))
             for ep in table.to_pylist():
                 paths = [self.data_path(ep)] + [self.video_path(ep, key) for key in VIDEO_KEYS]
@@ -126,6 +293,9 @@ class B1KDataset(torch.utils.data.Dataset):
                         existence[file] = file.is_file()
                     if not existence[file]:
                         missing.append(str(file))
+                if missing and wanted is not None:
+                    raise FileNotFoundError(f'Requested episode {ep["episode_index"]} is incomplete locally: '
+                                            f'missing {missing}')
                 if missing:
                     skipped += 1
                     continue
@@ -133,6 +303,13 @@ class B1KDataset(torch.utils.data.Dataset):
                     raise ValueError(f'Invalid episode bounds: {ep["episode_index"]}')
                 self.episodes.append(ep)
         self.episodes.sort(key=lambda ep: ep['episode_index'])
+        if wanted is not None:
+            absent = sorted(set(wanted) - {int(ep['episode_index']) for ep in self.episodes})
+            if absent:
+                other = {episode: names.get(owners[episode], owners[episode]) for episode in absent if episode in owners}
+                raise ValueError(f'Requested episodes {absent} are not episodes of the selected tasks '
+                                 f'{sorted(names[i] for i in selected)} in {self.root}/meta/episodes '
+                                 f'(episodes of other tasks: {other or "none"})')
         if not self.episodes:
             raise ValueError(f'No complete local episodes for task names {sorted(requested) or "all"}; '
                              f'{skipped} episodes reference missing Parquet/RGB video files under {self.root}')
@@ -145,6 +322,10 @@ class B1KDataset(torch.utils.data.Dataset):
         self.by_id = {int(ep['episode_index']): ep for ep in self.episodes}
         if len(self.by_id) != len(self.episodes):
             raise ValueError('Duplicate episode_index in metadata')
+        self.recorded_lengths = {int(ep['episode_index']): int(ep['length']) for ep in self.episodes}
+        self.settle = apply_settle_steps(self.root, settle_steps, self.episodes)
+        if self.settle:
+            LOGGER.info('Settle steps %s', describe_settle_steps(self.settle))
         self.lengths = np.array([ep['length'] for ep in self.episodes], dtype=np.int64)
         self.ends = self.lengths.cumsum()
         self.starts = self.ends - self.lengths
@@ -183,10 +364,12 @@ class B1KDataset(torch.utils.data.Dataset):
     def __len__(self):
         return int(self.ends[-1])
 
-    def _read_rows(self, ep, frame, count):
+    def _read_rows(self, ep, frame, count, recorded=False):
+        """Rows of up to `count` frames from `frame`, ending at the episode's kept (or `recorded`) last frame."""
         path = self.data_path(ep)
         lower = ep['dataset_from_index'] + frame
-        upper = min(lower + count, ep['dataset_to_index'])
+        end = self.recorded_lengths[int(ep['episode_index'])] if recorded else ep['length']
+        upper = min(lower + count, ep['dataset_from_index'] + end)
         if path not in self._footers:
             with pq.ParquetFile(path) as file:
                 index_col = file.schema_arrow.names.index('index')
@@ -317,13 +500,16 @@ class B1KDataset(torch.utils.data.Dataset):
             actions = _matrix(table['action'])
             for position in positions:
                 ep = self.episodes[position]
+                recorded = self.recorded_lengths[int(ep['episode_index'])]
                 rows = np.flatnonzero(episode_column == ep['episode_index'])
                 rows = rows[np.argsort(index_column[rows], kind='stable')]
-                if (len(rows) != ep['length'] or
-                        not np.array_equal(index_column[rows], np.arange(ep['dataset_from_index'], ep['dataset_to_index'])) or
-                        not np.array_equal(frame_column[rows], np.arange(ep['length'])) or
+                if (len(rows) != recorded or
+                        not np.array_equal(index_column[rows], np.arange(ep['dataset_from_index'],
+                                                                         ep['dataset_from_index'] + recorded)) or
+                        not np.array_equal(frame_column[rows], np.arange(recorded)) or
                         not np.all(task_column[rows] == ep['task_index'])):
                     raise ValueError(f'Corrupt episode/frame bounds for episode {ep["episode_index"]} in {path}')
+                rows = rows[:ep['length']]
                 target = slice(int(self.starts[position]), int(self.ends[position]))
                 timestamp[target] = timestamps[rows]
                 state[target] = states[rows]
@@ -413,12 +599,18 @@ class B1KDataset(torch.utils.data.Dataset):
         m2 = np.zeros(48, dtype=np.float64)
         by_file = {}
         for ep in self.episodes:
-            by_file.setdefault(self.data_path(ep), []).append(ep['episode_index'])
-        for path, ids in sorted(by_file.items()):
+            by_file.setdefault(self.data_path(ep), []).append(ep)
+        columns = ['episode_index', 'observation.state', 'action'] + (['frame_index'] if self.settle else [])
+        for path, eps in sorted(by_file.items()):
+            ids = np.array([ep['episode_index'] for ep in eps], dtype=np.int64)  # ascending, like self.episodes
+            lengths = np.array([ep['length'] for ep in eps], dtype=np.int64)
             with pq.ParquetFile(path) as file:
-                for batch in file.iter_batches(batch_size=65536, columns=['episode_index', 'observation.state', 'action']):
+                for batch in file.iter_batches(batch_size=65536, columns=columns):
                     table = pa.Table.from_batches([batch])
                     table = table.filter(pc.is_in(table['episode_index'], value_set=pa.array(ids)))
+                    if self.settle:
+                        kept = lengths[np.searchsorted(ids, table['episode_index'].to_numpy())]
+                        table = table.filter(pa.array(table['frame_index'].to_numpy() < kept))
                     if max_frames is not None:
                         table = table.slice(0, max(0, max_frames - count))
                     if not table.num_rows:

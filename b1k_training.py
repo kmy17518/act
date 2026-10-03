@@ -18,7 +18,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from b1k_dataset import B1KDataset, CAMERAS, OBS_KEYS, STATE_INDICES, VIDEO_KEYS, SplitBatchSampler, StepBatchSampler
+from b1k_dataset import (B1KDataset, CAMERAS, OBS_KEYS, STATE_INDICES, VIDEO_KEYS, SplitBatchSampler, StepBatchSampler,
+                         describe_episode_split, expand_task_groups, parse_settle_steps, resolve_episode_split)
 from b1k_frame_cache import dequantize_images
 from detr.models.maxpool_nhwc import MaxPool3x3NHWC, replaces
 from detr.models.transformer import use_fused_attention
@@ -399,10 +400,28 @@ def wandb_run(args, output, checkpoint):
         tracked.finish()
 
 
+class ExplicitOption(argparse.Action):
+    """Store the value and record that it was given (`_<dest>_explicit`), for options checked against a checkpoint."""
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f'_{self.dest}_explicit', True)
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--dataset-path', '--dataset-root', dest='dataset_path', required=True)
-    p.add_argument('--task-names', nargs='+', help='Default: every complete local task')
+    p.add_argument('--task-names', nargs='+', help='Tasks or task groups of <dataset>/isg_meta/task_groups.json. '
+                   'Default: every complete local task (with an episode split: every task of the split file)')
+    p.add_argument('--episode-split', default='auto', action=ExplicitOption, metavar='SPEC',
+                   help='Train on the "train" episodes of the selected tasks listed by an isg-episode-split/v1 file: '
+                        'auto (<dataset root>/isg_meta/train_split.json if it exists, else no split), none, or a file '
+                        'path. Resume reuses the checkpoint\'s episodes; an explicit SPEC must select the same ones')
+    p.add_argument('--settle-steps', default='all', action=ExplicitOption, metavar='SPEC',
+                   help='Frames kept after each episode\'s program (the recorded settle window, where the robot holds '
+                        'still), cut at load time using <dataset root>/isg_meta/settle_windows.json: all (default: every '
+                        'recorded frame), a number of frames (0 keeps the program only) or a decimal fraction of the '
+                        'program length (0.2), capped at the recorded window. '
+                        'Resume reuses the checkpoint\'s value; an explicit SPEC must equal it')
     p.add_argument('--output-dir', required=True)
     p.add_argument('--max-steps', type=int, default=50000, help='Total optimizer steps, including resumed steps')
     p.add_argument('--batch-size', type=int, default=8)
@@ -504,6 +523,10 @@ def _train(args, output, root, resources):
     checkpoint = load_checkpoint(args.resume) if args.resume else None
     if checkpoint and (checkpoint.get('checkpoint_type') == 'eval' or 'optimizer' not in checkpoint):
         raise ValueError('Cannot resume training from an eval-only checkpoint; use a full step checkpoint or latest.pt')
+    task_names = expand_task_groups(root, args.task_names)
+    if task_names != args.task_names:
+        LOGGER.info('--task-names %s select the tasks %s', args.task_names, task_names)
+    args.settle_steps = parse_settle_steps(args.settle_steps)
     if checkpoint:
         if args.max_steps <= checkpoint['step']:
             raise ValueError(f'--max-steps must exceed resumed step {checkpoint["step"]}')
@@ -515,8 +538,22 @@ def _train(args, output, root, resources):
         adapter = checkpoint['adapter_config']
         model_config = dict(checkpoint['model_config'])
         model_config.setdefault('policy_class', 'ACT')
-        task_names = args.task_names or list(checkpoint['task_map'].values())
+        saved_tasks = list(checkpoint['task_map'].values())
+        if task_names and set(task_names) != set(saved_tasks):
+            raise ValueError(f'--task-names {args.task_names} select {task_names}, but the checkpoint trained on '
+                             f'{saved_tasks}')
+        task_names = task_names or saved_tasks
         args.seed = checkpoint['train_config']['seed']
+        episode_split = checkpoint.get('episode_split')
+        if getattr(args, '_episode_split_explicit', False):
+            requested = resolve_episode_split(root, args.episode_split, task_names)
+            if (requested or {}).get('episodes') != (episode_split or {}).get('episodes'):
+                raise ValueError(f'--episode-split {args.episode_split} differs from checkpoint: '
+                                 f'{describe_episode_split(requested)} vs {describe_episode_split(episode_split)}')
+        saved_settle = (checkpoint.get('settle_steps') or {}).get('spec', 'all')
+        if getattr(args, '_settle_steps_explicit', False) and args.settle_steps != saved_settle:
+            raise ValueError(f'--settle-steps {args.settle_steps} differs from checkpoint ({saved_settle})')
+        args.settle_steps = saved_settle
     else:
         image_size = args.image_size or ([240, 240] if args.policy_class == 'ACT' else [480, 640])
         if args.policy_class == 'CNNMLP' and (args.pre_norm or args.position_embedding != 'sine'):
@@ -530,7 +567,8 @@ def _train(args, output, root, resources):
                    'action_transform': 'identity', 'action_shift': 0, 'task_conditioning': 'onehot',
                    'timestamp_tolerance': args.timestamp_tolerance, 'image_resize': 'bilinear_antialias',
                    'image_normalization': f'rgb_div255_then_imagenet_in_{args.policy_class}Policy'}
-        task_names = args.task_names
+        episode_split = resolve_episode_split(root, args.episode_split, task_names)
+        task_names = episode_split['tasks'] if episode_split else task_names
         model_config = {'policy_class': args.policy_class,
                         'num_queries': args.chunk_size if args.policy_class == 'ACT' else 1,
                         'hidden_dim': args.hidden_dim,
@@ -549,10 +587,14 @@ def _train(args, output, root, resources):
     tracked, wandb_identity = resources.enter_context(wandb_run(args, output, checkpoint))
     configure_cpu_threads(torch_threads=args.torch_threads or torch.get_num_threads(),
                           arrow_threads=args.arrow_threads, opencv_threads=args.opencv_threads)
+    if episode_split:
+        LOGGER.info('Episode split %s', describe_episode_split(episode_split))
     dataset = B1KDataset(root, task_names, model_config['num_queries'], adapter['image_size'],
                          cache_row_groups=args.cache_row_groups, profile_reads=True,
                          timestamp_tolerance=adapter['timestamp_tolerance'],
-                         frame_cache=args.frame_cache.resolve() if args.frame_cache else None)
+                         frame_cache=args.frame_cache.resolve() if args.frame_cache else None,
+                         episodes=episode_split['episodes'] if episode_split else None,
+                         settle_steps=args.settle_steps)
     resources.callback(dataset.close)
     if checkpoint and dataset.task_map != checkpoint['task_map']:
         raise ValueError('Resume task map differs from checkpoint')
@@ -605,11 +647,12 @@ def _train(args, output, root, resources):
             torch.cuda.set_rng_state(checkpoint['cuda_rng'], device)
     if args.max_steps <= start:
         raise ValueError(f'--max-steps must exceed resumed step {start}')
-    train_config = vars(args).copy()
+    train_config = {key: value for key, value in vars(args).items() if not key.startswith('_')}
     train_config['resume'] = str(args.resume) if args.resume else None
     train_config['frame_cache'] = str(args.frame_cache) if args.frame_cache else None
     run = {'model_config': model_config, 'adapter_config': adapter, 'train_config': train_config,
-           'task_map': dataset.task_map, 'normalization': stats, 'wandb': wandb_identity}
+           'task_map': dataset.task_map, 'episode_split': episode_split, 'settle_steps': dataset.settle,
+           'normalization': stats, 'wandb': wandb_identity}
     atomic_json(run, output / ('resume_run.json' if checkpoint else 'run.json'))
     if tracked:
         tracked.config.update(run, allow_val_change=True)
