@@ -14,6 +14,7 @@ Without --report the tables go to stdout; with it they replace the text between 
 import argparse
 from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -392,7 +393,9 @@ def main():
         current = current[:current.index(BEGIN)] + text + current[current.index(END) + len(END):]
     else:
         current = current.rstrip('\n') + '\n\n' + text + '\n'
-    report.write_text(current)
+    temporary = report.with_name(report.name + '.tmp')  # other writers edit the same report
+    temporary.write_text(current)
+    os.replace(temporary, report)
 
 
 if __name__ == '__main__':
