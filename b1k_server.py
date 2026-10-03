@@ -108,6 +108,7 @@ class Session:
         adapter = checkpoint['adapter_config']
         self.image_size = adapter['image_size']
         self.task_onehot = adapter.get('task_conditioning', 'onehot') == 'onehot'
+        self.gripper_state = adapter.get('gripper_state', 'fingers')
         # Goal images: per request under the `goal::<camera observation key>` keys, else the fixed images given at
         # server start (--goal-image CAMERA=PATH; an externally supplied target image), else the request is rejected.
         self.goal_views = list(adapter.get('goal_views', []))
@@ -163,7 +164,8 @@ class Session:
             raise ValueError('robot_r1::proprio must have shape (61,) or (B,61)')
         batch_size = len(state)
         task_ids = self.resolve_tasks(observation.get('task_id'), batch_size)
-        qpos = torch.stack([preprocess_state(s, int(task), self.stats, self.task_map, self.task_onehot)
+        qpos = torch.stack([preprocess_state(s, int(task), self.stats, self.task_map, self.task_onehot,
+                                             gripper_state=self.gripper_state)
                             for s, task in zip(state, task_ids)])
         images = self.batch_images(observation, OBS_KEYS, batch_size)
         goal = None
