@@ -1,10 +1,14 @@
 """Read-only, bounded-memory ACT samples from local LeRobot v3 Parquet/video."""
 
 from collections import OrderedDict
+from decimal import Decimal
+from fractions import Fraction
 import hashlib
 import json
 import logging
+import math
 from pathlib import Path
+import re
 import time
 
 import av
@@ -17,12 +21,17 @@ from torch.nn import functional as F
 
 
 STATE_INDICES = list(range(3)) + list(range(53, 57)) + list(range(3, 10)) + [24, 25] + list(range(28, 35)) + [49, 50]
+# Gripper proprioception (adapter_config['gripper_state']): `sum` adds each gripper's two finger positions into one
+# opening, so the state has one value per action dimension in the action's order (23 values, as in openpi);
+# `fingers` keeps both positions (25 values), the layout of checkpoints that do not record `gripper_state`.
+GRIPPER_STATES = ('sum', 'fingers')
 CAMERAS = ['zed_link', 'left_realsense_link', 'right_realsense_link']
 VIDEO_KEYS = [f'observation.rgb.{camera}_camera_0' for camera in CAMERAS]
 OBS_KEYS = [f'robot_r1::robot_r1:{camera}:Camera:0::rgb' for camera in CAMERAS]
 # Goal images (goal-image conditioning): one image per selected camera view, no observation-history axis.
-#   episode_last -- the last frame of the episode's own camera stream (the settled terminal state; works on any
-#                   LeRobot v3 root, including the challenge demos);
+#   episode_last -- the last recorded frame of the episode's own camera stream (the settled terminal state, also
+#                   when --settle-steps cuts the episode earlier; works on any LeRobot v3 root, including the
+#                   challenge demos);
 #   goal_key     -- a dedicated goal video stream shipped by the dataset (`observation.goal_rgb.<camera>_camera_0`,
 #                   static per episode, as in the radio skill-segment datasets).
 GOAL_SOURCES = ('episode_last', 'goal_key')
@@ -30,14 +39,163 @@ GOAL_VIDEO_KEYS = {camera: f'observation.goal_rgb.{camera}_camera_0' for camera 
 # Wire keys of goal images in serving requests: `goal::` + the camera's observation key.
 GOAL_OBS_KEYS = {camera: f'goal::{key}' for camera, key in zip(CAMERAS, OBS_KEYS)}
 COLUMNS = ['index', 'episode_index', 'frame_index', 'timestamp', 'task_index', 'observation.state', 'action']
+EPISODE_SPLIT_FILE = 'isg_meta/train_split.json'
+EPISODE_SPLIT_FORMAT = 'isg-episode-split/v1'
+TASK_GROUPS_FILE = 'isg_meta/task_groups.json'
+TASK_GROUPS_FORMAT = 'isg-task-groups/v1'
+SETTLE_WINDOWS_FILE = 'isg_meta/settle_windows.json'
+SETTLE_WINDOWS_FORMAT = 'isg-settle-windows/v1'
 LOGGER = logging.getLogger(__name__)
 
 
+def resolve_episode_split(dataset_path, spec='auto', task_names=None):
+    """Training episodes of `--episode-split SPEC` as a JSON-serializable record, or None without a split.
+
+    `auto` reads <root>/isg_meta/train_split.json when that file exists (no split otherwise), `none` disables
+    the split, any other value is the path of a split file. The selected tasks are `task_names` or, when omitted,
+    every task of the file; the episodes are the sorted union of their `train` lists.
+    """
+    if spec == 'none':
+        return None
+    path = Path(dataset_path) / EPISODE_SPLIT_FILE if spec == 'auto' else Path(spec)
+    if not path.is_file():
+        if spec == 'auto':
+            return None
+        raise FileNotFoundError(f'Episode split file {path} not found')
+    path = path.resolve()
+    content = path.read_bytes()
+    split = json.loads(content)
+    if split.get('format') != EPISODE_SPLIT_FORMAT or not isinstance(split.get('tasks'), dict):
+        raise ValueError(f'{path} is not an {EPISODE_SPLIT_FORMAT} episode split (format {split.get("format")!r})')
+    tasks = list(dict.fromkeys(task_names or split['tasks']))
+    missing = [name for name in tasks if name not in split['tasks']]
+    if missing:
+        raise ValueError(f'Selected tasks {missing} have no entry in episode split {path}')
+    episodes = sorted({int(episode) for name in tasks for episode in split['tasks'][name]['train']})
+    return {'file': str(path), 'sha256': hashlib.sha256(content).hexdigest(), 'format': split['format'],
+            'name': split.get('name'), 'subset': 'train', 'tasks': tasks, 'episodes': episodes}
+
+
+def describe_episode_split(split):
+    """One line for logs and errors: name, file, number of episodes and tasks of a split record."""
+    if split is None:
+        return 'no episode split'
+    return (f'{split["name"]} ({split["file"]}, sha256 {split["sha256"][:12]}): {len(split["episodes"])} '
+            f'{split["subset"]} episodes of tasks {split["tasks"]}')
+
+
+def expand_task_groups(dataset_path, task_names):
+    """`task_names` with every task group of <root>/isg_meta/task_groups.json replaced by the tasks it reaches.
+
+    A group lists task names and/or other groups. None (every task) stays None, and without a group file the names
+    are returned unchanged; otherwise the tasks come back without duplicates in order of first appearance.
+    """
+    if task_names is None:
+        return None
+    names = [task_names] if isinstance(task_names, str) else list(task_names)
+    path = Path(dataset_path) / TASK_GROUPS_FILE
+    if not path.is_file():
+        return names
+    content = json.loads(path.read_text())
+    groups = content.get('groups')
+    if content.get('format') != TASK_GROUPS_FORMAT or not isinstance(groups, dict):
+        raise ValueError(f'{path} is not an {TASK_GROUPS_FORMAT} task group file (format {content.get("format")!r})')
+    tasks = {row.get('task', row.get('__index_level_0__'))
+             for row in pq.read_table(Path(dataset_path) / 'meta/tasks.parquet').to_pylist()}
+
+    def expand(name, parents):
+        if name in tasks:
+            if name in groups:
+                raise ValueError(f'{name!r} is both a task and a task group in {path}')
+            return [name]
+        if name not in groups:
+            if parents:
+                raise ValueError(f'Task group {parents[-1]!r} in {path} lists unknown task or group {name!r}')
+            raise ValueError(f'Unknown task or task group {name!r}; groups in {path}: {sorted(groups)}; '
+                             f'tasks: {sorted(tasks)}')
+        if name in parents:
+            raise ValueError(f'Task group cycle {" -> ".join([*parents, name])} in {path}')
+        members = groups[name]
+        if not isinstance(members, list) or not members or not all(isinstance(member, str) for member in members):
+            raise ValueError(f'Task group {name!r} in {path} must be a nonempty list of task or group names')
+        return [task for member in members for task in expand(member, (*parents, name))]
+
+    return list(dict.fromkeys(task for name in names for task in expand(name, ())))
+
+
+def parse_settle_steps(spec):
+    """Canonical `--settle-steps` SPEC: `all`, a number of settle frames ('0', '10') or a decimal fraction of each
+    episode's program length ('0.2'; '1.0' is the whole program length, '1' one frame). Raises ValueError otherwise."""
+    text = str(spec).strip()
+    if text == 'all':
+        return text
+    if re.fullmatch(r'[0-9]+', text):
+        return str(int(text))
+    if re.fullmatch(r'[0-9]*\.[0-9]+|[0-9]+\.', text):
+        value = format(Decimal(text).normalize(), 'f')
+        return value if '.' in value else f'{value}.0'
+    raise ValueError(f'--settle-steps must be all, a number of frames (0, 10) or a decimal fraction of the program '
+                     f'length (0.1, 0.2); got {spec!r}')
+
+
+def settle_frames(spec, program_length):
+    """Settle frames that a canonical SPEC other than `all` requests after `program_length` program frames."""
+    return math.ceil(Fraction(spec) * program_length) if '.' in spec else int(spec)
+
+
+def apply_settle_steps(dataset_path, spec, episodes):
+    """Cut episodes (meta/episodes rows; `length` and `dataset_to_index` change in place) to `--settle-steps SPEC`.
+
+    `all` keeps every recorded frame and returns None. Otherwise each episode keeps its program -- the first
+    `program_length` frames listed by <root>/isg_meta/settle_windows.json -- followed by SPEC settle frames, capped
+    at the recorded window; returns the record saved with runs and checkpoints.
+    """
+    spec = parse_settle_steps(spec)
+    if spec == 'all':
+        return None
+    path = Path(dataset_path).resolve() / SETTLE_WINDOWS_FILE
+    if not path.is_file():
+        raise FileNotFoundError(f'--settle-steps {spec} needs {path}, the program length of every episode; only datasets '
+                                'whose episodes end with a recorded settle window ship it')
+    content = path.read_bytes()
+    windows = json.loads(content)
+    if windows.get('format') != SETTLE_WINDOWS_FORMAT or not isinstance(windows.get('episodes'), dict):
+        raise ValueError(f'{path} is not an {SETTLE_WINDOWS_FORMAT} file (format {windows.get("format")!r})')
+    recorded = settle = capped = 0
+    for ep in episodes:
+        entry = windows['episodes'].get(str(ep['episode_index']))
+        if not entry or entry.get('length') != ep['length'] or not 0 < entry.get('program_length', 0) <= ep['length']:
+            raise ValueError(f'{path} has no settle window for episode {ep["episode_index"]} of length {ep["length"]} '
+                             f'(entry {entry}); regenerate it for this dataset')
+        program = entry['program_length']
+        wanted = settle_frames(spec, program)
+        kept = min(wanted, ep['length'] - program)
+        capped += wanted > kept
+        recorded += ep['length']
+        settle += kept
+        ep['length'] = program + kept
+        ep['dataset_to_index'] = ep['dataset_from_index'] + ep['length']
+    if capped:
+        LOGGER.warning('--settle-steps %s exceeds the recorded settle window of %d of %d episodes; they keep their '
+                       'whole window', spec, capped, len(episodes))
+    return {'spec': spec, 'file': str(path), 'sha256': hashlib.sha256(content).hexdigest(),
+            'format': SETTLE_WINDOWS_FORMAT, 'frames': sum(ep['length'] for ep in episodes), 'settle_frames': settle,
+            'recorded_frames': recorded, 'capped_episodes': capped}
+
+
+def describe_settle_steps(settle):
+    """One line for logs and errors: kept, settle and recorded frames of a settle record."""
+    if settle is None:
+        return 'all (every recorded frame)'
+    return (f'{settle["spec"]} ({settle["file"]}, sha256 {settle["sha256"][:12]}): {settle["frames"]} of '
+            f'{settle["recorded_frames"]} recorded frames, {settle["settle_frames"]} of them settle frames; '
+            f'{settle["capped_episodes"]} episodes keep their whole recorded window')
 def quantize_image(tensor):
     """Float CHW image in [0, 1] (as `preprocess_image` returns) to the nearest uint8 HWC RGB array."""
     if tensor.ndim != 3 or tensor.shape[0] != 3:
         raise ValueError('Expected a float CHW RGB image')
     return torch.round(tensor * 255).clamp_(0, 255).to(torch.uint8).permute(1, 2, 0).contiguous().numpy()
+
 
 
 def preprocess_image(image, image_size):
@@ -54,20 +212,43 @@ def preprocess_image(image, image_size):
     return tensor
 
 
-def preprocess_state(state, task_id, stats, task_map, task_onehot=True):
-    """Normalized 25-D proprioception, plus the one-hot task category unless `task_onehot` is False.
+def extract_state(state, gripper_state='sum'):
+    """Proprioception of R1Pro states (last axis of 61): the STATE_INDICES values (base velocity 0:3, torso 3:7,
+    left arm 7:14, left fingers 14:16, right arm 16:23, right fingers 23:25), each finger pair summed for `sum`."""
+    if gripper_state not in GRIPPER_STATES:
+        raise ValueError(f'Unknown gripper_state {gripper_state!r}; expected one of {GRIPPER_STATES}')
+    selected = np.asarray(state)[..., STATE_INDICES]
+    if gripper_state == 'fingers':
+        return selected
+    return np.concatenate([selected[..., :14], selected[..., 14:16].sum(-1, keepdims=True),
+                           selected[..., 16:23], selected[..., 23:25].sum(-1, keepdims=True)], axis=-1)
+
+
+def proprio_dim(gripper_state='sum'):
+    """Number of proprioception values `extract_state` returns for a gripper layout."""
+    return len(STATE_INDICES) - 2 if gripper_state == 'sum' else len(STATE_INDICES)
+
+
+def preprocess_state(state, task_id, stats, task_map, task_onehot=True, gripper_state='sum'):
+    """Normalized proprioception (`extract_state` layout `gripper_state`), plus the one-hot task category unless
+    `task_onehot` is False.
 
     The task id is validated against the checkpoint task map either way; without the one-hot the network receives
     no task identity through the state (the N/I conditioning regimes; language regimes select their prompt through
     the task id column of the batch instead).
     """
+    if task_onehot not in (True, False):
+        raise ValueError(f'task_onehot must be a bool, got {task_onehot!r} (pass gripper_state by keyword)')
     state = np.asarray(state, dtype=np.float32)
     if state.shape != (61,) or not np.isfinite(state).all():
         raise ValueError('Expected finite 61-dimensional R1Pro state')
+    if len(stats['qpos_mean']) != proprio_dim(gripper_state):
+        raise ValueError(f'Normalization statistics hold {len(stats["qpos_mean"])} proprioception values; '
+                         f'gripper_state {gripper_state!r} has {proprio_dim(gripper_state)}')
     task_ids = sorted(task_map)
     if task_id not in task_map:
         raise ValueError(f'Unseen task_id {task_id}; checkpoint tasks: {task_map}')
-    qpos = (state[STATE_INDICES] - np.asarray(stats['qpos_mean'])) / np.asarray(stats['qpos_std'])
+    qpos = (extract_state(state, gripper_state) - np.asarray(stats['qpos_mean'])) / np.asarray(stats['qpos_std'])
     if not task_onehot:
         return torch.from_numpy(qpos.astype(np.float32))
     onehot = np.zeros(len(task_ids), dtype=np.float32)
@@ -101,10 +282,24 @@ class B1KDataset(torch.utils.data.Dataset):
     up per episode from a table built once at construction (`goal_source`, see GOAL_SOURCES), and `task_id`
     is the dataset task index (an int64 scalar) for prompt selection and bookkeeping -- it never enters the
     network unless `task_onehot` appends the one-hot category to `qpos`.
+
+    `episodes` (episode_index values, e.g. an episode split's `train` list) restricts the selected tasks to
+    exactly those episodes: a requested episode that is incomplete locally or not an episode of a selected task
+    fails instead of being skipped.
+
+    `settle_steps` (see `apply_settle_steps`) cuts every episode after its program plus that many settle frames
+    without rewriting the dataset: samples, action chunks (padded past the cut), statistics and the fingerprint
+    cover the kept frames only, while `episode_last` goals stay the last recorded frame.
+
+    `gripper_state` (see GRIPPER_STATES) selects the proprioception layout of `qpos` and of the statistics.
     """
     def __init__(self, dataset_path, task_names=None, chunk_size=100, image_size=(240, 240),
                  cache_row_groups=2, video_cache_size=3, timestamp_tolerance=0.008, profile_reads=False,
-                 frame_cache=None, goal_views=(), goal_source='episode_last', task_onehot=True):
+                 frame_cache=None, goal_views=(), goal_source='episode_last', task_onehot=True, episodes=None,
+                 settle_steps='all', gripper_state='sum'):
+        if gripper_state not in GRIPPER_STATES:
+            raise ValueError(f'Unknown gripper_state {gripper_state!r}; expected one of {GRIPPER_STATES}')
+        self.gripper_state = gripper_state
         self.root = Path(dataset_path).resolve()
         self.goal_views = list(goal_views or [])
         self.goal_camera_indices = goal_views_to_indices(self.goal_views)
@@ -140,6 +335,8 @@ class B1KDataset(torch.utils.data.Dataset):
         if unknown:
             raise ValueError(f'Unknown task names {sorted(unknown)}; available metadata tasks: {sorted(names.values())}')
         selected = {i for i, name in names.items() if not requested or name in requested}
+        wanted = None if episodes is None else sorted({int(episode) for episode in episodes})
+        owners = {}
         columns = ['episode_index', 'task_index', 'length', 'dataset_from_index', 'dataset_to_index',
                    'data/chunk_index', 'data/file_index']
         # Goal streams are required only when the goal comes from the dataset's dedicated goal videos.
@@ -173,6 +370,9 @@ class B1KDataset(torch.utils.data.Dataset):
                     task_ids.append(by_name[tasks[0]])
                 table = table.append_column('task_index', pa.array(task_ids))
                 table = table.select(columns)
+            if wanted is not None:
+                table = table.filter(pc.is_in(table['episode_index'], value_set=pa.array(wanted, pa.int64())))
+                owners.update(zip(table['episode_index'].to_pylist(), table['task_index'].to_pylist()))
             table = table.filter(pc.is_in(table['task_index'], value_set=pa.array(sorted(selected))))
             for ep in table.to_pylist():
                 paths = [self.data_path(ep)] + [self.video_path(ep, key) for key in self.required_video_keys]
@@ -182,6 +382,9 @@ class B1KDataset(torch.utils.data.Dataset):
                         existence[file] = file.is_file()
                     if not existence[file]:
                         missing.append(str(file))
+                if missing and wanted is not None:
+                    raise FileNotFoundError(f'Requested episode {ep["episode_index"]} is incomplete locally: '
+                                            f'missing {missing}')
                 if missing:
                     skipped += 1
                     continue
@@ -189,6 +392,13 @@ class B1KDataset(torch.utils.data.Dataset):
                     raise ValueError(f'Invalid episode bounds: {ep["episode_index"]}')
                 self.episodes.append(ep)
         self.episodes.sort(key=lambda ep: ep['episode_index'])
+        if wanted is not None:
+            absent = sorted(set(wanted) - {int(ep['episode_index']) for ep in self.episodes})
+            if absent:
+                other = {episode: names.get(owners[episode], owners[episode]) for episode in absent if episode in owners}
+                raise ValueError(f'Requested episodes {absent} are not episodes of the selected tasks '
+                                 f'{sorted(names[i] for i in selected)} in {self.root}/meta/episodes '
+                                 f'(episodes of other tasks: {other or "none"})')
         if not self.episodes:
             raise ValueError(f'No complete local episodes for task names {sorted(requested) or "all"}; '
                              f'{skipped} episodes reference missing Parquet/RGB video files under {self.root}')
@@ -201,6 +411,10 @@ class B1KDataset(torch.utils.data.Dataset):
         self.by_id = {int(ep['episode_index']): ep for ep in self.episodes}
         if len(self.by_id) != len(self.episodes):
             raise ValueError('Duplicate episode_index in metadata')
+        self.recorded_lengths = {int(ep['episode_index']): int(ep['length']) for ep in self.episodes}
+        self.settle = apply_settle_steps(self.root, settle_steps, self.episodes)
+        if self.settle:
+            LOGGER.info('Settle steps %s', describe_settle_steps(self.settle))
         self.lengths = np.array([ep['length'] for ep in self.episodes], dtype=np.int64)
         self.ends = self.lengths.cumsum()
         self.starts = self.ends - self.lengths
@@ -226,19 +440,20 @@ class B1KDataset(torch.utils.data.Dataset):
     def _goal_frame(self, ep, camera_index):
         """Decode one goal image for an episode/view: uint8 (H, W, 3) at the training image size.
 
-        `episode_last`: the episode's last frame of that camera (row timestamp of frame `length - 1` plus the
-        camera's `from_timestamp`). `goal_key`: the first frame of the dataset's static goal clip for that camera.
+        `episode_last`: the episode's last recorded frame of that camera (row timestamp of the recorded episode's
+        last frame plus the camera's `from_timestamp`, also when `settle_steps` cuts the episode earlier).
+        `goal_key`: the first frame of the dataset's static goal clip for that camera.
         Frames are resized with `preprocess_image` and rounded to uint8 exactly like the frame cache
         (`quantize_image`), so the goal path matches the cached-frame path to within 0.5/255.
         """
         camera = CAMERAS[camera_index]
         if self.goal_source == 'episode_last':
             key = VIDEO_KEYS[camera_index]
-            frame = int(ep['length']) - 1
-            if self._table is not None:
+            frame = self.recorded_lengths[int(ep['episode_index'])] - 1
+            if self._table is not None and frame < ep['length']:
                 timestamp = float(self._table['timestamp'][int(self.starts[self.positions[int(ep['episode_index'])]]) + frame])
             else:
-                timestamp = float(self._read_rows(ep, frame, 1)['timestamp'][0].as_py())
+                timestamp = float(self._read_rows(ep, frame, 1, recorded=True)['timestamp'][0].as_py())
         else:
             key = GOAL_VIDEO_KEYS[camera]
             timestamp = 0.0
@@ -286,15 +501,19 @@ class B1KDataset(torch.utils.data.Dataset):
         payload = {'root': str(self.root), 'episodes': self.episodes,
                    'files': [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in files],
                    'state_indices': STATE_INDICES, 'std_correction': 1}
+        if self.gripper_state != 'fingers':  # `fingers` keeps the fingerprints of runs from before the option
+            payload['gripper_state'] = self.gripper_state
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
     def __len__(self):
         return int(self.ends[-1])
 
-    def _read_rows(self, ep, frame, count):
+    def _read_rows(self, ep, frame, count, recorded=False):
+        """Rows of up to `count` frames from `frame`, ending at the episode's kept (or `recorded`) last frame."""
         path = self.data_path(ep)
         lower = ep['dataset_from_index'] + frame
-        upper = min(lower + count, ep['dataset_to_index'])
+        end = self.recorded_lengths[int(ep['episode_index'])] if recorded else ep['length']
+        upper = min(lower + count, ep['dataset_from_index'] + end)
         if path not in self._footers:
             with pq.ParquetFile(path) as file:
                 index_col = file.schema_arrow.names.index('index')
@@ -425,13 +644,16 @@ class B1KDataset(torch.utils.data.Dataset):
             actions = _matrix(table['action'])
             for position in positions:
                 ep = self.episodes[position]
+                recorded = self.recorded_lengths[int(ep['episode_index'])]
                 rows = np.flatnonzero(episode_column == ep['episode_index'])
                 rows = rows[np.argsort(index_column[rows], kind='stable')]
-                if (len(rows) != ep['length'] or
-                        not np.array_equal(index_column[rows], np.arange(ep['dataset_from_index'], ep['dataset_to_index'])) or
-                        not np.array_equal(frame_column[rows], np.arange(ep['length'])) or
+                if (len(rows) != recorded or
+                        not np.array_equal(index_column[rows], np.arange(ep['dataset_from_index'],
+                                                                         ep['dataset_from_index'] + recorded)) or
+                        not np.array_equal(frame_column[rows], np.arange(recorded)) or
                         not np.all(task_column[rows] == ep['task_index'])):
                     raise ValueError(f'Corrupt episode/frame bounds for episode {ep["episode_index"]} in {path}')
+                rows = rows[:ep['length']]
                 target = slice(int(self.starts[position]), int(self.ends[position]))
                 timestamp[target] = timestamps[rows]
                 state[target] = states[rows]
@@ -464,7 +686,8 @@ class B1KDataset(torch.utils.data.Dataset):
         actions = np.zeros((self.chunk_size, 23), dtype=np.float32)
         actions[:count] = table['action'][row:row + count]
         is_pad = np.arange(self.chunk_size) >= count
-        qpos = preprocess_state(table['state'][row], int(ep['task_index']), self.stats, self.task_map, self.task_onehot)
+        qpos = preprocess_state(table['state'][row], int(ep['task_index']), self.stats, self.task_map, self.task_onehot,
+                                gripper_state=self.gripper_state)
         actions = (actions - np.asarray(self.stats['action_mean'])) / np.asarray(self.stats['action_std'])
         middle = time.perf_counter() if self.profile_reads else 0
         images = np.empty((len(VIDEO_KEYS), *self.image_size, 3), dtype=np.uint8)
@@ -486,7 +709,8 @@ class B1KDataset(torch.utils.data.Dataset):
             return self._cached_sample(self.positions[int(episode_id)], frame)
         images, state, actions, is_pad, task_id = self.raw_sample(episode_id, frame)
         image = torch.stack([preprocess_image(x, self.image_size) for x in images])
-        qpos = preprocess_state(state, task_id, self.stats, self.task_map, self.task_onehot)
+        qpos = preprocess_state(state, task_id, self.stats, self.task_map, self.task_onehot,
+                                gripper_state=self.gripper_state)
         actions = (actions - np.asarray(self.stats['action_mean'])) / np.asarray(self.stats['action_std'])
         return (image, qpos, torch.from_numpy(actions.astype(np.float32)), torch.from_numpy(is_pad),
                 self.goal_for(self.positions[int(episode_id)]), torch.tensor(int(task_id), dtype=torch.int64))
@@ -519,21 +743,28 @@ class B1KDataset(torch.utils.data.Dataset):
     def compute_stats(self, max_frames=None):
         """Stream each selected file once; never decode video or retain all frames."""
         count = 0
-        mean = np.zeros(48, dtype=np.float64)
-        m2 = np.zeros(48, dtype=np.float64)
+        split = proprio_dim(self.gripper_state)
+        mean = np.zeros(split + 23, dtype=np.float64)
+        m2 = np.zeros(split + 23, dtype=np.float64)
         by_file = {}
         for ep in self.episodes:
-            by_file.setdefault(self.data_path(ep), []).append(ep['episode_index'])
-        for path, ids in sorted(by_file.items()):
+            by_file.setdefault(self.data_path(ep), []).append(ep)
+        columns = ['episode_index', 'observation.state', 'action'] + (['frame_index'] if self.settle else [])
+        for path, eps in sorted(by_file.items()):
+            ids = np.array([ep['episode_index'] for ep in eps], dtype=np.int64)  # ascending, like self.episodes
+            lengths = np.array([ep['length'] for ep in eps], dtype=np.int64)
             with pq.ParquetFile(path) as file:
-                for batch in file.iter_batches(batch_size=65536, columns=['episode_index', 'observation.state', 'action']):
+                for batch in file.iter_batches(batch_size=65536, columns=columns):
                     table = pa.Table.from_batches([batch])
                     table = table.filter(pc.is_in(table['episode_index'], value_set=pa.array(ids)))
+                    if self.settle:
+                        kept = lengths[np.searchsorted(ids, table['episode_index'].to_numpy())]
+                        table = table.filter(pa.array(table['frame_index'].to_numpy() < kept))
                     if max_frames is not None:
                         table = table.slice(0, max(0, max_frames - count))
                     if not table.num_rows:
                         continue
-                    x = np.concatenate([_matrix(table['observation.state'])[:, STATE_INDICES],
+                    x = np.concatenate([extract_state(_matrix(table['observation.state']), self.gripper_state),
                                         _matrix(table['action'])], axis=1).astype(np.float64)
                     if not np.isfinite(x).all():
                         raise ValueError(f'Non-finite state/action statistics in {path}')
@@ -553,10 +784,10 @@ class B1KDataset(torch.utils.data.Dataset):
         if count < 2:
             raise ValueError('At least two frames required for sample-standard-deviation normalization')
         std = np.maximum(np.sqrt(m2 / (count - 1)), 0.01)
-        return {'qpos_mean': mean[:25].astype(np.float32).tolist(),
-                'qpos_std': std[:25].astype(np.float32).tolist(),
-                'action_mean': mean[25:].astype(np.float32).tolist(),
-                'action_std': std[25:].astype(np.float32).tolist(),
+        return {'qpos_mean': mean[:split].astype(np.float32).tolist(),
+                'qpos_std': std[:split].astype(np.float32).tolist(),
+                'action_mean': mean[split:].astype(np.float32).tolist(),
+                'action_std': std[split:].astype(np.float32).tolist(),
                 'count': count, 'std_correction': 1, 'std_floor': 0.01,
                 'approximate': count != len(self), 'fingerprint': self.fingerprint()}
 

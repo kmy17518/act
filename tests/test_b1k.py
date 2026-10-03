@@ -1,9 +1,11 @@
 """Boundary, normalization, upstream numerical, and BEHAVIOR protocol regressions."""
 
 import asyncio
+import hashlib
 import json
 import msgpack
 from unittest.mock import MagicMock, patch
+import shutil
 import sys
 from types import SimpleNamespace
 
@@ -18,7 +20,8 @@ import websockets.asyncio.client
 import websockets.asyncio.server
 
 from b1k_dataset import (B1KDataset, OBS_KEYS, STATE_INDICES, VIDEO_KEYS, StepBatchSampler,
-                         SplitBatchSampler, preprocess_image, preprocess_state)
+                         SplitBatchSampler, expand_task_groups, extract_state, parse_settle_steps, preprocess_image,
+                         preprocess_state, proprio_dim, resolve_episode_split, settle_frames)
 from b1k_frame_cache import (FrameCacheReader, build_frame_cache, dequantize_images, entry_is_valid, quantize_image,
                              selected_videos, verify_frame_cache)
 from b1k_server import B1KServer, Session, packb, unpackb
@@ -89,8 +92,8 @@ def hdf5_reference(root, tmp_path, stats, sim=True):
         samples = [dataset.raw_sample(ep['episode_index'], frame) for frame in range(ep['length'])]
         with h5py.File(directory / f'episode_{i}.hdf5', 'w') as file:
             file.attrs['sim'] = sim
-            file['observations/qpos'] = np.stack([sample[1][STATE_INDICES] for sample in samples])
-            file['observations/qvel'] = np.zeros((ep['length'], 25), dtype=np.float32)
+            file['observations/qpos'] = np.stack([extract_state(sample[1]) for sample in samples])
+            file['observations/qvel'] = np.zeros((ep['length'], 23), dtype=np.float32)
             file['action'] = np.stack([sample[2][0] for sample in samples])
             for c, key in enumerate(VIDEO_KEYS):
                 file[f'observations/images/{key}'] = np.stack([sample[0][c] for sample in samples])
@@ -115,10 +118,10 @@ def test_exact_hdf5_statistics_and_sample_boundaries(tiny_root, tmp_path):
                 reference = EpisodicDataset([e], str(directory), VIDEO_KEYS, reference_stats)[0]
             sample = dataset.sample_at(ep['episode_index'], frame)
             torch.testing.assert_close(sample[0], reference[0], atol=0, rtol=0)
-            torch.testing.assert_close(sample[1][:25], reference[1], atol=1e-6, rtol=1e-6)
+            torch.testing.assert_close(sample[1][:23], reference[1], atol=1e-6, rtol=1e-6)
             torch.testing.assert_close(sample[2], reference[2][:4], atol=1e-6, rtol=1e-6)
             torch.testing.assert_close(sample[3], reference[3][:4])
-            assert sample[1][25 + e] == 1
+            assert sample[1][23 + e] == 1
     assert dataset.sample_at(42, 4)[3].tolist() == [False, True, True, True]
     assert len(dataset._groups) <= 2 and len(dataset._videos) <= 3
     dataset.close()
@@ -165,7 +168,7 @@ def test_partial_noncontiguous_ids_task_filters(tiny_root):
     assert list(dataset.by_id) == [99] and len(dataset) == 5
     dataset.stats = dataset.compute_stats()
     assert dataset.stats['count'] == 5
-    assert dataset[0][1].shape == (26,)
+    assert dataset[0][1].shape == (23 + 1,)
     assert dataset[4][3][1:].all()
     metadata_path = tiny_root / 'meta/episodes/chunk-042/file-000.parquet'
     pq.write_table(pa.Table.from_pylist([dataset.episodes[0]]), metadata_path)
@@ -619,6 +622,411 @@ def test_resume_accepts_resynced_files_but_not_changed_data(tiny_root, tmp_path)
     with pytest.raises(ValueError, match='differ from checkpoint'):
         train(parser().parse_args(common + ['--output-dir', str(smoke), '--max-steps', '2', '--stats-max-frames', '2',
                                            '--resume', str(smoke / 'step_00000001.pt')]))
+
+
+def add_episode(root, episode_id=50, begin=200):
+    """Second episode of task `first` (other actions) in its own data file, on the camera segments of episode 42."""
+    path = root / 'meta/episodes/chunk-042/file-000.parquet'
+    episodes = pq.read_table(path).to_pylist()
+    episode = {**episodes[0], 'episode_index': episode_id, 'data/file_index': 1, 'dataset_from_index': begin,
+               'dataset_to_index': begin + 5}
+    pq.write_table(pa.Table.from_pylist(episodes + [episode]), path)
+    rows = [{**row, 'episode_index': episode_id, 'index': begin + row['frame_index'], 'action': [x + 1 for x in row['action']]}
+            for row in pq.read_table(root / 'data/chunk-042/file-000.parquet').to_pylist() if row['episode_index'] == 42]
+    pq.write_table(pa.Table.from_pylist(rows), root / 'data/chunk-042/file-001.parquet')
+
+
+def write_split(path, train_episodes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tasks = {task: {'train': train, 'held_out': []} for task, train in train_episodes.items()}
+    path.write_text(json.dumps({'format': 'isg-episode-split/v1', 'name': 'tiny', 'tasks': tasks}))
+    return path
+
+
+def write_groups(root, groups, format='isg-task-groups/v1'):
+    path = root / 'isg_meta/task_groups.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({'format': format, 'groups': groups}))
+    return path
+
+
+class TinyPolicy(torch.nn.Module):
+    """Stand-in for make_policy in trainer tests that only check data selection and run bookkeeping."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(()))
+
+    def configure_optimizers(self):
+        return torch.optim.AdamW(self.parameters())
+
+    def forward(self, qpos, images, actions, is_pad):
+        return {'loss': self.weight.square()}
+
+
+def test_episode_split_resolution_selects_exactly_the_requested_episodes(tiny_root, tmp_path):
+    add_episode(tiny_root)
+    assert resolve_episode_split(tiny_root, 'auto') is None  # no isg_meta/train_split.json: unchanged behaviour
+    everything = B1KDataset(tiny_root)
+    assert list(everything.by_id) == [42, 50, 99]
+    path = write_split(tiny_root / 'isg_meta/train_split.json', {'first': [42], 'second': [99]})
+    split = resolve_episode_split(tiny_root, 'auto')
+    assert split == {'file': str(path.resolve()), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                     'format': 'isg-episode-split/v1', 'name': 'tiny', 'subset': 'train', 'tasks': ['first', 'second'],
+                     'episodes': [42, 99]}
+    assert resolve_episode_split(tiny_root, 'none') is None
+    assert resolve_episode_split(tiny_root, 'auto', ['second'])['episodes'] == [99]
+    other = write_split(tmp_path / 'other.json', {'first': [50, 42]})
+    assert resolve_episode_split(tiny_root, str(other), ['first'])['episodes'] == [42, 50]
+    dataset = B1KDataset(tiny_root, split['tasks'], episodes=split['episodes'])
+    assert list(dataset.by_id) == [42, 99] and dataset.task_map == {7: 'first', 9: 'second'} and len(dataset) == 10
+    # The fingerprint hashes the selected episode rows, so statistics caches and resume checks are per selection.
+    assert dataset.fingerprint() != everything.fingerprint()
+    with pytest.raises(ValueError, match=r"\['unavailable'\] have no entry in episode split .*train_split\.json"):
+        resolve_episode_split(tiny_root, 'auto', ['first', 'unavailable'])
+    with pytest.raises(FileNotFoundError, match='missing.json'):
+        resolve_episode_split(tiny_root, str(tmp_path / 'missing.json'))
+    (tmp_path / 'other_format.json').write_text(json.dumps({'format': 'isg-episode-split/v0', 'tasks': {}}))
+    with pytest.raises(ValueError, match='not an isg-episode-split/v1'):
+        resolve_episode_split(tiny_root, str(tmp_path / 'other_format.json'))
+    with pytest.raises(ValueError, match=r"Requested episodes \[99\] are not episodes of the selected tasks.*'second'"):
+        B1KDataset(tiny_root, ['first'], episodes=[42, 99])
+    with pytest.raises(ValueError, match=r'Requested episodes \[77\]'):
+        B1KDataset(tiny_root, ['first'], episodes=[42, 77])
+    (tiny_root / 'data/chunk-042/file-001.parquet').unlink()
+    assert list(B1KDataset(tiny_root, ['first']).by_id) == [42]  # unrequested incomplete episodes are still skipped
+    with pytest.raises(FileNotFoundError, match='Requested episode 50 is incomplete'):
+        B1KDataset(tiny_root, ['first'], episodes=[42, 50])
+
+
+def test_episode_split_is_recorded_and_the_checkpoint_selection_is_authoritative_on_resume(tiny_root, tmp_path,
+                                                                                         monkeypatch, caplog):
+    monkeypatch.setattr('b1k_training.make_policy', lambda *args, **kwargs: TinyPolicy())
+    add_episode(tiny_root)
+    split_file = write_split(tiny_root / 'isg_meta/train_split.json', {'first': [42], 'second': [99]})
+    expected = resolve_episode_split(tiny_root)
+    common = ['--dataset-path', str(tiny_root), '--device', 'cpu', '--num-workers', '0', '--batch-size', '2',
+              '--image-size', '16', '16', '--save-every', '1', '--export-every', '1']
+    split_run, plain_run = tmp_path / 'split', tmp_path / 'plain'
+    caplog.set_level('INFO', logger='b1k_training')
+    first = train(parser().parse_args(common + ['--output-dir', str(split_run), '--max-steps', '1']))
+    assert f'Episode split tiny ({split_file.resolve()}, sha256 {expected["sha256"][:12]}): 2 train episodes' in caplog.text
+    run = json.loads((split_run / 'run.json').read_text())
+    assert run['episode_split'] == expected and run['train_config']['episode_split'] == 'auto'
+    assert run['conditioning']['episodes'] == 2 and run['conditioning']['data_split'] == 'train'
+    for saved in (first, split_run / 'export_queue/eval/step_00000001.pt'):  # torch.load(weights_only=True)
+        assert load_checkpoint(saved)['episode_split'] == expected
+    plain = train(parser().parse_args(common + ['--output-dir', str(plain_run), '--max-steps', '1',
+                                                '--episode-split', 'none']))
+    assert load_checkpoint(plain)['episode_split'] is None
+    assert json.loads((plain_run / 'run.json').read_text())['conditioning']['episodes'] == 3
+    fingerprints = [load_checkpoint(path)['normalization']['fingerprint'] for path in (first, plain)]
+    assert fingerprints[0] != fingerprints[1]
+    other = write_split(tmp_path / 'other.json', {'first': [42, 50]})
+    explicit = train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'explicit'), '--max-steps', '1',
+                                                   '--episode-split', str(other), '--task-names', 'first']))
+    assert load_checkpoint(explicit)['episode_split']['episodes'] == [42, 50]
+    # Without the flag, resume trains on the checkpoint's episodes even after the split file changed ...
+    write_split(split_file, {'first': [50], 'second': [99]})
+    resumed = train(parser().parse_args(common + ['--output-dir', str(split_run), '--max-steps', '2',
+                                                  '--resume', str(first)]))
+    assert load_checkpoint(resumed)['episode_split'] == expected
+    assert json.loads((split_run / 'resume_run.json').read_text())['conditioning']['episodes'] == 2
+    # ... checkpoints from before the option keep training on every episode (no auto-discovery on resume) ...
+    legacy = load_checkpoint(plain)
+    del legacy['episode_split']
+    torch.save(legacy, tmp_path / 'legacy.pt')
+    path = train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'legacy'), '--max-steps', '2',
+                                               '--resume', str(tmp_path / 'legacy.pt')]))
+    assert load_checkpoint(path)['episode_split'] is None
+    assert json.loads((tmp_path / 'legacy/resume_run.json').read_text())['conditioning']['episodes'] == 3
+    # ... and an explicit --episode-split must select exactly the checkpoint's episodes.
+    for spec in ('auto', 'none'):
+        with pytest.raises(ValueError, match='--episode-split .* differs from checkpoint'):
+            train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'refused'), '--max-steps', '3',
+                                                '--resume', str(resumed), '--episode-split', spec]))
+    same = write_split(tmp_path / 'same.json', {'first': [42], 'second': [99]})
+    path = train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'same'), '--max-steps', '3',
+                                               '--resume', str(resumed), '--episode-split', str(same)]))
+    assert load_checkpoint(path)['episode_split'] == expected
+
+
+def test_task_groups_expand_to_the_tasks_they_reach(tiny_root):
+    assert expand_task_groups(tiny_root, None) is None
+    assert expand_task_groups(tiny_root, ['second', 'typo']) == ['second', 'typo']  # no group file: unchanged
+    write_groups(tiny_root, {'firsts': ['first'], 'pair': ['firsts', 'second'], 'all': ['pair', 'unavailable']})
+    assert expand_task_groups(tiny_root, 'firsts') == ['first']
+    assert expand_task_groups(tiny_root, ['all']) == ['first', 'second', 'unavailable']
+    assert expand_task_groups(tiny_root, ['second', 'pair', 'first']) == ['second', 'first']
+    with pytest.raises(ValueError, match=r"Unknown task or task group 'typo'; groups in .*task_groups\.json: "
+                                         r"\['all', 'firsts', 'pair'\]"):
+        expand_task_groups(tiny_root, ['first', 'typo'])
+    for groups, error in [({'outer': ['inner'], 'inner': ['frist']},
+                           r"Task group 'inner' in .* lists unknown task or group 'frist'"),
+                          ({'outer': ['inner'], 'inner': ['outer']}, 'Task group cycle outer -> inner -> outer'),
+                          ({'outer': ['first'], 'first': ['second']}, "'first' is both a task and a task group"),
+                          ({'outer': []}, "Task group 'outer' .* must be a nonempty list"),
+                          ({'outer': 'first'}, "Task group 'outer' .* must be a nonempty list")]:
+        write_groups(tiny_root, groups)
+        with pytest.raises(ValueError, match=error):
+            expand_task_groups(tiny_root, ['outer'])
+        assert expand_task_groups(tiny_root, ['second']) == ['second']  # only the groups reached are checked
+    write_groups(tiny_root, {}, format='isg-task-groups/v0')
+    with pytest.raises(ValueError, match='not an isg-task-groups/v1 task group file'):
+        expand_task_groups(tiny_root, ['first'])
+
+
+def test_a_task_group_trains_on_its_split_episodes_with_their_own_statistics(tiny_root, tmp_path, monkeypatch,
+                                                                             caplog):
+    monkeypatch.setattr('b1k_training.make_policy', lambda *args, **kwargs: TinyPolicy())
+    add_episode(tiny_root)
+    write_split(tiny_root / 'isg_meta/train_split.json', {'first': [50], 'second': [99]})
+    write_groups(tiny_root, {'firsts': ['first'], 'pair': ['firsts', 'second']})
+    common = ['--dataset-path', str(tiny_root), '--device', 'cpu', '--num-workers', '0', '--batch-size', '2',
+              '--image-size', '16', '16', '--save-every', '1', '--export-every', '1']
+    run_dir = tmp_path / 'group'
+    caplog.set_level('INFO', logger='b1k_training')
+    first = train(parser().parse_args(common + ['--output-dir', str(run_dir), '--max-steps', '1',
+                                                '--task-names', 'firsts']))
+    assert "--task-names ['firsts'] select the tasks ['first']" in caplog.text
+    run = json.loads((run_dir / 'run.json').read_text())
+    assert run['train_config']['task_names'] == ['firsts'] and run['task_map'] == {'7': 'first'}
+    assert run['episode_split']['tasks'] == ['first'] and run['episode_split']['episodes'] == [50]
+    # Statistics cover the group's split episodes alone: episode 50, not episode 42 of the same task.
+    stats = B1KDataset(tiny_root, ['first'], episodes=[50]).compute_stats()
+    assert stats['count'] == 5 and stats != B1KDataset(tiny_root, ['first']).compute_stats()
+    assert load_checkpoint(first)['normalization'] == stats
+    assert (run_dir / f'stats_{stats["fingerprint"][:16]}_all.json').is_file()
+    mixed = train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'mixed'), '--max-steps', '1',
+                                                '--task-names', 'second', 'pair']))
+    assert load_checkpoint(mixed)['episode_split']['episodes'] == [50, 99]
+    assert load_checkpoint(mixed)['task_map'] == {7: 'first', 9: 'second'}
+    # Resume expands --task-names again and must arrive at the checkpoint's tasks.
+    resumed = train(parser().parse_args(common + ['--output-dir', str(run_dir), '--max-steps', '2',
+                                                  '--resume', str(first), '--task-names', 'firsts']))
+    assert load_checkpoint(resumed)['task_map'] == {7: 'first'}
+    write_groups(tiny_root, {'firsts': ['first', 'second']})
+    with pytest.raises(ValueError, match=r"--task-names \['firsts'\] select \['first', 'second'\], but the checkpoint "
+                                         r"trained on \['first'\]"):
+        train(parser().parse_args(common + ['--output-dir', str(run_dir), '--max-steps', '3',
+                                            '--resume', str(resumed), '--task-names', 'firsts']))
+
+
+def test_frame_cache_builder_accepts_task_groups(tiny_root, tmp_path, monkeypatch):
+    import b1k_frame_cache
+    write_groups(tiny_root, {'firsts': ['first']})
+    built = []
+    monkeypatch.setattr(b1k_frame_cache, 'build_frame_cache', lambda dataset, *args, **kwargs: built.append(
+        dict(dataset.task_map)))
+    b1k_frame_cache.main(['--dataset-path', str(tiny_root), '--cache-dir', str(tmp_path / 'cache'),
+                          '--task-names', 'firsts', '--verify', '0'])
+    assert built == [{7: 'first'}]
+
+
+def write_settle_windows(root, programs, format='isg-settle-windows/v1'):
+    lengths = {ep['episode_index']: ep['length']
+               for ep in pq.read_table(root / 'meta/episodes/chunk-042/file-000.parquet').to_pylist()}
+    path = root / 'isg_meta/settle_windows.json'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({'format': format, 'episodes': {
+        str(episode): {'length': lengths[episode], 'program_length': program} for episode, program in programs.items()}}))
+    return path
+
+
+def truncated_copy(root, destination, programs):
+    """The physical cut at the program end that --settle-steps 0 replaces (what truncate-isg-settle.py writes)."""
+    shutil.copytree(root, destination)
+    data = destination / 'data/chunk-042/file-000.parquet'
+    rows = [row for row in pq.read_table(data).to_pylist() if row['frame_index'] < programs[row['episode_index']]]
+    pq.write_table(pa.Table.from_pylist(rows), data, row_group_size=3)
+    meta = destination / 'meta/episodes/chunk-042/file-000.parquet'
+    pq.write_table(pa.Table.from_pylist([
+        {**ep, 'length': programs[ep['episode_index']],
+         'dataset_to_index': ep['dataset_from_index'] + programs[ep['episode_index']]}
+        for ep in pq.read_table(meta).to_pylist()]), meta)
+    return destination
+
+
+def test_settle_steps_specs_are_canonical_and_fractions_exact():
+    for spec, canonical in [('all', 'all'), ('0', '0'), ('010', '10'), (10, '10'), ('0.20', '0.2'), ('.5', '0.5'),
+                            ('1.', '1.0'), ('1.0', '1.0'), ('10.0', '10.0'), ('0.0', '0.0'), (' 0.1 ', '0.1')]:
+        assert parse_settle_steps(spec) == canonical
+    for spec in ('-1', '1e-1', '0.2%', 'half', '', '.', 'none'):
+        with pytest.raises(ValueError, match='--settle-steps must be all, a number of frames'):
+            parse_settle_steps(spec)
+    assert settle_frames('0.55', 100) == 55  # math.ceil(0.55 * 100) is 56 in floating point
+    assert settle_frames('0.2', 7) == 2 and settle_frames('1.0', 7) == 7 and settle_frames('1', 7) == 1
+    assert settle_frames('0', 7) == 0 and settle_frames('0.0', 7) == 0
+
+
+def test_settle_steps_cut_episodes_at_load_time_like_a_truncated_copy(tiny_root, tmp_path, caplog):
+    everything = B1KDataset(tiny_root, chunk_size=4, image_size=(16, 16), goal_views=['zed_link'])
+    with pytest.raises(FileNotFoundError, match=r'--settle-steps 0 needs .*isg_meta/settle_windows\.json'):
+        B1KDataset(tiny_root, settle_steps='0')
+    path = write_settle_windows(tiny_root, {42: 3, 99: 2})
+    assert B1KDataset(tiny_root, settle_steps='all').fingerprint() == everything.fingerprint()
+    caplog.set_level('INFO', logger='b1k_dataset')
+    settled = B1KDataset(tiny_root, chunk_size=4, image_size=(16, 16), goal_views=['zed_link'], settle_steps='0')
+    assert settled.settle == {'spec': '0', 'file': str(path.resolve()),
+                              'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                              'format': 'isg-settle-windows/v1', 'frames': 5, 'settle_frames': 0,
+                              'recorded_frames': 10, 'capped_episodes': 0}
+    assert (f'Settle steps 0 ({path.resolve()}, sha256 {settled.settle["sha256"][:12]}): 5 of 10 recorded frames'
+            in caplog.text)
+    assert settled.lengths.tolist() == [3, 2] and len(settled) == 5
+    assert settled.fingerprint() != everything.fingerprint()
+    # Everything matches cutting the files at the program end, except the goal: still the last recorded frame.
+    copy = B1KDataset(truncated_copy(tiny_root, tmp_path / 'truncated', {42: 3, 99: 2}), chunk_size=4,
+                      image_size=(16, 16), goal_views=['zed_link'])
+    stats = copy.compute_stats()
+    assert {**settled.compute_stats(), 'fingerprint': None} == {**stats, 'fingerprint': None}
+    settled.stats = copy.stats = stats
+    for ep in copy.episodes:
+        for frame in range(ep['length']):
+            ours, theirs = settled.sample_at(ep['episode_index'], frame), copy.sample_at(ep['episode_index'], frame)
+            for column in (0, 1, 2, 3, 5):
+                torch.testing.assert_close(ours[column], theirs[column], atol=0, rtol=0)
+    assert settled.sample_at(42, 2)[3].tolist() == [False, True, True, True]
+    with pytest.raises(IndexError):
+        settled.raw_sample(42, 3)
+    np.testing.assert_array_equal(settled.goal_table, everything.goal_table)
+    assert not np.array_equal(settled.goal_table, copy.goal_table)
+    np.testing.assert_array_equal(settled._ensure_table()['action'], copy._ensure_table()['action'])
+    np.testing.assert_array_equal(settled._goal_frame(settled.episodes[0], 0), everything.goal_table[0, 0])
+    # Fractions round up; requests beyond an episode's recorded window keep the whole window.
+    for spec, lengths, capped in [('1', [4, 3], 0), ('0.5', [5, 3], 0), ('0.7', [5, 4], 1), ('10', [5, 5], 2)]:
+        dataset = B1KDataset(tiny_root, settle_steps=spec)
+        assert dataset.lengths.tolist() == lengths and dataset.settle['capped_episodes'] == capped
+    assert dataset.fingerprint() == everything.fingerprint()  # every recorded frame: the same statistics cache
+    assert B1KDataset(tiny_root, ['first'], settle_steps='0').lengths.tolist() == [3]
+    write_settle_windows(tiny_root, {42: 3})
+    with pytest.raises(ValueError, match=r'has no settle window for episode 99 of length 5 \(entry None\)'):
+        B1KDataset(tiny_root, settle_steps='0')
+    assert len(B1KDataset(tiny_root, ['first'], settle_steps='0')) == 3  # only selected episodes need an entry
+    path.write_text(json.dumps({'format': 'isg-settle-windows/v1', 'episodes': {
+        '42': {'length': 6, 'program_length': 3}, '99': {'length': 5, 'program_length': 2}}}))
+    with pytest.raises(ValueError, match=r'episode 42 of length 5 .*regenerate it for this dataset'):
+        B1KDataset(tiny_root, settle_steps='0')
+    write_settle_windows(tiny_root, {42: 3, 99: 2}, format='isg-settle-windows/v0')
+    with pytest.raises(ValueError, match='not an isg-settle-windows/v1 file'):
+        B1KDataset(tiny_root, settle_steps='0')
+
+
+def test_settle_steps_are_recorded_and_the_checkpoint_value_is_authoritative_on_resume(tiny_root, tmp_path,
+                                                                                     monkeypatch):
+    monkeypatch.setattr('b1k_training.make_policy', lambda *args, **kwargs: TinyPolicy())
+    common = ['--dataset-path', str(tiny_root), '--device', 'cpu', '--num-workers', '0', '--batch-size', '2',
+              '--image-size', '16', '16', '--save-every', '1', '--export-every', '1']
+    with pytest.raises(FileNotFoundError, match='settle_windows.json'):
+        train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'missing'), '--max-steps', '1',
+                                            '--settle-steps', '0']))
+    write_settle_windows(tiny_root, {42: 3, 99: 2})
+    with pytest.raises(ValueError, match='--settle-steps must be all'):
+        train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'typo'), '--max-steps', '1',
+                                            '--settle-steps', '20%']))
+    run_dir = tmp_path / 'settled'
+    first = train(parser().parse_args(common + ['--output-dir', str(run_dir), '--max-steps', '1',
+                                                '--settle-steps', '00']))
+    expected = B1KDataset(tiny_root, settle_steps='0').settle
+    run = json.loads((run_dir / 'run.json').read_text())
+    assert run['settle_steps'] == expected and run['train_config']['settle_steps'] == '0'
+    assert run['conditioning']['settle_steps'] == '0' and run['conditioning']['frames'] == 5
+    assert run['normalization']['count'] == 5
+    for saved in (first, run_dir / 'export_queue/eval/step_00000001.pt'):  # torch.load(weights_only=True)
+        assert load_checkpoint(saved)['settle_steps'] == expected
+    plain = train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'plain'), '--max-steps', '1']))
+    assert load_checkpoint(plain)['settle_steps'] is None and load_checkpoint(plain)['normalization']['count'] == 10
+    assert json.loads((tmp_path / 'plain/run.json').read_text())['conditioning']['settle_steps'] == 'all'
+    # Resume keeps the checkpoint's value; an explicit value must be the same one.
+    resumed = train(parser().parse_args(common + ['--output-dir', str(run_dir), '--max-steps', '2',
+                                                  '--resume', str(first)]))
+    assert load_checkpoint(resumed)['settle_steps'] == expected
+    assert json.loads((run_dir / 'resume_run.json').read_text())['conditioning']['frames'] == 5
+    for spec in ('all', '1', '0.0'):
+        with pytest.raises(ValueError, match=rf'--settle-steps {spec} differs from checkpoint \(0\)'):
+            train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'refused'), '--max-steps', '3',
+                                                '--resume', str(resumed), '--settle-steps', spec]))
+    same = train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'same'), '--max-steps', '3',
+                                               '--resume', str(resumed), '--settle-steps', '0']))
+    assert load_checkpoint(same)['settle_steps'] == expected
+    # Checkpoints from before the option resume on every recorded frame.
+    legacy = load_checkpoint(plain)
+    del legacy['settle_steps']
+    torch.save(legacy, tmp_path / 'legacy.pt')
+    path = train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'legacy'), '--max-steps', '2',
+                                               '--resume', str(tmp_path / 'legacy.pt')]))
+    assert load_checkpoint(path)['settle_steps'] is None
+    with pytest.raises(ValueError, match=r'--settle-steps 0 differs from checkpoint \(all\)'):
+        train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'legacy-refused'), '--max-steps', '2',
+                                            '--resume', str(tmp_path / 'legacy.pt'), '--settle-steps', '0']))
+
+
+def test_gripper_state_sums_each_finger_pair_into_one_opening():
+    state = np.arange(61, dtype=np.float32) + 100
+    summed, fingers = extract_state(state), extract_state(state, 'fingers')
+    np.testing.assert_array_equal(fingers, state[STATE_INDICES])
+    np.testing.assert_array_equal(summed, np.concatenate([state[0:3], state[53:57], state[3:10], [state[24] + state[25]],
+                                                          state[28:35], [state[49] + state[50]]]))
+    assert summed.shape == (proprio_dim('sum'),) == (23,) and fingers.shape == (proprio_dim('fingers'),) == (25,)
+    np.testing.assert_array_equal(extract_state(np.stack([state, state + 1]))[1], extract_state(state + 1))
+    with pytest.raises(ValueError, match="Unknown gripper_state 'mean'"):
+        extract_state(state, 'mean')
+    stats = {'qpos_mean': [0.] * 25, 'qpos_std': [1.] * 25}
+    with pytest.raises(ValueError, match="hold 25 proprioception values; gripper_state 'sum' has 23"):
+        preprocess_state(state, 7, stats, {7: 'first'})
+    with pytest.raises(ValueError, match='task_onehot must be a bool'):  # the layout is keyword-only in effect
+        preprocess_state(state, 7, stats, {7: 'first'}, 'fingers')
+    torch.testing.assert_close(preprocess_state(state, 7, stats, {7: 'first'}, gripper_state='fingers'),
+                               torch.from_numpy(np.concatenate([fingers, [1.]]).astype(np.float32)))
+
+
+def test_summed_gripper_state_statistics_samples_and_legacy_fingerprint(tiny_root):
+    summed = B1KDataset(tiny_root, chunk_size=4, image_size=(16, 16))
+    fingers = B1KDataset(tiny_root, chunk_size=4, image_size=(16, 16), gripper_state='fingers')
+    assert summed.gripper_state == 'sum'
+    stats, finger_stats = summed.compute_stats(), fingers.compute_stats()
+    assert len(stats['qpos_mean']) == len(stats['qpos_std']) == 23 and len(finger_stats['qpos_mean']) == 25
+    assert stats['action_mean'] == finger_stats['action_mean'] and stats['action_std'] == finger_stats['action_std']
+    states = np.stack([summed.raw_sample(ep['episode_index'], frame)[1]
+                       for ep in summed.episodes for frame in range(ep['length'])])
+    np.testing.assert_allclose(stats['qpos_mean'], extract_state(states).astype(np.float64).mean(0), rtol=1e-6)
+    summed.stats = stats
+    assert summed.sample_at(42, 1)[1].shape == (23 + 2,)
+    # `fingers` keeps the fingerprint (and statistics cache) of runs from before the option; `sum` gets its own.
+    files = sorted({fingers.data_path(ep) for ep in fingers.episodes})
+    legacy = {'root': str(fingers.root), 'episodes': fingers.episodes,
+              'files': [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in files],
+              'state_indices': STATE_INDICES, 'std_correction': 1}
+    assert fingers.fingerprint() == hashlib.sha256(json.dumps(legacy, sort_keys=True).encode()).hexdigest()
+    assert summed.fingerprint() != fingers.fingerprint()
+    with pytest.raises(ValueError, match="Unknown gripper_state 'both'"):
+        B1KDataset(tiny_root, gripper_state='both')
+
+
+def test_gripper_state_is_recorded_and_legacy_checkpoints_resume_and_serve(tiny_root, tmp_path):
+    from b1k_server import PolicyPredictor
+    common = ['--dataset-path', str(tiny_root), '--batch-size', '2', '--num-workers', '0', '--device', 'cpu',
+              '--chunk-size', '4', '--image-size', '32', '32', '--hidden-dim', '32', '--dim-feedforward', '64',
+              '--enc-layers', '1', '--dec-layers', '1', '--nheads', '4', '--no-pretrained-backbone', '--save-every', '1']
+    summed = load_checkpoint(train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'sum'),
+                                                                 '--max-steps', '1'])))
+    assert summed['adapter_config']['gripper_state'] == 'sum' and summed['train_config']['gripper_state'] == 'sum'
+    assert summed['model_config']['state_dim'] == 23 + 2 and len(summed['normalization']['qpos_mean']) == 23
+    fingers = load_checkpoint(train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'fingers'),
+                                                                  '--max-steps', '1', '--gripper-state', 'fingers'])))
+    assert fingers['adapter_config']['gripper_state'] == 'fingers' and fingers['model_config']['state_dim'] == 25 + 2
+    # A checkpoint from before the option (no recorded layout) resumes and serves with both finger positions.
+    legacy = dict(fingers, adapter_config={k: v for k, v in fingers['adapter_config'].items() if k != 'gripper_state'})
+    torch.save(legacy, tmp_path / 'legacy.pt')
+    resumed = load_checkpoint(train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'legacy'),
+                                                                  '--max-steps', '2', '--resume', str(tmp_path / 'legacy.pt')])))
+    assert 'gripper_state' not in resumed['adapter_config'] and resumed['model_config']['state_dim'] == 25 + 2
+    with pytest.raises(ValueError, match=r'--gripper-state sum differs from checkpoint \(fingers\)'):
+        train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'refused'), '--max-steps', '2',
+                                            '--resume', str(tmp_path / 'legacy.pt'), '--gripper-state', 'sum']))
+    for checkpoint, layout in ((summed, 'sum'), (load_checkpoint(tmp_path / 'legacy.pt'), 'fingers')):
+        session = Session(PolicyPredictor(checkpoint, 'cpu'), checkpoint, action_horizon=2)
+        assert session.gripper_state == layout and session.act(observation()).shape == (1, 23)
 
 
 def test_fused_attention_matches_explicit_attention_weights_path():
@@ -1110,8 +1518,9 @@ def test_preprocessing_session_replan_batch_tasks_and_transaction():
     first = session.act(obs)
     assert first.shape == (2, 23) and first.dtype == np.float32
     qpos, images = predictor.calls[-1]
+    assert session.gripper_state == 'fingers' and qpos.shape == (2, 25 + 2)  # no recorded layout: 25 values
     torch.testing.assert_close(qpos[0], preprocess_state(obs['robot_r1::proprio'][0], 7,
-                                                       session.stats, session.task_map))
+                                                       session.stats, session.task_map, gripper_state='fingers'))
     torch.testing.assert_close(images[0, 0], preprocess_image(obs[OBS_KEYS[0]][0], (16, 16)))
     invalid = observation(2, 777)
     old_positions = session.positions.copy()
