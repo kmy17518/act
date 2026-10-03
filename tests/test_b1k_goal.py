@@ -81,12 +81,12 @@ def test_dataset_goal_table_is_the_episode_last_frame_and_task_id_column(tiny_ro
         # tiny_root frames hold value frame_index * 10 + camera; the last observation of episode e is frame e*8+c*2+5
         assert int(dataset.goal_table[position, 0, 0, 0, 0]) == (position * 8 + 5) * 10
         images, qpos, actions, is_pad, goal, task_id = dataset.sample_at(ep['episode_index'], 0)
-        assert qpos.shape == (25,) and goal.shape == (2, 16, 16, 3) and goal.dtype == torch.uint8
+        assert qpos.shape == (23,) and goal.shape == (2, 16, 16, 3) and goal.dtype == torch.uint8
         assert int(task_id) == ep['task_index'] and torch.equal(goal, torch.from_numpy(dataset.goal_table[position]))
     onehot = B1KDataset(tiny_root, chunk_size=4, image_size=(16, 16))
     onehot.stats = dataset.stats
     sample = onehot.sample_at(99, 2)
-    assert sample[1].shape == (27,) and sample[4].shape == (0, 16, 16, 3) and int(sample[5]) == 9
+    assert sample[1].shape == (23 + 2,) and sample[4].shape == (0, 16, 16, 3) and int(sample[5]) == 9
     with pytest.raises(ValueError, match='Goal views'):
         B1KDataset(tiny_root, chunk_size=4, image_size=(16, 16), goal_views=['zed_link', 'zed_link'])
     with pytest.raises(ValueError, match='goal_source'):
@@ -284,7 +284,7 @@ def test_train_resume_serve_goal_conditioned_policy(tiny_root, tmp_path, fusion)
     first = load_checkpoint(first_path)
     config, adapter = first['model_config'], first['adapter_config']
     assert config['regime'] == 'image' and config['goal_fusion'] == fusion and config['goal_views'] == ['zed_link']
-    assert config['state_dim'] == 25 and config['task_onehot'] is False and adapter['task_conditioning'] == 'none'
+    assert config['state_dim'] == 23 and config['task_onehot'] is False and adapter['task_conditioning'] == 'none'
     assert adapter['goal_source'] == 'episode_last' and adapter['goal_observation_keys'] == [GOAL_OBS_KEYS['zed_link']]
     assert first['conditioning']['regime'] == 'image' and first['conditioning']['goal']['fusion'] == fusion
     assert first['conditioning']['language']['implementation'] == 'none' and first['conditioning']['task_onehot'] is False
@@ -371,8 +371,9 @@ def test_small_policy_learns_two_goals_from_the_same_start(tmp_path, fusion):
     """Acceptance check: identical observations, two reachable goals, opposite actions; inference uses the zero latent."""
     torch.set_num_threads(2)
     root = two_goal_root(tmp_path)
+    # gripper_state='fingers': the 25-value state these tuned learning rates were measured with
     dataset = B1KDataset(root, chunk_size=4, image_size=(16, 16), goal_views=['zed_link'], goal_source='goal_key',
-                         task_onehot=False)
+                         task_onehot=False, gripper_state='fingers')
     dataset.stats = dataset.compute_stats()
     torch.manual_seed(0)
     # KL weight 10 (the B1K recipe): the style latent must stay close to the prior, so the decoder has to read the
