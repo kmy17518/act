@@ -79,6 +79,7 @@ class Session:
         self.predictor = predictor
         self.task_map = checkpoint['task_map']
         self.stats = checkpoint['normalization']
+        self.gripper_state = checkpoint['adapter_config'].get('gripper_state', 'fingers')
         self.image_size = checkpoint['adapter_config']['image_size']
         self.policy_class = policy_class(checkpoint['model_config'])
         self.chunk_size = checkpoint['model_config']['num_queries']
@@ -130,7 +131,7 @@ class Session:
             raise ValueError('robot_r1::proprio must have shape (61,) or (B,61)')
         batch_size = len(state)
         task_ids = self.resolve_tasks(observation.get('task_id'), batch_size)
-        qpos = torch.stack([preprocess_state(s, int(task), self.stats, self.task_map)
+        qpos = torch.stack([preprocess_state(s, int(task), self.stats, self.task_map, self.gripper_state)
                             for s, task in zip(state, task_ids)])
         cameras = []
         for key in OBS_KEYS:
