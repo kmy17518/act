@@ -29,6 +29,12 @@ GOAL_FUSIONS = ('none', 'early', 'late')
 GOAL_ENCODERS = ('shared_base', 'separate_base', 'frozen')
 # Late fusion's goal tokens: the full projected feature grid, or its spatial mean as one token per view.
 GOAL_TOKENS = ('grid', 'pooled')
+# Late fusion: the goal tokens' position codes (the camera grid's sine code, or none: the goal tag only), their
+# content (the projected goal features, or their difference to the projected current features of the same camera),
+# and where they enter (the encoder memory, the decoder's cross-attention memory only, or the action queries).
+GOAL_POSITIONS = ('sine', 'none')
+GOAL_CONTENTS = ('goal', 'diff')
+GOAL_ENTRIES = ('encoder', 'decoder', 'queries')
 
 
 def parse_goal_tag_init(spec):
@@ -68,7 +74,8 @@ class DETRVAE(nn.Module):
     def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, action_dim=None,
                  mt_act_language_dim=None, camera_batch=False, goal_fusion='none', goal_views=(),
                  goal_role_embedding=True, goal_encoder='shared_base', language_on_goal_encoder=False,
-                 goal_tag_init='zero', goal_stem_init='zero', goal_tokens='grid'):
+                 goal_tag_init='zero', goal_stem_init='zero', goal_tokens='grid', goal_pos='sine', goal_content='goal',
+                 goal_entry='encoder', goal_stem_gain=None, goal_stem_diff=False):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -106,6 +113,15 @@ class DETRVAE(nn.Module):
             goal_tokens: late fusion's goal tokens, 'grid' (the projected feature grid with the spatial positions)
                 or 'pooled' (its spatial mean, one token per view with no spatial position, appended after every
                 camera token).
+            goal_pos: late fusion's goal-token position codes, 'sine' (the camera grid's) or 'none' (goal tag only).
+            goal_content: late fusion's goal-token content, 'goal' (projected goal features) or 'diff' (projected goal
+                features minus the projected current features of the goal view's camera, location by location).
+            goal_entry: where late fusion's goal tokens enter: 'encoder' (encoder memory), 'decoder' (appended to the
+                encoder output only: the decoder's cross-attention reads them, the encoder never processes them) or
+                'queries' (the pooled goal token of every view, summed, is added to every action query's position
+                embedding; requires goal_tokens='pooled' and no goal tag).
+            goal_stem_gain / goal_stem_diff: early fusion's learned per-filter goal gain (its start) and explicit
+                difference channel (see backbone.PairedConv2d).
         """
         super().__init__()
         self.num_queries = num_queries
@@ -118,10 +134,24 @@ class DETRVAE(nn.Module):
         if goal_tokens not in GOAL_TOKENS:
             raise ValueError(f'goal_tokens must be one of {GOAL_TOKENS}, got {goal_tokens!r}')
         goal_tag_init = parse_goal_tag_init(goal_tag_init)
+        for value, choices, label in [(goal_pos, GOAL_POSITIONS, 'goal_pos'), (goal_content, GOAL_CONTENTS, 'goal_content'),
+                                      (goal_entry, GOAL_ENTRIES, 'goal_entry')]:
+            if value not in choices:
+                raise ValueError(f'{label} must be one of {choices}, got {value!r}')
+        late_options = (goal_pos, goal_content, goal_entry) != ('sine', 'goal', 'encoder')
+        early_options = goal_stem_gain is not None or bool(goal_stem_diff)
+        if late_options and goal_fusion != 'late':
+            raise ValueError('goal_pos / goal_content / goal_entry apply to late fusion only')
+        if early_options and goal_fusion != 'early':
+            raise ValueError('goal_stem_gain / goal_stem_diff apply to early fusion only')
+        if goal_entry == 'queries' and (goal_tokens != 'pooled' or goal_role_embedding):
+            raise ValueError("goal_entry='queries' adds pooled goal tokens to the action queries: it requires "
+                             "goal_tokens='pooled' and no goal role embedding")
         self.goal_fusion = goal_fusion
         self.goal_views = tuple(int(view) for view in goal_views) if goal_fusion != 'none' else ()
         self.goal_encoder = goal_encoder
         self.goal_tokens = goal_tokens
+        self.goal_pos, self.goal_content, self.goal_entry = goal_pos, goal_content, goal_entry
         self.language_on_goal_encoder = bool(language_on_goal_encoder)
         self.goal_backbone = None
         self.goal_role_embed = None
@@ -181,7 +211,7 @@ class DETRVAE(nn.Module):
                 raise ValueError('Early fusion pairs the goal with its camera inside the shared stem; use goal_encoder=shared_base')
             if goal_tokens != 'grid':
                 raise ValueError('goal_tokens applies to late fusion only')
-            self.backbones[0][0].pair_stem(goal_stem_init)
+            self.backbones[0][0].pair_stem(goal_stem_init, goal_stem_gain, bool(goal_stem_diff))
         elif goal_fusion == 'late':
             if goal_stem_init != 'zero':
                 raise ValueError('goal_stem_init applies to early fusion only')
@@ -209,6 +239,12 @@ class DETRVAE(nn.Module):
         if self.goal_encoder == 'frozen' and self.goal_backbone is not None:
             self.goal_backbone.eval()
         return self
+
+    @staticmethod
+    def goal_difference(current, goal, goal_present, view):
+        """Early fusion's explicit difference channel `goal - current`, zero for an absent goal."""
+        difference = goal - current
+        return difference if goal_present is None else difference * goal_present[:, view, None, None, None]
 
     def goal_token_layout(self, feature_width):
         """Memory layout of late fusion: (extra tokens, camera token columns, goal token columns) per feature row."""
@@ -241,6 +277,7 @@ class DETRVAE(nn.Module):
                     goal = goal * goal_valid.to(goal.dtype)[:, :, None, None, None]
         elif goal is not None and goal.shape[1:2] != (0,):
             raise ValueError('This policy has no goal-image path; do not pass goal images')
+        goal_present = None if goal_valid is None else goal_valid.to(image.dtype)
         task_emb = None
         if self.mt_act:
             if lang_emb is None:
@@ -298,10 +335,17 @@ class DETRVAE(nn.Module):
                     goal_half = torch.zeros_like(stacked)
                     for view, cam_id in enumerate(self.goal_views):
                         goal_half[:, cam_id] = goal[:, view]
-                    stacked = torch.cat([stacked, goal_half], dim=2)
+                    parts = [stacked, goal_half]
+                    if self.backbones[0][0].body.conv1.goal_diff_weight is not None:
+                        diff = torch.zeros_like(stacked)
+                        for view, cam_id in enumerate(self.goal_views):
+                            diff[:, cam_id] = self.goal_difference(stacked[:, cam_id], goal[:, view], goal_present, view)
+                        parts.append(diff)
+                    stacked = torch.cat(parts, dim=2)
                 flat = stacked.transpose(0, 1).reshape(ncam * bs, *stacked.shape[2:])
                 features, pos = self.backbones[0](flat, lang_emb=None if lang_emb is None else lang_emb.repeat(ncam, 1))
                 features = self.input_proj(features[0]) # (ncam * bs, hidden, h, w)
+                projected = [features[c * bs:(c + 1) * bs] for c in range(ncam)]
                 # fold camera dimension into width dimension, in camera order (same layout as the per-camera cat)
                 src = features.view(ncam, bs, *features.shape[1:]).permute(1, 2, 3, 0, 4).reshape(
                     bs, features.shape[1], features.shape[2], ncam * features.shape[3])
@@ -314,17 +358,22 @@ class DETRVAE(nn.Module):
                     cam_image = image[:, cam_id]
                     if self.goal_fusion == 'early' and cam_id in self.goal_views:
                         # [current; goal] channel stacking; both halves carry the same normalization
-                        cam_image = torch.cat([cam_image, goal[:, self.goal_views.index(cam_id)]], dim=1)
+                        view = self.goal_views.index(cam_id)
+                        parts = [cam_image, goal[:, view]]
+                        if self.backbones[0][0].body.conv1.goal_diff_weight is not None:
+                            parts.append(self.goal_difference(cam_image, goal[:, view], goal_present, view))
+                        cam_image = torch.cat(parts, dim=1)
                     features, pos = self.backbones[0](cam_image, lang_emb=lang_emb, camera=cam_id) # HARDCODED
                     features = features[0] # take the last layer feature
                     pos = pos[0]
                     all_cam_features.append(self.input_proj(features))
                     all_cam_pos.append(pos)
+                projected = all_cam_features
                 # fold camera dimension into width dimension
                 src = torch.cat(all_cam_features, axis=3)
                 pos = torch.cat(all_cam_pos, axis=3)
             mask = None
-            memory_tokens = memory_pos = None
+            memory_tokens = memory_pos = decoder_tokens = decoder_pos = decoder_mask = query_add = None
             if self.goal_fusion == 'late':
                 # Goal-view tokens: same backbone (or its copy), projection and spatial positions as a camera,
                 # plus the learned goal identity on the positional stream; appended after the current-view tokens.
@@ -336,7 +385,11 @@ class DETRVAE(nn.Module):
                         features, gpos = goal_backbone(goal[:, view], lang_emb=goal_lang, camera=cam_id,
                                                        film_identity=goal_lang is None)
                     features = self.input_proj(features[0])
+                    if self.goal_content == 'diff':
+                        features = features - projected[cam_id]  # the projection's bias cancels
                     gpos = gpos[0]
+                    if self.goal_pos == 'none':
+                        gpos = torch.zeros_like(gpos[:1])
                     if self.goal_tokens == 'pooled':
                         features = features.mean(dim=(2, 3))  # (bs, hidden): one token, no spatial position
                         gpos = torch.zeros_like(features[:1])
@@ -345,7 +398,21 @@ class DETRVAE(nn.Module):
                         gpos = gpos + (role.view(1, -1) if self.goal_tokens == 'pooled' else role.view(1, -1, 1, 1))
                     goal_features.append(features)
                     goal_pos.append(gpos if gpos.shape[0] in (1, bs) else gpos[:bs])
-                if self.goal_tokens == 'pooled':
+                if self.goal_entry == 'queries':
+                    shown = goal_valid.to(goal_features[0].dtype) if goal_valid is not None else None
+                    query_add = sum(f if shown is None else f * shown[:, view, None]
+                                    for view, f in enumerate(goal_features))
+                elif self.goal_entry == 'decoder':
+                    # flattened like the encoder memory: (tokens, batch, hidden), view after view
+                    tokens = [f.unsqueeze(0) if self.goal_tokens == 'pooled' else f.flatten(2).permute(2, 0, 1)
+                              for f in goal_features]
+                    codes = [p.unsqueeze(0).expand(-1, bs, -1) if self.goal_tokens == 'pooled'
+                             else p.expand(bs, -1, -1, -1).flatten(2).permute(2, 0, 1) for p in goal_pos]
+                    decoder_tokens, decoder_pos = torch.cat(tokens, dim=0), torch.cat(codes, dim=0)
+                    if goal_valid is not None:
+                        decoder_mask = torch.cat([(~goal_valid[:, view, None]).expand(-1, t.shape[0])
+                                                  for view, t in enumerate(tokens)], dim=1)
+                elif self.goal_tokens == 'pooled':
                     # Encoder memory [extra tokens, camera tokens, one token per goal view]
                     memory_tokens = torch.stack(goal_features, dim=0)
                     memory_pos = torch.stack(goal_pos, dim=0)
@@ -357,20 +424,21 @@ class DETRVAE(nn.Module):
                     feature_width = goal_features[0].shape[3]
                     src = torch.cat([src, *goal_features], axis=3)
                     pos = torch.cat([pos, *goal_pos], axis=3)
-                if goal_valid is not None and self.goal_tokens == 'grid':
-                    # Key padding mask over the encoder memory: True hides a token. Layout per feature row is
-                    # [camera columns | goal-view columns]; extra tokens (latent, proprio, task) come first.
-                    extra, camera_columns, _ = self.goal_token_layout(feature_width)
-                    grid = torch.zeros(bs, src.shape[2], src.shape[3], dtype=torch.bool, device=src.device)
-                    for view in range(len(self.goal_views)):
-                        start = camera_columns + view * feature_width
-                        grid[:, :, start:start + feature_width] = ~goal_valid[:, view, None, None]
-                    mask = torch.cat([torch.zeros(bs, extra, dtype=torch.bool, device=src.device), grid.flatten(1)], dim=1)
+                    if goal_valid is not None:
+                        # Key padding mask over the encoder memory: True hides a token. Layout per feature row is
+                        # [camera columns | goal-view columns]; extra tokens (latent, proprio, task) come first.
+                        extra, camera_columns, _ = self.goal_token_layout(feature_width)
+                        grid = torch.zeros(bs, src.shape[2], src.shape[3], dtype=torch.bool, device=src.device)
+                        for view in range(len(self.goal_views)):
+                            start = camera_columns + view * feature_width
+                            grid[:, :, start:start + feature_width] = ~goal_valid[:, view, None, None]
+                        mask = torch.cat([torch.zeros(bs, extra, dtype=torch.bool, device=src.device), grid.flatten(1)], dim=1)
             # proprioception features
             proprio_input = self.input_proj_robot_state(qpos)
             hs = self.transformer(src, mask, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight,
                                   decoder_layers=self.decoder_layers_used, task_emb=task_emb,
-                                  memory_tokens=memory_tokens, memory_pos=memory_pos)[0]
+                                  memory_tokens=memory_tokens, memory_pos=memory_pos, decoder_tokens=decoder_tokens,
+                                  decoder_pos=decoder_pos, decoder_mask=decoder_mask, query_add=query_add)[0]
         else:
             if self.mt_act:
                 raise ValueError('MT-ACT requires image backbones')
@@ -526,6 +594,11 @@ def build(args):
         goal_tag_init=getattr(args, 'goal_tag_init', 'zero'),
         goal_stem_init=getattr(args, 'goal_stem_init', 'zero'),
         goal_tokens=getattr(args, 'goal_tokens', 'grid'),
+        goal_pos=getattr(args, 'goal_pos', 'sine'),
+        goal_content=getattr(args, 'goal_content', 'goal'),
+        goal_entry=getattr(args, 'goal_entry', 'encoder'),
+        goal_stem_gain=getattr(args, 'goal_stem_gain', None),
+        goal_stem_diff=bool(getattr(args, 'goal_stem_diff', False)),
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)

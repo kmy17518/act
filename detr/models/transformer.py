@@ -63,9 +63,14 @@ class Transformer(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None, additional_pos_embed=None,
-                decoder_layers=None, task_emb=None, memory_tokens=None, memory_pos=None):
+                decoder_layers=None, task_emb=None, memory_tokens=None, memory_pos=None, decoder_tokens=None,
+                decoder_pos=None, decoder_mask=None, query_add=None):
         """`memory_tokens` / `memory_pos` (tokens, batch, dim), optional: further encoder tokens with their position
-        codes, appended after the flattened feature map (late fusion's pooled goal tokens)."""
+        codes, appended after the flattened feature map (late fusion's pooled goal tokens).
+        `decoder_tokens` / `decoder_pos` (tokens, batch, dim) and `decoder_mask` (batch, tokens; True hides): tokens
+        appended to the encoder *output* only, so the decoder's cross-attention reads them while the encoder never
+        processes them (late fusion with the goal entering the decoder only).
+        `query_add` (batch, dim): added to every action query's position embedding (the goal in the action queries)."""
         # TODO flatten only when input has H and W
         if len(src.shape) == 4: # has H and W
             # flatten NxCxHxW to HWxNxC
@@ -96,8 +101,19 @@ class Transformer(nn.Module):
             pos_embed = pos_embed.unsqueeze(1).repeat(1, bs, 1)
             query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
 
+        if query_add is not None:
+            query_embed = query_embed + query_add.unsqueeze(0)
         tgt = torch.zeros_like(query_embed)
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
+        if decoder_tokens is not None:
+            memory = torch.cat([memory, decoder_tokens], axis=0)
+            pos_embed = torch.cat([pos_embed, decoder_pos.expand(-1, memory.shape[1], -1)], axis=0)
+            if mask is not None or decoder_mask is not None:
+                shown = torch.zeros(memory.shape[1], memory.shape[0] - decoder_tokens.shape[0], dtype=torch.bool,
+                                    device=memory.device)
+                mask = torch.cat([shown if mask is None else mask,
+                                  torch.zeros(memory.shape[1], decoder_tokens.shape[0], dtype=torch.bool,
+                                              device=memory.device) if decoder_mask is None else decoder_mask], dim=1)
         hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
                           pos=pos_embed, query_pos=query_embed, num_layers=decoder_layers)
         hs = hs.transpose(1, 2)

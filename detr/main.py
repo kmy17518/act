@@ -69,12 +69,12 @@ def get_args_parser():
     return parser
 
 
-GOAL_PARAMETER_NAMES = ('goal_weight', 'goal_gain', 'goal_role_embed', 'goal_proj')
+GOAL_PARAMETER_NAMES = ('goal_weight', 'goal_gain', 'goal_diff_weight', 'goal_role_embed', 'goal_proj')
 
 
 def is_goal_parameter(name):
     """Parameters that exist only for goal conditioning and take `lr_goal` when it is set: the goal half of the
-    paired stem (`goal_weight`, `goal_gain`), late fusion's goal identity (`goal_role_embed`) and goal-only
+    paired stem (`goal_weight`, `goal_gain`, `goal_diff_weight`), late fusion's goal identity (`goal_role_embed`) and goal-only
     projections (`goal_proj*`). Shared modules (backbone, `input_proj`) keep their groups."""
     return any(part in GOAL_PARAMETER_NAMES or part.startswith('goal_proj') for part in name.split('.'))
 

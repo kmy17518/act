@@ -93,11 +93,19 @@ class PairedConv2d(nn.Conv2d):
                   fan-in 3*7*7): the goal is visible from step one without pretrained patterns (GC-DP-style);
       copy:SCALE  SCALE times the ImageNet weights: pretrained patterns on the goal half; any SCALE != 1 lets the
                   stem tell the goal from the current image at initialization (1.0 computes W*(current + goal)).
+    `gain` (a float) adds a learned per-filter gain `goal_gain` (out_channels x 1 x 1 x 1, starting at `gain`) on the
+    goal half, whose effective filters are then `goal_gain * goal_weight`: with `copy:1` and gain 0.5 the stem starts
+    as `copy:0.5` but can rescale each goal filter as a whole (the early-fusion counterpart of a goal tag).
+    `diff=True` adds an explicit difference channel: the input is 9 channels `[current; goal; goal - current]` (the
+    caller zeroes both goal parts for an absent goal) and the stem computes `W_obs * current + W_goal * goal +
+    W_diff * (goal - current)` with `goal_diff_weight` (W_diff) starting at zero -- the same function class as the
+    6-channel stem while a goal is present, parameterized so that gradient steps move the response to the
+    goal-current difference directly, and still exactly the base stem for an absent goal.
     A 3-channel input (other cameras, goal-free passes) runs the plain convolution. State-dict keys stay
-    `weight`/`bias`; `goal_weight` is the only addition. These initializations are our controlled engineering
-    choices, not claims about BridgeData's unpublished details.
+    `weight`/`bias`; `goal_weight` (and `goal_gain`, `goal_diff_weight` when enabled) are the only additions. These
+    initializations are our controlled engineering choices, not claims about BridgeData's unpublished details.
     """
-    def __init__(self, conv, init='zero'):
+    def __init__(self, conv, init='zero', gain=None, diff=False):
         super().__init__(conv.in_channels, conv.out_channels, conv.kernel_size, conv.stride, conv.padding,
                          conv.dilation, conv.groups, conv.bias is not None, conv.padding_mode)
         init = parse_goal_stem_init(init)
@@ -111,21 +119,37 @@ class PairedConv2d(nn.Conv2d):
                 nn.init.kaiming_uniform_(self.goal_weight, a=math.sqrt(5))
             elif init.startswith('copy:'):
                 self.goal_weight.copy_(float(init[5:]) * conv.weight)
+        self.goal_gain = None if gain is None else nn.Parameter(torch.full((conv.out_channels, 1, 1, 1), float(gain)))
+        self.goal_diff_weight = nn.Parameter(torch.zeros_like(self.weight)) if diff else None
+
+    @property
+    def paired_channels(self):
+        """Input channels of a paired pass: [current; goal] (6) or, with the difference channel, 9."""
+        return (3 if self.goal_diff_weight is not None else 2) * self.in_channels
+
+    def paired_weight(self):
+        """The (out, paired_channels, kh, kw) weight of the paired convolution."""
+        goal = self.goal_weight.to(self.weight.dtype)
+        if self.goal_gain is not None:
+            goal = self.goal_gain.to(self.weight.dtype) * goal
+        parts = [self.weight, goal]
+        if self.goal_diff_weight is not None:
+            parts.append(self.goal_diff_weight.to(self.weight.dtype))
+        return torch.cat(parts, dim=1)
 
     def forward(self, x):
         if x.shape[1] == self.in_channels:
             return super().forward(x)
-        if x.shape[1] != 2 * self.in_channels:
-            raise ValueError(f'PairedConv2d expects {self.in_channels} or {2 * self.in_channels} input channels, '
+        if x.shape[1] != self.paired_channels:
+            raise ValueError(f'PairedConv2d expects {self.in_channels} or {self.paired_channels} input channels, '
                              f'got {x.shape[1]}')
-        weight = torch.cat([self.weight, self.goal_weight.to(self.weight.dtype)], dim=1)
-        return self._conv_forward(x, weight, self.bias)
+        return self._conv_forward(x, self.paired_weight(), self.bias)
 
 
-def pair_stem(body, init='zero'):
+def pair_stem(body, init='zero', gain=None, diff=False):
     """Replace a ResNet body's `conv1` with a PairedConv2d (idempotent); returns the paired stem."""
     if not isinstance(body.conv1, PairedConv2d):
-        body.conv1 = PairedConv2d(body.conv1, init)
+        body.conv1 = PairedConv2d(body.conv1, init, gain, diff)
     return body.conv1
 
 
@@ -398,9 +422,9 @@ class BackboneBase(nn.Module):
         for module in self.per_camera_norms:
             module.camera = camera
 
-    def pair_stem(self, init='zero'):
+    def pair_stem(self, init='zero', gain=None, diff=False):
         """Goal-image early fusion: make the stem accept `[current; goal]` 6-channel inputs (see PairedConv2d)."""
-        return pair_stem(self.body, init)
+        return pair_stem(self.body, init, gain, diff)
 
     def forward(self, tensor, lang_emb=None, film_identity=False):
         if self.language_conditioning != 'none':
