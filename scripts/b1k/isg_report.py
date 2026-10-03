@@ -290,7 +290,54 @@ def wave_analysis(manifest):
                      f' | {verdict(d1, d_own, True)} | ' + ' | '.join(f'{x:+.4f}' for x in d2) +
                      f' | {verdict(d2, delta[("gap_goal", None)], False)} |')
     lines += ['', f'2δ: L1_own {fmt(2 * d_own)}, gap (goal tasks) {fmt(2 * delta[("gap_goal", None)])}. Slot 2 is the '
-              'baseline\'s own seed replicate, so it is a tie by construction of δ.']
+              'baseline\'s own seed replicate, so it is a tie by construction of δ.', '']
+    return lines + paired_by_seed(manifest, results, slot, final)
+
+
+def paired_by_seed(manifest, results, slot, final):
+    """Each mechanism minus the baseline of the same seed (runs of one seed share their initialization), from the
+    'seed-N replicate of wave-1 slot K' runs; and the baseline's spread over its seeds."""
+    seeds = {}  # (slot, seed) -> run
+    for number, name in slot.items():
+        seeds[(number, int(manifest['_runs'][name]['seed']))] = name
+    for name, run in manifest['_runs'].items():
+        match = re.match(r'seed-(\d+) replicate of wave-\d+ slot (\d+)', run.get('role', ''))
+        if match:
+            seeds[(int(match.group(2)), int(match.group(1)))] = name
+    baselines = {seed: name for (number, seed), name in seeds.items() if number == 1 and seed != 0}
+    baselines[0] = slot[1]
+    baselines.update({1: slot[2]} if 2 in slot else {})
+    replicated = sorted({number for (number, seed) in seeds if number not in (1, 2) and seed != 0})
+    if not replicated and len(baselines) < 3:
+        return []
+    lines = [f'#### Paired by initialization (each run minus the baseline of the same seed, {final // 1000}k)', '']
+    finals = {seed: results.get(name, {}).get(final) for seed, name in baselines.items()}
+    done = {seed: finals[seed] for seed in sorted(finals) if finals[seed] is not None}
+    if len(done) >= 3:
+        own = [metric(result, 'L1_own') for result in done.values()]
+        gap = [metric(result, 'gap_goal') for result in done.values()]
+        lines += [f'Baseline over seeds {sorted(done)}: L1_own ' + ' / '.join(fmt(v) for v in own) +
+                  f' (range {fmt(max(own) - min(own))}), gap (goal tasks) ' + ' / '.join(fmt(v) for v in gap) +
+                  f' (range {fmt(max(gap) - min(gap))}).', '']
+    header = ['| Slot | Seed | Run | Δ L1_own | Δ gap (goal tasks) | Δ gap reloc | Δ gap boardgame |',
+              '| ---: | ---: | --- | ---: | ---: | ---: | ---: |']
+    rows, waiting = [], []
+    for number in replicated:
+        for seed in sorted(s for (n, s) in seeds if n == number):
+            name, base = seeds[(number, seed)], finals.get(seed)
+            result = results.get(name, {}).get(final)
+            if result is None or base is None:
+                waiting.append(f'`{name}`')
+                continue
+            rows.append(f'| {number} | {seed} | `{name}` | {metric(result, "L1_own") - metric(base, "L1_own"):+.4f} | '
+                        f'{metric(result, "gap_goal") - metric(base, "gap_goal"):+.4f} | '
+                        f'{metric(result, "gap", "reloc") - metric(base, "gap", "reloc"):+.4f} | '
+                        f'{metric(result, "gap", "boardgame") - metric(base, "gap", "boardgame"):+.4f} |')
+    if rows:
+        lines += header + rows + ['', 'A mechanism difference that holds for both initializations (same sign, similar '
+                                  'size) is the evidence the promotion rule asks for (two seeds agree).']
+    if waiting:
+        lines += ['', f'Waiting for the {final // 1000}k Tier A of ' + ', '.join(waiting) + ' (or of its baseline).']
     return lines
 
 
