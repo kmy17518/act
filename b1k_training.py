@@ -23,8 +23,8 @@ from b1k_dataset import (B1KDataset, CAMERAS, GOAL_OBS_KEYS, GOAL_SOURCES, GOAL_
                          expand_task_groups, goal_views_to_indices, parse_settle_steps, proprio_dim,
                          resolve_episode_split)
 from b1k_frame_cache import dequantize_images
-from detr.models.backbone import SpaceToDepthStem, replaces_stem
-from detr.models.detr_vae import GOAL_ENCODERS, GOAL_FUSIONS
+from detr.models.backbone import SpaceToDepthStem, parse_goal_stem_init, replaces_stem
+from detr.models.detr_vae import GOAL_ENCODERS, GOAL_FUSIONS, GOAL_TOKENS, parse_goal_tag_init
 from detr.models.maxpool_nhwc import MaxPool3x3NHWC, replaces
 from detr.models.transformer import use_fused_attention
 from policy import ACTPolicy, CNNMLPPolicy
@@ -58,9 +58,16 @@ def goal_config(model_config):
         raise ValueError('goal_views require goal_fusion early or late')
     if fusion != 'none' and not views:
         raise ValueError('goal_fusion early/late requires goal_views')
+    tokens = model_config.get('goal_tokens', 'grid')
+    if tokens not in GOAL_TOKENS:
+        raise ValueError(f'Unsupported goal_tokens {tokens!r}')
+    lr_goal = model_config.get('lr_goal')
     return {'goal_fusion': fusion, 'goal_views': views, 'goal_encoder': encoder,
             'goal_role_embedding': bool(model_config.get('goal_role_embedding', True)),
-            'language_on_goal_encoder': bool(model_config.get('language_on_goal_encoder', False))}
+            'language_on_goal_encoder': bool(model_config.get('language_on_goal_encoder', False)),
+            'goal_tag_init': parse_goal_tag_init(model_config.get('goal_tag_init', 'zero')),
+            'goal_stem_init': parse_goal_stem_init(model_config.get('goal_stem_init', 'zero')),
+            'goal_tokens': tokens, 'lr_goal': None if lr_goal is None else float(lr_goal)}
 
 
 def load_checkpoint(path):
@@ -348,7 +355,8 @@ def compile_policy(policy, mode):
             # Benchmark Triton/cuBLAS GEMM and convolution choices per shape (a few extra minutes once,
             # cached on disk); the selected kernels are still TF32/fp32.
             inductor_config.max_autotune = True
-        for backbone in policy.model.backbones:
+        goal_backbone = getattr(policy.model, 'goal_backbone', None)
+        for backbone in list(policy.model.backbones) + ([goal_backbone] if goal_backbone is not None else []):
             body = backbone[0]
             body.forward = torch.compile(body.forward)
         if mode != 'backbone':
@@ -525,6 +533,10 @@ def conditioning_record(model_config, adapter, dataset, root, episode_split=None
                      'on_goal_encoder': goal['language_on_goal_encoder'] if goal['goal_fusion'] == 'late' else None},
         'goal': {'fusion': goal['goal_fusion'], 'views': goal['goal_views'], 'encoder': goal['goal_encoder'],
                  'role_embedding': goal['goal_role_embedding'] if goal['goal_fusion'] == 'late' else None,
+                 'tag_init': goal['goal_tag_init'] if goal['goal_fusion'] == 'late' else None,
+                 'tokens': goal['goal_tokens'] if goal['goal_fusion'] == 'late' else None,
+                 'stem_init': goal['goal_stem_init'] if goal['goal_fusion'] == 'early' else None,
+                 'lr_goal': goal['lr_goal'],
                  'source': adapter.get('goal_source') if goal['goal_views'] else None,
                  'sampling_policy': 'fixed_terminal_frame_per_episode' if goal['goal_views'] else None,
                  'hindsight_probability': 0.0, 'dropout_probability': 0.0},
@@ -562,6 +574,7 @@ def resolve_regime(args):
     if args.language_on_goal_encoder and args.language_conditioning == 'none':
         raise ValueError('--language-on-goal-encoder requires language conditioning')
     if args.regime is None:
+        validate_goal_mechanism(args)
         return
     wants_language = args.regime in ('language', 'image_language')
     wants_goal = args.regime in ('image', 'image_language')
@@ -583,6 +596,23 @@ def resolve_regime(args):
     if args.task_onehot:
         LOGGER.warning('--task-onehot with --regime %s: the task id enters the state; this is a task-ID experiment, '
                        'not the plain %s condition', args.regime, args.regime)
+    validate_goal_mechanism(args)
+
+
+def validate_goal_mechanism(args):
+    """Canonicalize the goal-mechanism options and check that each applies to the resolved fusion (fresh runs)."""
+    args.goal_tag_init = parse_goal_tag_init(args.goal_tag_init)
+    args.goal_stem_init = parse_goal_stem_init(args.goal_stem_init)
+    if args.goal_fusion != 'late' and (args.goal_tag_init != 'zero' or args.goal_tokens != 'grid'):
+        raise ValueError('--goal-tag-init and --goal-tokens apply to --goal-fusion late')
+    if args.goal_tag_init != 'zero' and not args.goal_role_embedding:
+        raise ValueError('--goal-tag-init requires the goal role embedding')
+    if args.goal_fusion != 'early' and args.goal_stem_init != 'zero':
+        raise ValueError('--goal-stem-init applies to --goal-fusion early')
+    if args.goal_encoder == 'frozen' and args.language_on_goal_encoder:
+        raise ValueError('--goal-encoder frozen cannot be language-modulated (--language-on-goal-encoder)')
+    if args.lr_goal is not None and (args.goal_fusion == 'none' or not args.lr_goal > 0):
+        raise ValueError('--lr-goal requires --goal-fusion early or late and a positive value')
 
 
 def parser():
@@ -662,9 +692,22 @@ def parser():
                    help='episode_last: last frame of the episode\'s own camera stream (any LeRobot v3 root); goal_key: '
                         'the dataset\'s observation.goal_rgb.<camera>_camera_0 stream (saved in the adapter config)')
     p.add_argument('--goal-encoder', choices=list(GOAL_ENCODERS), default='shared_base', action=LanguageOption,
-                   help='Late fusion: encode the goal with the shared RGB backbone (default) or an identical separate copy')
+                   help='Late fusion: encode the goal with the shared RGB backbone (default), an identical separate '
+                        'trainable copy, or a copy frozen at the ImageNet initialization (no gradients, eval mode)')
     p.add_argument('--goal-role-embedding', action=ExplicitBooleanOption, default=True,
-                   help='Late fusion: learned per-view goal identity added to the goal tokens\' positions (zero-initialised)')
+                   help='Late fusion: learned per-view goal identity added to the goal tokens\' positions')
+    p.add_argument('--goal-tag-init', default='zero', action=LanguageOption, metavar='zero|normal:STD',
+                   help='Late fusion: start of the goal identity, zero (default; goal and head tokens are '
+                        'indistinguishable until it grows) or normal:STD (Gaussian, e.g. normal:0.5)')
+    p.add_argument('--goal-stem-init', default='zero', action=LanguageOption, metavar='zero|random|copy:SCALE',
+                   help='Early fusion: start of the goal half of the paired stem, zero (default), random (nn.Conv2d '
+                        'default initialization) or copy:SCALE (SCALE x the ImageNet stem weights, e.g. copy:0.5)')
+    p.add_argument('--goal-tokens', choices=list(GOAL_TOKENS), default='grid', action=LanguageOption,
+                   help='Late fusion: the goal\'s full projected feature grid (default) or its spatial mean as one '
+                        'token per view (pooled)')
+    p.add_argument('--lr-goal', type=float, default=None, action=LanguageOption,
+                   help='Learning rate of the goal-specific parameters (paired-stem goal half, goal identity, goal '
+                        'projections) as their own AdamW group. Default: they stay in the backbone / main groups')
     p.add_argument('--language-on-goal-encoder', action=ExplicitBooleanOption, default=False,
                    help='Late fusion with language: also FiLM-modulate the goal pass with the language embedding. Default '
                         'off: the goal is encoded with the FiLM layers at the identity (gamma = beta = 0)')
@@ -777,7 +820,8 @@ def _train(args, output, root, resources):
                              ('language_encoder', 'clip'), ('backbone_norm', 'frozen'), ('camera_batch', False),
                              ('regime', None), ('task_onehot', True), ('goal_fusion', 'none'), ('goal_views', []),
                              ('goal_encoder', 'shared_base'), ('goal_role_embedding', True),
-                             ('language_on_goal_encoder', False)]:
+                             ('language_on_goal_encoder', False), ('goal_tag_init', 'zero'),
+                             ('goal_stem_init', 'zero'), ('goal_tokens', 'grid'), ('lr_goal', None)]:
             saved_value = model_config.get(key, default)
             if getattr(args, f'_{key}_explicit', False) and getattr(args, key) != saved_value:
                 raise ValueError(f'--{key.replace("_", "-")} differs from checkpoint')
@@ -851,6 +895,8 @@ def _train(args, output, root, resources):
                         'goal_fusion': args.goal_fusion, 'goal_views': list(args.goal_views),
                         'goal_encoder': args.goal_encoder, 'goal_role_embedding': bool(args.goal_role_embedding),
                         'language_on_goal_encoder': bool(args.language_on_goal_encoder),
+                        'goal_tag_init': args.goal_tag_init, 'goal_stem_init': args.goal_stem_init,
+                        'goal_tokens': args.goal_tokens, 'lr_goal': args.lr_goal,
                         'dilation': False, 'masks': False, 'action_dim': 23}
         if args.language_conditioning != 'none':
             model_config['film_init'] = args.film_init
@@ -988,6 +1034,10 @@ def _train(args, output, root, resources):
                 goal['goal_views'], adapter.get('goal_source', 'episode_last'), goal['goal_encoder'],
                 goal['goal_role_embedding'], goal['language_on_goal_encoder'],
                 sum(parameter.numel() for parameter in policy.parameters()))
+    if goal['goal_fusion'] != 'none':
+        LOGGER.info('Goal mechanism: tag init %s, stem init %s, tokens %s, goal LR %s (%d goal-group parameters)',
+                    goal['goal_tag_init'], goal['goal_stem_init'], goal['goal_tokens'], goal['lr_goal'],
+                    sum(p.numel() for g in optimizer.param_groups[2:] for p in g['params']))
     begin = time.monotonic()
     previous_end = begin
     batches = optimizer_batches(loader, args.batch_size, args.loader_batch_size, device=device, stream=copy_stream)

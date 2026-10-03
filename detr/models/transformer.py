@@ -63,13 +63,18 @@ class Transformer(nn.Module):
                 nn.init.xavier_uniform_(p)
 
     def forward(self, src, mask, query_embed, pos_embed, latent_input=None, proprio_input=None, additional_pos_embed=None,
-                decoder_layers=None, task_emb=None):
+                decoder_layers=None, task_emb=None, memory_tokens=None, memory_pos=None):
+        """`memory_tokens` / `memory_pos` (tokens, batch, dim), optional: further encoder tokens with their position
+        codes, appended after the flattened feature map (late fusion's pooled goal tokens)."""
         # TODO flatten only when input has H and W
         if len(src.shape) == 4: # has H and W
             # flatten NxCxHxW to HWxNxC
             bs, c, h, w = src.shape
             src = src.flatten(2).permute(2, 0, 1)
             pos_embed = pos_embed.flatten(2).permute(2, 0, 1).expand(-1, bs, -1)
+            if memory_tokens is not None:
+                src = torch.cat([src, memory_tokens], axis=0)
+                pos_embed = torch.cat([pos_embed, memory_pos.expand(-1, bs, -1)], axis=0)
             query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
             # mask = mask.flatten(1)
 

@@ -69,6 +69,16 @@ def get_args_parser():
     return parser
 
 
+GOAL_PARAMETER_NAMES = ('goal_weight', 'goal_gain', 'goal_role_embed', 'goal_proj')
+
+
+def is_goal_parameter(name):
+    """Parameters that exist only for goal conditioning and take `lr_goal` when it is set: the goal half of the
+    paired stem (`goal_weight`, `goal_gain`), late fusion's goal identity (`goal_role_embed`) and goal-only
+    projections (`goal_proj*`). Shared modules (backbone, `input_proj`) keep their groups."""
+    return any(part in GOAL_PARAMETER_NAMES or part.startswith('goal_proj') for part in name.split('.'))
+
+
 def build_ACT_model_and_optimizer(args_override):
     parser = argparse.ArgumentParser('DETR training and evaluation script', parents=[get_args_parser()])
     if args_override.get('programmatic', False):
@@ -82,13 +92,19 @@ def build_ACT_model_and_optimizer(args_override):
     model = build_ACT_model(args)
     model.to(args_override.get('device', 'cuda'))
 
+    lr_goal = getattr(args, 'lr_goal', None)
+    goal = (lambda n: is_goal_parameter(n)) if lr_goal is not None else (lambda n: False)
     param_dicts = [
-        {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
+        {"params": [p for n, p in model.named_parameters() if "backbone" not in n and not goal(n) and p.requires_grad]},
         {
-            "params": [p for n, p in model.named_parameters() if "backbone" in n and p.requires_grad],
+            "params": [p for n, p in model.named_parameters() if "backbone" in n and not goal(n) and p.requires_grad],
             "lr": args.lr_backbone,
         },
     ]
+    goal_parameters = [p for n, p in model.named_parameters() if goal(n) and p.requires_grad]
+    if goal_parameters:
+        # Goal-specific parameters get their own learning rate (third group, also when it equals another group's).
+        param_dicts.append({"params": goal_parameters, "lr": float(lr_goal)})
     # fused=True selects the single-kernel CUDA AdamW implementation of the same update rule.
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay,
