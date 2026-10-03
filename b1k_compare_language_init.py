@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, default_collate
 
-from b1k_dataset import B1KDataset, CAMERAS, OBS_KEYS, STATE_INDICES, VIDEO_KEYS, StepBatchSampler
+from b1k_dataset import B1KDataset, CAMERAS, OBS_KEYS, STATE_INDICES, VIDEO_KEYS, StepBatchSampler, proprio_dim
 from b1k_language import language_embedding_table, language_for_qpos
 from b1k_training import (CHECKPOINT_VERSION, atomic_json, atomic_save, configure_cpu_threads,
                           make_policy, run_lock)
@@ -358,7 +358,7 @@ def training_stats(dataset, path):
     if (stats['fingerprint'] != fingerprint or stats['approximate'] or stats['count'] != len(dataset)
             or stats['std_correction'] != 1 or stats['std_floor'] != 0.01):
         raise ValueError('Exact training-only normalization cache does not match the split')
-    for prefix, size in [('qpos', len(STATE_INDICES)), ('action', 23)]:
+    for prefix, size in [('qpos', proprio_dim(dataset.gripper_state)), ('action', 23)]:
         mean, std = np.asarray(stats[f'{prefix}_mean']), np.asarray(stats[f'{prefix}_std'])
         if mean.shape != (size,) or std.shape != (size,) or not np.isfinite(mean).all() or not np.isfinite(std).all() or (std <= 0).any():
             raise ValueError('Invalid normalization values')
@@ -513,13 +513,13 @@ def compare(args):
 
 
 def _compare(args, output, root, device, resources):
-    config = model_config(len(STATE_INDICES) + len(args.task_names))
+    config = model_config(proprio_dim() + len(args.task_names))
     dataset = B1KDataset(root, args.task_names, config['num_queries'], IMAGE_SIZE, profile_reads=True)
     resources.callback(dataset.close)
     if len(dataset.episodes) != args.expected_episodes:
         raise ValueError(f'Expected {args.expected_episodes} complete episodes, found {len(dataset.episodes)}')
     source, cache, embeddings, cache_hash = cached_language(args.cache_run, dataset.task_map)
-    config['state_dim'] = len(STATE_INDICES) + len(dataset.task_map)
+    config['state_dim'] = proprio_dim(dataset.gripper_state) + len(dataset.task_map)
     full_fingerprint = dataset.fingerprint()
     evaluation, split = split_dataset(dataset, args.holdout_every)
     resources.callback(evaluation.close)
@@ -531,7 +531,8 @@ def _compare(args, output, root, device, resources):
                                      for row in samples[start:start + args.eval_batch_size]])
                     for start in range(0, len(samples), args.eval_batch_size)]
     evaluation.close()
-    adapter = {'image_size': list(IMAGE_SIZE), 'state_indices': STATE_INDICES, 'video_keys': VIDEO_KEYS,
+    adapter = {'image_size': list(IMAGE_SIZE), 'state_indices': STATE_INDICES,
+               'gripper_state': dataset.gripper_state, 'video_keys': VIDEO_KEYS,
                'observation_keys': OBS_KEYS, 'action_dim': 23, 'action_transform': 'identity', 'action_shift': 0,
                'task_conditioning': 'onehot', 'timestamp_tolerance': dataset.timestamp_tolerance,
                'image_resize': 'bilinear_antialias', 'image_normalization': 'rgb_div255_then_imagenet_in_ACTPolicy'}

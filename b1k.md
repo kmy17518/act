@@ -53,8 +53,9 @@ Native random access costs ~33 ms of single-core work per sample (HEVC GOP 8 dec
 ### R1Pro mapping and preprocessing
 
 - Input proprio: `observation.state` / serving `robot_r1::proprio`, 61 dimensions.
-- Selected 25 dimensions, in order: `[0:3, 53:57, 3:10, 24:26, 28:35, 49:51]`.
-- A one-hot vector is appended **after** continuous-state normalization, ordered by sorted checkpoint task IDs (including one category for single-task training). Model state dimension is `25 + number_of_tasks`.
+- Selected dimensions, in order: `[0:3, 53:57, 3:10, 24:26, 28:35, 49:51]`. With `--gripper-state sum` (default) each gripper's two finger positions (`24:26`, `49:51`) are added into one opening, so the state has **23** values in the action's layout (base, torso, left arm, left gripper, right arm, right gripper), as openpi does; `--gripper-state fingers` keeps both positions (**25** values). The summed opening is the raw sum in metres (0 to 0.1); normalization rescales it like every other dimension.
+- The layout is recorded as `adapter_config.gripper_state` (and `train_config.gripper_state`). Resume and serving use the checkpoint's layout, `fingers` for checkpoints that record none (everything trained before the option), so existing checkpoints keep loading, resuming and serving unchanged; an explicit `--gripper-state` must match the checkpoint on resume. A `fingers` dataset keeps its previous fingerprint (and `stats_<fingerprint>_*.json` cache); `sum` statistics get their own.
+- A one-hot vector is appended **after** continuous-state normalization, ordered by sorted checkpoint task IDs (including one category for single-task training). Model state dimension is `23 + number_of_tasks` (`25 + number_of_tasks` with `fingers`).
 - Action: all 23 dataset dimensions, retaining original base velocity / absolute joint / gripper command semantics. **No additional delta transformation**, clipping, or gripper threshold is applied.
 - Camera order: head (`zed_link`), left wrist, right wrist. RGB uint8 becomes float CHW `/255`; RGBA drops alpha. Bilinear antialiased resize defaults to **240×240 for ACT** and **480×640 for CNNMLP**, then the selected upstream policy applies ImageNet mean/std normalization. Training and serving call the same preprocessing functions.
 - CNNMLP preserves the original unpadded convolutions: a 480×640 image produces 15×20 ResNet18 features, then 3×8×32 = 768 flattened values per camera. A configured image size changes the MLP input width using the true spatial result, not adaptive pooling or a replacement CNN. Both dimensions must be at least 385 pixels for the stride-32 backbone; 240×240 is rejected. The original two 1024-wide hidden layers are unchanged.
@@ -127,9 +128,9 @@ CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 .venv/bin/python scripts/b1k/train_b1k.
   --max-steps 50000 --batch-size 8 --num-workers 4 --device cuda
 ```
 
-`--dataset-root` aliases `--dataset-path`. Drop `--task-names` for all complete local tasks; multiple names are space-separated. `--policy-class ACT|CNNMLP` selects the upstream policy (default ACT). Default B1K ACT architecture matches the upstream README training recipe: ResNet18, hidden 512, feedforward 3200, 4 encoder / 7 decoder layers, 8 heads, chunk 100, KL weight 10, LR 1e-5, backbone LR 1e-5, AdamW weight decay 1e-4, dropout 0.1. The lower-level upstream parser defaults remain intact.
+`--dataset-root` aliases `--dataset-path`. Drop `--task-names` for all complete local tasks; multiple names are space-separated, and the names of a dataset's [task groups](#task-groups) select their tasks. `--policy-class ACT|CNNMLP` selects the upstream policy (default ACT). Default B1K ACT architecture matches the upstream README training recipe: ResNet18, hidden 512, feedforward 3200, 4 encoder / 7 decoder layers, 8 heads, chunk 100, KL weight 10, LR 1e-5, backbone LR 1e-5, AdamW weight decay 1e-4, dropout 0.1. The lower-level upstream parser defaults remain intact.
 
-For CNNMLP, add `--policy-class CNNMLP`; omit `--image-size` to use the upstream 480×640 spatial path. CNNMLP always records `num_queries=1`, takes the first action target, and uses upstream MSE; `--chunk-size` and transformer/KL hyperparameters do not change it into a chunked policy. State input is 25 + task count, output is 23. ACT accepts `--position-embedding sine|learned` and `--pre-norm`/`--no-pre-norm`; defaults remain sine and post-norm. Nondefault positional/norm options are rejected for CNNMLP, which does not use transformer positions or normalization.
+For CNNMLP, add `--policy-class CNNMLP`; omit `--image-size` to use the upstream 480×640 spatial path. CNNMLP always records `num_queries=1`, takes the first action target, and uses upstream MSE; `--chunk-size` and transformer/KL hyperparameters do not change it into a chunked policy. State input is 23 (25 with `--gripper-state fingers`) + task count, output is 23. ACT accepts `--position-embedding sine|learned` and `--pre-norm`/`--no-pre-norm`; defaults remain sine and post-norm. Nondefault positional/norm options are rejected for CNNMLP, which does not use transformer positions or normalization.
 
 ```bash
 source /tmp/dev/env.sh
@@ -148,6 +149,56 @@ Checkpoints contain all serving and training configuration, selected task IDs/na
 Other useful knobs: `--policy-class`, `--position-embedding`, `--pre-norm`, `--chunk-size`, `--image-size HEIGHT WIDTH`, `--hidden-dim`, `--dim-feedforward`, `--enc-layers`, `--dec-layers`, `--nheads`, `--kl-weight`, `--lr`, `--save-every`, `--cache-row-groups`. See `--help`. Metrics are JSON lines in `metrics.jsonl`; every checkpoint is suitable for inference, but no validation-driven best-checkpoint selection or simulator success evaluation is performed by this trainer.
 
 This ACT/CNNMLP integration is **single-process, single-GPU** (or CPU) only. Unlike GR00T's distributed training path, it does not implement `torchrun`/DDP; do not launch multiple training ranks against one output directory. `--num-workers` controls CPU data-loading workers, not GPU training ranks. An exclusive nonblocking `flock` on `output/run.lock` rejects a concurrent trainer before metadata, W&B, or dataset setup. The file remains after exit; the kernel releases the lock automatically, so do not delete it while training.
+
+### Episode split (`--episode-split`)
+
+`--episode-split auto` (default) trains on a dataset's fixed split when it ships one: `<dataset root>/isg_meta/train_split.json` if that file exists, otherwise every complete episode of the selected tasks exactly as before (the challenge demos have no such file; their selection, statistics and fingerprint are unchanged). `none` ignores the file; a path selects that file, which must exist. The file must declare `"format": "isg-episode-split/v1"`. The selected tasks are `--task-names` or, when omitted, every task of the split; each must have an entry under `tasks` (the error names the tasks and the file), and training uses the sorted union of their `train` episodes. `B1KDataset(episodes=...)` applies that list after the task filter: every listed episode must exist locally with its Parquet and camera files and belong to a selected task, or construction fails, so a split episode is never silently dropped (unlisted incomplete episodes are still skipped). The trainer logs one `Episode split NAME (FILE, sha256 ...): N train episodes of tasks [...]` line.
+
+```bash
+source /tmp/dev/env.sh
+cd /tmp/dev/baselines/act
+CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 .venv/bin/python scripts/b1k/train_b1k.py \
+  --dataset-path /tmp/dev/datasets/isg-init \
+  --task-names camera_relocalization-standard \
+  --output-dir outputs/isg-camera-relocalization \
+  --max-steps 50000 --batch-size 8 --num-workers 4 --device cuda
+```
+
+This trains on the task's 100 `train` episodes (26 are held out). `run.json` / `resume_run.json`, the W&B config and every full and evaluation checkpoint record `episode_split`: the resolved absolute file, the SHA-256 of its bytes, format, split name, subset `train`, the selected tasks and the sorted episodes, or `null` without a split; `train_config.episode_split` keeps the flag value. Normalization statistics are computed over the selected episodes only: the dataset fingerprint covers the selected episode rows, so the `stats_<fingerprint>_*.json` cache and the resume checks are per selection. On resume the checkpoint's selection is authoritative: without `--episode-split` the recorded split episodes are reused even if the file has changed since, and checkpoints without a split (or written before this option) resume without one; the dataset root is not searched again. An explicit `--episode-split` must select the identical episode list. The frame cache can stay task-level: its entries are whole packed videos, validated only for the files the selected episodes read, which under a split are a subset of their tasks' files. `tests/test_b1k.py` covers resolution (auto, none, path, missing task, format), exact selection (other-task, absent and incomplete episodes), the run/checkpoint records and both resume rules.
+
+### Task groups
+
+`--task-names` (also of `scripts/b1k/build_frame_cache.py`) accepts the names of task groups that a dataset defines in `<dataset root>/isg_meta/task_groups.json` (`"format": "isg-task-groups/v1"`, `"groups": {"name": [member, ...]}`). A member is a task name or another group, and groups and tasks can be mixed on the command line. `isg-init` ships `camera_relocalization`, `object_scaling`, `mental_rotation`, `iors_ontop_small`, `iors_ontop`, `iors_small`, `iors_large`, `iors`, `alignment`, `disembedding`, `cm_articulation_small`, `cm_articulation_large`, `cm_articulation`, `cm_attachment` and `cm` (members and task indices in its README). The names are expanded once at startup, before the episode split is resolved; duplicates are dropped and `B1KDataset` receives plain task names, so a group trains on the union of its tasks' `train` episodes and its normalization statistics are computed over exactly those frames. The trainer logs `--task-names [...] select the tasks [...]`; `train_config.task_names` keeps the names as given, while `task_map`, `episode_split.tasks` and the checkpoints hold the tasks. An unknown name, a member that is neither a task nor a group, a name that is both, an empty group or a cycle fails with the file named; without a group file the names are used unchanged. On resume, `--task-names` is expanded again with the current file and must select the checkpoint's tasks (omit it to reuse them).
+
+```bash
+source /tmp/dev/env.sh
+cd /tmp/dev/baselines/act
+CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 .venv/bin/python scripts/b1k/train_b1k.py \
+  --dataset-path /tmp/dev/datasets/isg-init \
+  --task-names cm_articulation_small \
+  --output-dir outputs/isg-cm-articulation-small \
+  --max-steps 50000 --batch-size 8 --num-workers 4 --device cuda
+```
+
+This trains on the 200 `train` episodes of the two small-scale articulation tasks (blender open and close) with statistics of those 200 episodes.
+
+### Settle steps (`--settle-steps`)
+
+Every `isg-init` episode is its program (P frames) followed by a recorded settle window of max(50, ceil(0.2·P)) frames in which the robot holds its final command. `--settle-steps SPEC` chooses how much of the window to train on when the episodes are loaded, so one dataset serves every setting and no truncated copy is needed (`/tmp/dev/scripts/truncate-isg-settle.py` writes one, with the window removed, for trainers without this flag): `all` (default) keeps every recorded frame, an integer keeps that many settle frames (`0` keeps the program only), and a decimal keeps that fraction of each episode's program length, rounded up (`0.1`, `0.2`; `1` is one frame, `1.0` is P frames). A request beyond an episode's recorded window keeps the whole window, and the trainer warns with the number of such episodes (on `isg-init`, 0–50 frames and fractions up to 0.2 never exceed a window). Values are canonicalized (`010` = `10`, `0.20` = `0.2`); anything else fails at startup.
+
+The program lengths come from `<dataset root>/isg_meta/settle_windows.json` (`"format": "isg-settle-windows/v1"`, written by `/tmp/dev/scripts/make-isg-settle-windows.py`, which verifies every episode's settle window against its actions). A value other than `all` fails without that file, so a dataset without settle windows (the challenge demos, a truncated copy) cannot be cut by mistake, and every selected episode needs an entry whose recorded length matches `meta/episodes`. The cut changes the frames that are sampled, the statistics, the in-memory table of the frame cache path and the dataset fingerprint (so the `stats_<fingerprint>_*.json` cache and resume checks are per setting), and action chunks are padded past the cut with `is_pad` masking exactly as at the end of a truncated episode. Frame caches hold whole videos, so one cache built for `isg-init` serves every SPEC (a truncated copy's cache does not: its files are separate copies).
+
+```bash
+source /tmp/dev/env.sh
+cd /tmp/dev/baselines/act
+CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 .venv/bin/python scripts/b1k/train_b1k.py \
+  --dataset-path /tmp/dev/datasets/isg-init \
+  --task-names cm_articulation_small --settle-steps 0.1 \
+  --output-dir outputs/isg-cm-articulation-small-settle-0.1 \
+  --max-steps 50000 --batch-size 8 --num-workers 4 --device cuda
+```
+
+On `cm_articulation_small`'s 200 `train` episodes, `isg-init` has 185,375 frames: `--settle-steps 0` keeps 154,413 (the frames of the truncated copy, with bit-identical statistics and samples), `10` keeps 156,413, `0.1` keeps 169,942, and `0.2` keeps all 185,375. `run.json` / `resume_run.json`, the W&B config and every full and evaluation checkpoint record `settle_steps`: the canonical SPEC, the resolved file, the SHA-256 of its bytes, its format, and the kept, settle and recorded frame counts and number of capped episodes, or `null` for `all`. `train_config.settle_steps` holds the canonical SPEC. On resume the checkpoint's value is authoritative: omit the flag to reuse it; an explicit SPEC must equal it, and checkpoints without the record resume on every recorded frame. `tests/test_b1k.py` checks parsing and exact fractions, compares the cut with a physically truncated copy (statistics, every sample, the in-memory table) and covers capping, missing or stale window files, the records and the resume rules.
 
 ### Throughput options (Blackwell)
 

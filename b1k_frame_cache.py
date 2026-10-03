@@ -36,7 +36,7 @@ import av
 import numpy as np
 import torch
 
-from b1k_dataset import B1KDataset, VIDEO_KEYS, preprocess_image
+from b1k_dataset import B1KDataset, VIDEO_KEYS, expand_task_groups, preprocess_image
 
 FORMAT = 'act_b1k_frame_cache_v1'
 LOGGER = logging.getLogger(__name__)
@@ -326,7 +326,8 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--dataset-path', '--dataset-root', dest='dataset_path', required=True)
     p.add_argument('--cache-dir', required=True)
-    p.add_argument('--task-names', nargs='+', help='Default: every complete local task')
+    p.add_argument('--task-names', nargs='+', help='Tasks or task groups of <dataset>/isg_meta/task_groups.json. '
+                   'Default: every complete local task')
     p.add_argument('--image-size', type=int, nargs=2, default=[240, 240], metavar=('HEIGHT', 'WIDTH'))
     p.add_argument('--workers', type=int, default=max(1, min(10, os.cpu_count() or 1)))
     p.add_argument('--cpu-budget', type=int, default=30, help='Total cores to spread over workers (resize threads)')
@@ -338,7 +339,8 @@ def parser():
 def main(argv=None):
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     args = parser().parse_args(argv)
-    dataset = B1KDataset(args.dataset_path, args.task_names, image_size=args.image_size)
+    dataset = B1KDataset(args.dataset_path, expand_task_groups(args.dataset_path, args.task_names),
+                         image_size=args.image_size)
     try:
         build_frame_cache(dataset, args.cache_dir, workers=args.workers, cpu_budget=args.cpu_budget)
         if args.verify:
