@@ -93,8 +93,9 @@ async def exercise_websocket(checkpoint, predictor, observations, temporal_agg, 
 
     first, second = observations[:2]
     stats, tasks = checkpoint['normalization'], checkpoint['task_map']
+    gripper_state = checkpoint['adapter_config'].get('gripper_state', 'fingers')
     def predict(obs):
-        qpos = torch.stack([preprocess_state(state, obs['task_id'], stats, tasks)
+        qpos = torch.stack([preprocess_state(state, obs['task_id'], stats, tasks, gripper_state)
                             for state in obs['robot_r1::proprio']])
         images = torch.stack([torch.stack([preprocess_image(image, checkpoint['adapter_config']['image_size'])
                                           for image in obs[key]]) for key in OBS_KEYS], dim=1)

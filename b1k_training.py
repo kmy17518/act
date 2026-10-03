@@ -18,8 +18,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from b1k_dataset import (B1KDataset, CAMERAS, OBS_KEYS, STATE_INDICES, VIDEO_KEYS, SplitBatchSampler, StepBatchSampler,
-                         describe_episode_split, expand_task_groups, parse_settle_steps, resolve_episode_split)
+from b1k_dataset import (B1KDataset, CAMERAS, GRIPPER_STATES, OBS_KEYS, STATE_INDICES, VIDEO_KEYS, SplitBatchSampler,
+                         StepBatchSampler, describe_episode_split, expand_task_groups, parse_settle_steps, proprio_dim,
+                         resolve_episode_split)
 from b1k_frame_cache import dequantize_images
 from detr.models.maxpool_nhwc import MaxPool3x3NHWC, replaces
 from detr.models.transformer import use_fused_attention
@@ -37,6 +38,8 @@ def load_checkpoint(path):
     adapter = checkpoint['adapter_config']
     if adapter['state_indices'] != STATE_INDICES or adapter['action_dim'] != 23:
         raise ValueError('Unsupported checkpoint robot mapping')
+    if adapter.get('gripper_state', 'fingers') not in GRIPPER_STATES:
+        raise ValueError('Unsupported checkpoint gripper state layout')
     if adapter['video_keys'] != VIDEO_KEYS or adapter['observation_keys'] != OBS_KEYS:
         raise ValueError('Unsupported checkpoint camera mapping')
     if adapter['action_transform'] != 'identity' or adapter['action_shift'] != 0:
@@ -422,6 +425,10 @@ def parser():
                         'recorded frame), a number of frames (0 keeps the program only) or a decimal fraction of the '
                         'program length (0.2), capped at the recorded window. '
                         'Resume reuses the checkpoint\'s value; an explicit SPEC must equal it')
+    p.add_argument('--gripper-state', choices=GRIPPER_STATES, default='sum', action=ExplicitOption,
+                   help='Gripper proprioception: sum (default) adds the two finger positions of each gripper into one '
+                        'opening, giving a 23-value state in the action\'s layout; fingers keeps both (25 values). '
+                        'Resume uses the checkpoint\'s layout (fingers for checkpoints that do not record one)')
     p.add_argument('--output-dir', required=True)
     p.add_argument('--max-steps', type=int, default=50000, help='Total optimizer steps, including resumed steps')
     p.add_argument('--batch-size', type=int, default=8)
@@ -554,6 +561,10 @@ def _train(args, output, root, resources):
         if getattr(args, '_settle_steps_explicit', False) and args.settle_steps != saved_settle:
             raise ValueError(f'--settle-steps {args.settle_steps} differs from checkpoint ({saved_settle})')
         args.settle_steps = saved_settle
+        saved_gripper = adapter.get('gripper_state', 'fingers')
+        if getattr(args, '_gripper_state_explicit', False) and args.gripper_state != saved_gripper:
+            raise ValueError(f'--gripper-state {args.gripper_state} differs from checkpoint ({saved_gripper})')
+        args.gripper_state = saved_gripper
     else:
         image_size = args.image_size or ([240, 240] if args.policy_class == 'ACT' else [480, 640])
         if args.policy_class == 'CNNMLP' and (args.pre_norm or args.position_embedding != 'sine'):
@@ -562,7 +573,7 @@ def _train(args, output, root, resources):
             raise ValueError('--image-size dimensions must be positive')
         if args.policy_class == 'CNNMLP' and min(image_size) < 385:
             raise ValueError('CNNMLP requires images at least 385x385; default is 480x640')
-        adapter = {'image_size': list(image_size), 'state_indices': STATE_INDICES,
+        adapter = {'image_size': list(image_size), 'state_indices': STATE_INDICES, 'gripper_state': args.gripper_state,
                    'video_keys': VIDEO_KEYS, 'observation_keys': OBS_KEYS, 'action_dim': 23,
                    'action_transform': 'identity', 'action_shift': 0, 'task_conditioning': 'onehot',
                    'timestamp_tolerance': args.timestamp_tolerance, 'image_resize': 'bilinear_antialias',
@@ -594,11 +605,11 @@ def _train(args, output, root, resources):
                          timestamp_tolerance=adapter['timestamp_tolerance'],
                          frame_cache=args.frame_cache.resolve() if args.frame_cache else None,
                          episodes=episode_split['episodes'] if episode_split else None,
-                         settle_steps=args.settle_steps)
+                         settle_steps=args.settle_steps, gripper_state=adapter.get('gripper_state', 'fingers'))
     resources.callback(dataset.close)
     if checkpoint and dataset.task_map != checkpoint['task_map']:
         raise ValueError('Resume task map differs from checkpoint')
-    model_config['state_dim'] = len(STATE_INDICES) + len(dataset.task_map)
+    model_config['state_dim'] = proprio_dim(dataset.gripper_state) + len(dataset.task_map)
     fingerprint = dataset.fingerprint()
     output.mkdir(parents=True, exist_ok=True)
     if checkpoint:

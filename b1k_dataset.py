@@ -21,6 +21,10 @@ from torch.nn import functional as F
 
 
 STATE_INDICES = list(range(3)) + list(range(53, 57)) + list(range(3, 10)) + [24, 25] + list(range(28, 35)) + [49, 50]
+# Gripper proprioception (adapter_config['gripper_state']): `sum` adds each gripper's two finger positions into one
+# opening, so the state has one value per action dimension in the action's order (23 values, as in openpi);
+# `fingers` keeps both positions (25 values), the layout of checkpoints that do not record `gripper_state`.
+GRIPPER_STATES = ('sum', 'fingers')
 CAMERAS = ['zed_link', 'left_realsense_link', 'right_realsense_link']
 VIDEO_KEYS = [f'observation.rgb.{camera}_camera_0' for camera in CAMERAS]
 OBS_KEYS = [f'robot_r1::robot_r1:{camera}:Camera:0::rgb' for camera in CAMERAS]
@@ -192,14 +196,34 @@ def preprocess_image(image, image_size):
     return tensor
 
 
-def preprocess_state(state, task_id, stats, task_map):
+def extract_state(state, gripper_state='sum'):
+    """Proprioception of R1Pro states (last axis of 61): the STATE_INDICES values (base velocity 0:3, torso 3:7,
+    left arm 7:14, left fingers 14:16, right arm 16:23, right fingers 23:25), each finger pair summed for `sum`."""
+    if gripper_state not in GRIPPER_STATES:
+        raise ValueError(f'Unknown gripper_state {gripper_state!r}; expected one of {GRIPPER_STATES}')
+    selected = np.asarray(state)[..., STATE_INDICES]
+    if gripper_state == 'fingers':
+        return selected
+    return np.concatenate([selected[..., :14], selected[..., 14:16].sum(-1, keepdims=True),
+                           selected[..., 16:23], selected[..., 23:25].sum(-1, keepdims=True)], axis=-1)
+
+
+def proprio_dim(gripper_state='sum'):
+    """Number of proprioception values `extract_state` returns for a gripper layout."""
+    return len(STATE_INDICES) - 2 if gripper_state == 'sum' else len(STATE_INDICES)
+
+
+def preprocess_state(state, task_id, stats, task_map, gripper_state='sum'):
     state = np.asarray(state, dtype=np.float32)
     if state.shape != (61,) or not np.isfinite(state).all():
         raise ValueError('Expected finite 61-dimensional R1Pro state')
+    if len(stats['qpos_mean']) != proprio_dim(gripper_state):
+        raise ValueError(f'Normalization statistics hold {len(stats["qpos_mean"])} proprioception values; '
+                         f'gripper_state {gripper_state!r} has {proprio_dim(gripper_state)}')
     task_ids = sorted(task_map)
     if task_id not in task_map:
         raise ValueError(f'Unseen task_id {task_id}; checkpoint tasks: {task_map}')
-    qpos = (state[STATE_INDICES] - np.asarray(stats['qpos_mean'])) / np.asarray(stats['qpos_std'])
+    qpos = (extract_state(state, gripper_state) - np.asarray(stats['qpos_mean'])) / np.asarray(stats['qpos_std'])
     onehot = np.zeros(len(task_ids), dtype=np.float32)
     onehot[task_ids.index(task_id)] = 1
     return torch.from_numpy(np.concatenate([qpos, onehot]).astype(np.float32))
@@ -224,10 +248,15 @@ class B1KDataset(torch.utils.data.Dataset):
     `settle_steps` (see `apply_settle_steps`) cuts every episode after its program plus that many settle frames
     without rewriting the dataset: samples, action chunks (padded past the cut), statistics and the fingerprint
     cover the kept frames only.
+
+    `gripper_state` (see GRIPPER_STATES) selects the proprioception layout of `qpos` and of the statistics.
     """
     def __init__(self, dataset_path, task_names=None, chunk_size=100, image_size=(240, 240),
                  cache_row_groups=2, video_cache_size=3, timestamp_tolerance=0.008, profile_reads=False,
-                 frame_cache=None, episodes=None, settle_steps='all'):
+                 frame_cache=None, episodes=None, settle_steps='all', gripper_state='sum'):
+        if gripper_state not in GRIPPER_STATES:
+            raise ValueError(f'Unknown gripper_state {gripper_state!r}; expected one of {GRIPPER_STATES}')
+        self.gripper_state = gripper_state
         self.root = Path(dataset_path).resolve()
         self.info = json.loads((self.root / 'meta/info.json').read_text())
         if self.info.get('codebase_version') != 'v3.0':
@@ -359,6 +388,8 @@ class B1KDataset(torch.utils.data.Dataset):
         payload = {'root': str(self.root), 'episodes': self.episodes,
                    'files': [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in files],
                    'state_indices': STATE_INDICES, 'std_correction': 1}
+        if self.gripper_state != 'fingers':  # `fingers` keeps the fingerprints of runs from before the option
+            payload['gripper_state'] = self.gripper_state
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
     def __len__(self):
@@ -542,7 +573,8 @@ class B1KDataset(torch.utils.data.Dataset):
         actions = np.zeros((self.chunk_size, 23), dtype=np.float32)
         actions[:count] = table['action'][row:row + count]
         is_pad = np.arange(self.chunk_size) >= count
-        qpos = preprocess_state(table['state'][row], int(ep['task_index']), self.stats, self.task_map)
+        qpos = preprocess_state(table['state'][row], int(ep['task_index']), self.stats, self.task_map,
+                                self.gripper_state)
         actions = (actions - np.asarray(self.stats['action_mean'])) / np.asarray(self.stats['action_std'])
         middle = time.perf_counter() if self.profile_reads else 0
         images = np.empty((len(VIDEO_KEYS), *self.image_size, 3), dtype=np.uint8)
@@ -563,7 +595,7 @@ class B1KDataset(torch.utils.data.Dataset):
             return self._cached_sample(self.positions[int(episode_id)], frame)
         images, state, actions, is_pad, task_id = self.raw_sample(episode_id, frame)
         image = torch.stack([preprocess_image(x, self.image_size) for x in images])
-        qpos = preprocess_state(state, task_id, self.stats, self.task_map)
+        qpos = preprocess_state(state, task_id, self.stats, self.task_map, self.gripper_state)
         actions = (actions - np.asarray(self.stats['action_mean'])) / np.asarray(self.stats['action_std'])
         return image, qpos, torch.from_numpy(actions.astype(np.float32)), torch.from_numpy(is_pad)
 
@@ -595,8 +627,9 @@ class B1KDataset(torch.utils.data.Dataset):
     def compute_stats(self, max_frames=None):
         """Stream each selected file once; never decode video or retain all frames."""
         count = 0
-        mean = np.zeros(48, dtype=np.float64)
-        m2 = np.zeros(48, dtype=np.float64)
+        split = proprio_dim(self.gripper_state)
+        mean = np.zeros(split + 23, dtype=np.float64)
+        m2 = np.zeros(split + 23, dtype=np.float64)
         by_file = {}
         for ep in self.episodes:
             by_file.setdefault(self.data_path(ep), []).append(ep)
@@ -615,7 +648,7 @@ class B1KDataset(torch.utils.data.Dataset):
                         table = table.slice(0, max(0, max_frames - count))
                     if not table.num_rows:
                         continue
-                    x = np.concatenate([_matrix(table['observation.state'])[:, STATE_INDICES],
+                    x = np.concatenate([extract_state(_matrix(table['observation.state']), self.gripper_state),
                                         _matrix(table['action'])], axis=1).astype(np.float64)
                     if not np.isfinite(x).all():
                         raise ValueError(f'Non-finite state/action statistics in {path}')
@@ -635,10 +668,10 @@ class B1KDataset(torch.utils.data.Dataset):
         if count < 2:
             raise ValueError('At least two frames required for sample-standard-deviation normalization')
         std = np.maximum(np.sqrt(m2 / (count - 1)), 0.01)
-        return {'qpos_mean': mean[:25].astype(np.float32).tolist(),
-                'qpos_std': std[:25].astype(np.float32).tolist(),
-                'action_mean': mean[25:].astype(np.float32).tolist(),
-                'action_std': std[25:].astype(np.float32).tolist(),
+        return {'qpos_mean': mean[:split].astype(np.float32).tolist(),
+                'qpos_std': std[:split].astype(np.float32).tolist(),
+                'action_mean': mean[split:].astype(np.float32).tolist(),
+                'action_std': std[split:].astype(np.float32).tolist(),
                 'count': count, 'std_correction': 1, 'std_floor': 0.01,
                 'approximate': count != len(self), 'fingerprint': self.fingerprint()}
 

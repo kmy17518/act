@@ -20,8 +20,8 @@ import websockets.asyncio.client
 import websockets.asyncio.server
 
 from b1k_dataset import (B1KDataset, OBS_KEYS, STATE_INDICES, VIDEO_KEYS, StepBatchSampler,
-                         SplitBatchSampler, expand_task_groups, parse_settle_steps, preprocess_image,
-                         preprocess_state, resolve_episode_split, settle_frames)
+                         SplitBatchSampler, expand_task_groups, extract_state, parse_settle_steps, preprocess_image,
+                         preprocess_state, proprio_dim, resolve_episode_split, settle_frames)
 from b1k_frame_cache import (FrameCacheReader, build_frame_cache, dequantize_images, entry_is_valid, quantize_image,
                              selected_videos, verify_frame_cache)
 from b1k_server import B1KServer, Session, packb, unpackb
@@ -92,8 +92,8 @@ def hdf5_reference(root, tmp_path, stats, sim=True):
         samples = [dataset.raw_sample(ep['episode_index'], frame) for frame in range(ep['length'])]
         with h5py.File(directory / f'episode_{i}.hdf5', 'w') as file:
             file.attrs['sim'] = sim
-            file['observations/qpos'] = np.stack([sample[1][STATE_INDICES] for sample in samples])
-            file['observations/qvel'] = np.zeros((ep['length'], 25), dtype=np.float32)
+            file['observations/qpos'] = np.stack([extract_state(sample[1]) for sample in samples])
+            file['observations/qvel'] = np.zeros((ep['length'], 23), dtype=np.float32)
             file['action'] = np.stack([sample[2][0] for sample in samples])
             for c, key in enumerate(VIDEO_KEYS):
                 file[f'observations/images/{key}'] = np.stack([sample[0][c] for sample in samples])
@@ -118,10 +118,10 @@ def test_exact_hdf5_statistics_and_sample_boundaries(tiny_root, tmp_path):
                 reference = EpisodicDataset([e], str(directory), VIDEO_KEYS, reference_stats)[0]
             sample = dataset.sample_at(ep['episode_index'], frame)
             torch.testing.assert_close(sample[0], reference[0], atol=0, rtol=0)
-            torch.testing.assert_close(sample[1][:25], reference[1], atol=1e-6, rtol=1e-6)
+            torch.testing.assert_close(sample[1][:23], reference[1], atol=1e-6, rtol=1e-6)
             torch.testing.assert_close(sample[2], reference[2][:4], atol=1e-6, rtol=1e-6)
             torch.testing.assert_close(sample[3], reference[3][:4])
-            assert sample[1][25 + e] == 1
+            assert sample[1][23 + e] == 1
     assert dataset.sample_at(42, 4)[3].tolist() == [False, True, True, True]
     assert len(dataset._groups) <= 2 and len(dataset._videos) <= 3
     dataset.close()
@@ -168,7 +168,7 @@ def test_partial_noncontiguous_ids_task_filters(tiny_root):
     assert list(dataset.by_id) == [99] and len(dataset) == 5
     dataset.stats = dataset.compute_stats()
     assert dataset.stats['count'] == 5
-    assert dataset[0][1].shape == (26,)
+    assert dataset[0][1].shape == (23 + 1,)
     assert dataset[4][3][1:].all()
     metadata_path = tiny_root / 'meta/episodes/chunk-042/file-000.parquet'
     pq.write_table(pa.Table.from_pylist([dataset.episodes[0]]), metadata_path)
@@ -949,6 +949,72 @@ def test_settle_steps_are_recorded_and_the_checkpoint_value_is_authoritative_on_
                                             '--resume', str(tmp_path / 'legacy.pt'), '--settle-steps', '0']))
 
 
+def test_gripper_state_sums_each_finger_pair_into_one_opening():
+    state = np.arange(61, dtype=np.float32) + 100
+    summed, fingers = extract_state(state), extract_state(state, 'fingers')
+    np.testing.assert_array_equal(fingers, state[STATE_INDICES])
+    np.testing.assert_array_equal(summed, np.concatenate([state[0:3], state[53:57], state[3:10], [state[24] + state[25]],
+                                                          state[28:35], [state[49] + state[50]]]))
+    assert summed.shape == (proprio_dim('sum'),) == (23,) and fingers.shape == (proprio_dim('fingers'),) == (25,)
+    np.testing.assert_array_equal(extract_state(np.stack([state, state + 1]))[1], extract_state(state + 1))
+    with pytest.raises(ValueError, match="Unknown gripper_state 'mean'"):
+        extract_state(state, 'mean')
+    stats = {'qpos_mean': [0.] * 25, 'qpos_std': [1.] * 25}
+    with pytest.raises(ValueError, match="hold 25 proprioception values; gripper_state 'sum' has 23"):
+        preprocess_state(state, 7, stats, {7: 'first'})
+    torch.testing.assert_close(preprocess_state(state, 7, stats, {7: 'first'}, 'fingers'),
+                               torch.from_numpy(np.concatenate([fingers, [1.]]).astype(np.float32)))
+
+
+def test_summed_gripper_state_statistics_samples_and_legacy_fingerprint(tiny_root):
+    summed = B1KDataset(tiny_root, chunk_size=4, image_size=(16, 16))
+    fingers = B1KDataset(tiny_root, chunk_size=4, image_size=(16, 16), gripper_state='fingers')
+    assert summed.gripper_state == 'sum'
+    stats, finger_stats = summed.compute_stats(), fingers.compute_stats()
+    assert len(stats['qpos_mean']) == len(stats['qpos_std']) == 23 and len(finger_stats['qpos_mean']) == 25
+    assert stats['action_mean'] == finger_stats['action_mean'] and stats['action_std'] == finger_stats['action_std']
+    states = np.stack([summed.raw_sample(ep['episode_index'], frame)[1]
+                       for ep in summed.episodes for frame in range(ep['length'])])
+    np.testing.assert_allclose(stats['qpos_mean'], extract_state(states).astype(np.float64).mean(0), rtol=1e-6)
+    summed.stats = stats
+    assert summed.sample_at(42, 1)[1].shape == (23 + 2,)
+    # `fingers` keeps the fingerprint (and statistics cache) of runs from before the option; `sum` gets its own.
+    files = sorted({fingers.data_path(ep) for ep in fingers.episodes})
+    legacy = {'root': str(fingers.root), 'episodes': fingers.episodes,
+              'files': [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in files],
+              'state_indices': STATE_INDICES, 'std_correction': 1}
+    assert fingers.fingerprint() == hashlib.sha256(json.dumps(legacy, sort_keys=True).encode()).hexdigest()
+    assert summed.fingerprint() != fingers.fingerprint()
+    with pytest.raises(ValueError, match="Unknown gripper_state 'both'"):
+        B1KDataset(tiny_root, gripper_state='both')
+
+
+def test_gripper_state_is_recorded_and_legacy_checkpoints_resume_and_serve(tiny_root, tmp_path):
+    from b1k_server import PolicyPredictor
+    common = ['--dataset-path', str(tiny_root), '--batch-size', '2', '--num-workers', '0', '--device', 'cpu',
+              '--chunk-size', '4', '--image-size', '32', '32', '--hidden-dim', '32', '--dim-feedforward', '64',
+              '--enc-layers', '1', '--dec-layers', '1', '--nheads', '4', '--no-pretrained-backbone', '--save-every', '1']
+    summed = load_checkpoint(train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'sum'),
+                                                                 '--max-steps', '1'])))
+    assert summed['adapter_config']['gripper_state'] == 'sum' and summed['train_config']['gripper_state'] == 'sum'
+    assert summed['model_config']['state_dim'] == 23 + 2 and len(summed['normalization']['qpos_mean']) == 23
+    fingers = load_checkpoint(train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'fingers'),
+                                                                  '--max-steps', '1', '--gripper-state', 'fingers'])))
+    assert fingers['adapter_config']['gripper_state'] == 'fingers' and fingers['model_config']['state_dim'] == 25 + 2
+    # A checkpoint from before the option (no recorded layout) resumes and serves with both finger positions.
+    legacy = dict(fingers, adapter_config={k: v for k, v in fingers['adapter_config'].items() if k != 'gripper_state'})
+    torch.save(legacy, tmp_path / 'legacy.pt')
+    resumed = load_checkpoint(train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'legacy'),
+                                                                  '--max-steps', '2', '--resume', str(tmp_path / 'legacy.pt')])))
+    assert 'gripper_state' not in resumed['adapter_config'] and resumed['model_config']['state_dim'] == 25 + 2
+    with pytest.raises(ValueError, match=r'--gripper-state sum differs from checkpoint \(fingers\)'):
+        train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'refused'), '--max-steps', '2',
+                                            '--resume', str(tmp_path / 'legacy.pt'), '--gripper-state', 'sum']))
+    for checkpoint, layout in ((summed, 'sum'), (load_checkpoint(tmp_path / 'legacy.pt'), 'fingers')):
+        session = Session(PolicyPredictor(checkpoint, 'cpu'), checkpoint, action_horizon=2)
+        assert session.gripper_state == layout and session.act(observation()).shape == (1, 23)
+
+
 def test_fused_attention_matches_explicit_attention_weights_path():
     from detr.models.transformer import use_fused_attention
     torch.set_num_threads(1)
@@ -1384,8 +1450,9 @@ def test_preprocessing_session_replan_batch_tasks_and_transaction():
     first = session.act(obs)
     assert first.shape == (2, 23) and first.dtype == np.float32
     qpos, images = predictor.calls[-1]
+    assert session.gripper_state == 'fingers' and qpos.shape == (2, 25 + 2)  # no recorded layout: 25 values
     torch.testing.assert_close(qpos[0], preprocess_state(obs['robot_r1::proprio'][0], 7,
-                                                       session.stats, session.task_map))
+                                                       session.stats, session.task_map, 'fingers'))
     torch.testing.assert_close(images[0, 0], preprocess_image(obs[OBS_KEYS[0]][0], (16, 16)))
     invalid = observation(2, 777)
     old_positions = session.positions.copy()
