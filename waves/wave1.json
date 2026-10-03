@@ -23,6 +23,14 @@
   "staging_root": "/tmp/dev/hf-staging/isg",
   "logs_root": "/tmp/dev/logs/isg",
   "tmux_server": "isg",
+  "tier_a": {
+    "heldout_dataset": "/tmp/dev/datasets/isg-init-eval",
+    "dir": "tierA-eval50",
+    "wandb_suffix": "tae",
+    "wandb_prefix": "tierA-eval50",
+    "summary": "tier-a-eval50-summary.json",
+    "note": "Held-out = the test set kmy17518/isg-init-eval (split eval50: 50 episodes per testbed task, board game included, instances no training demo uses; settle windows cut with --settle-steps 0 like training). The earlier results on isg-init's own 39 held-out episodes stay in <run>/tierA/ and W&B <run>-ta."
+  },
   "common": {
     "max_steps": 50000,
     "eval_every": 10000,
@@ -281,6 +289,66 @@
         "random",
         "--lr-goal",
         "1e-3"
+      ]
+    },
+    {
+      "name": "w1-early-copy05-lrg1e-3-s1",
+      "gpu": 0,
+      "cores": "0-23",
+      "seed": 1,
+      "role": "seed-1 replicate of wave-1 slot 7 (w1-early-copy05-lrg1e-3-s0): verdict-independent run launched after the 50k Tier A on the test set (plan 6.2, verdict unclear without Tier B; every seed-0 run shares one initialization)",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3"
+      ]
+    },
+    {
+      "name": "w1-early-random-lrg1e-3-s1",
+      "gpu": 1,
+      "cores": "24-47",
+      "seed": 1,
+      "role": "seed-1 replicate of wave-1 slot 6 (w1-early-random-lrg1e-3-s0): verdict-independent run launched after the 50k Tier A on the test set (plan 6.2, verdict unclear without Tier B; every seed-0 run shares one initialization)",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "random",
+        "--lr-goal",
+        "1e-3"
+      ]
+    },
+    {
+      "name": "w1-early-zero-lrg1e-3-s1",
+      "gpu": 2,
+      "cores": "48-71",
+      "seed": 1,
+      "role": "seed-1 replicate of wave-1 slot 5 (w1-early-zero-lrg1e-3-s0): verdict-independent run launched after the 50k Tier A on the test set (plan 6.2, verdict unclear without Tier B; every seed-0 run shares one initialization)",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "zero",
+        "--lr-goal",
+        "1e-3"
+      ]
+    },
+    {
+      "name": "w1-late-tagzero-lrg1e-4-s2",
+      "gpu": 3,
+      "cores": "72-95",
+      "seed": 2,
+      "role": "seed-2 replicate of wave-1 slot 1 (w1-late-tagzero-lrg1e-4-s0, the baseline): third seed of the noise floor (seed 1 trains to 2.1x the training L1 of seed 0); verdict-independent, launched after the 50k Tier A",
+      "flags": [
+        "--goal-fusion",
+        "late",
+        "--goal-tag-init",
+        "zero",
+        "--lr-goal",
+        "1e-4"
       ]
     }
   ],
