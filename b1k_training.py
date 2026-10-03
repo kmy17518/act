@@ -585,7 +585,7 @@ def parser():
                    help='Frames kept after each episode\'s program (the recorded settle window, where the robot holds '
                         'still), cut at load time using <dataset root>/isg_meta/settle_windows.json: all (default: every '
                         'recorded frame), a number of frames (0 keeps the program only) or a decimal fraction of the '
-                        'program length (0.2), capped at the recorded window. '
+                        'program length (0.2), capped at the recorded window. Goal images stay the last recorded frame. '
                         'Resume reuses the checkpoint\'s value; an explicit SPEC must equal it')
     p.add_argument('--gripper-state', choices=GRIPPER_STATES, default='sum', action=ExplicitOption,
                    help='Gripper proprioception: sum (default) adds the two finger positions of each gripper into one '
