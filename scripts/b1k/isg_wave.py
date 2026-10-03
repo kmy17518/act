@@ -204,7 +204,7 @@ def status(manifest):
         if status_file.exists():
             value = json.loads(status_file.read_text())
             upload = f'{value["health"]} full={value["current_step"]} eval={value["eval_steps"]}'
-        tier_a = sorted(p.stem for p in (where['run'] / 'tierA').glob('step_*.json')) if (where['run'] / 'tierA').exists() else []
+        tier_a = sorted(p.stem for p in (where['run'] / 'tierA').glob('step_*.json') if not p.stem.endswith('.probe')) if (where['run'] / 'tierA').exists() else []
         remaining = (max_steps(manifest, run) - last['step']) * step_s / 3600
         print(f'{name:44s} step {last["step"]:6d} {step_s:.3f} s/step L1(last100) {l1:.4f} '
               f'peak {last.get("gpu/peak_reserved_bytes", 0) / 2**30:.0f} GiB eta {remaining:.1f} h exit {exit_code} | '

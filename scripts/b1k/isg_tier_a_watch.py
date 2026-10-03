@@ -71,6 +71,8 @@ def flatten(result):
 def log_wandb(manifest, name, result):
     if not os.environ.get('WANDB_API_KEY'):
         return 'skipped (no WANDB_API_KEY)'
+    # the trainers' endpoint; this host's inherited WANDB_BASE_URL points elsewhere
+    os.environ['WANDB_BASE_URL'] = manifest['wandb'].get('base_url', 'https://api.wandb.ai')
     import wandb
     run = wandb.init(project=manifest['wandb']['project'], entity=manifest['wandb']['entity'], id=f'{name}-ta',
                      name=f'{name}-tierA', group=name, job_type='tier-a', resume='allow',
@@ -97,25 +99,52 @@ def pending(manifest, name):
     return found
 
 
+def write_json(path, value):
+    temporary = path.with_name(path.name + '.tmp')
+    temporary.write_text(json.dumps(value, indent=2))
+    temporary.replace(path)
+
+
 def probe(manifest, name, run, step, checkpoint):
+    """Probe once (a probe result left by an earlier attempt is reused), then write the Tier A JSON; W&B is
+    logged separately by `publish` so that a W&B outage never re-runs the probe on the training GPU."""
     run_dir = paths(manifest, name)['run']
     output = run_dir / 'tierA' / f'step_{step:08d}.json'
     raw = output.with_name(output.stem + '.probe.json')
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(run.get('gpu', 0)), OMP_NUM_THREADS='4')
     started = time.time()
-    subprocess.run(['taskset', '-c', '120-143', str(CHECKOUT / '.venv/bin/python'), '-u',
-                    str(CHECKOUT / 'scripts/b1k/isg_tier_a.py'), str(checkpoint), '--output', str(raw),
-                    '--device', 'cuda', '--batch-size', '64'],
-                   check=True, env=env, stdout=subprocess.DEVNULL, cwd=CHECKOUT)
+    if not raw.exists():
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(run.get('gpu', 0)), OMP_NUM_THREADS='4')
+        subprocess.run(['taskset', '-c', '120-143', str(CHECKOUT / '.venv/bin/python'), '-u',
+                        str(CHECKOUT / 'scripts/b1k/isg_tier_a.py'), str(checkpoint), '--output', str(raw),
+                        '--device', 'cuda', '--batch-size', '64'],
+                       check=True, env=env, stdout=subprocess.DEVNULL, cwd=CHECKOUT)
     result = json.loads(raw.read_text())
     result['training'] = training_context(run_dir, step)
-    result['wandb_tier_a'] = log_wandb(manifest, name, result)
-    temporary = output.with_name(output.name + '.tmp')
-    temporary.write_text(json.dumps(result, indent=2))
-    temporary.replace(output)
+    result['wandb_tier_a'] = None
+    write_json(output, result)
     raw.unlink(missing_ok=True)
     print(json.dumps({'event': 'tier_a', 'run': name, 'step': step, 'seconds': round(time.time() - started),
                       'heldout': result['heldout'].get('mean'), 'train': result['train'].get('mean')}), flush=True)
+
+
+def publish(manifest, name):
+    """Log every Tier A result of a run that is not on W&B yet (in step order; W&B steps must increase)."""
+    directory = paths(manifest, name)['run'] / 'tierA'
+    if not directory.exists():
+        return
+    for path in sorted(directory.glob('step_*.json')):
+        if path.stem.endswith('.probe'):
+            continue
+        result = json.loads(path.read_text())
+        if result.get('wandb_tier_a'):
+            continue
+        try:
+            result['wandb_tier_a'] = log_wandb(manifest, name, result)
+        except Exception as exc:  # retried next poll
+            print(json.dumps({'event': 'wandb_failed', 'run': name, 'step': result['step'],
+                              'error': f'{type(exc).__name__}: {exc}'[:300]}), flush=True)
+            return
+        write_json(path, result)
 
 
 def write_summary(manifest):
@@ -146,6 +175,7 @@ def main():
                 except Exception as exc:  # keep watching the other runs
                     print(json.dumps({'event': 'tier_a_failed', 'run': name, 'step': step,
                                       'error': f'{type(exc).__name__}: {exc}'[:500]}), flush=True)
+            publish(manifest, name)
         write_summary(manifest)
         if args.once:
             return 0

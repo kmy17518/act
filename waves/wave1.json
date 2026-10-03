@@ -16,7 +16,8 @@
   "hf_repo_prefix": "act-isg-",
   "wandb": {
     "entity": "kmy17518",
-    "project": "b1k-isg-goal"
+    "project": "b1k-isg-goal",
+    "base_url": "https://api.wandb.ai"
   },
   "runs_root": "/tmp/dev/runs/isg",
   "staging_root": "/tmp/dev/hf-staging/isg",
@@ -107,7 +108,7 @@
       "gpu": 0,
       "cores": "0-23",
       "seed": 0,
-      "role": "goal-LR calibration (early, 1e-4) and the bf16-backbone arm of the bf16 check; continues as wave-1 slot 5 if 1e-4 is chosen",
+      "role": "goal-LR calibration (early, 1e-4) and bf16 arm of the bf16 check: stopped at 10k (early goal LR = 1e-3)",
       "flags": [
         "--goal-fusion",
         "early",
@@ -122,7 +123,7 @@
       "gpu": 1,
       "cores": "24-47",
       "seed": 0,
-      "role": "goal-LR calibration (late, 1e-5); continues as wave-1 slot 1 (baseline) if 1e-5 is chosen",
+      "role": "goal-LR calibration (late, 1e-5): stopped at 10k (late goal LR = 1e-4)",
       "flags": [
         "--goal-fusion",
         "late",
@@ -137,7 +138,7 @@
       "gpu": 2,
       "cores": "48-71",
       "seed": 0,
-      "role": "goal-LR calibration (late, 1e-4); continues as wave-1 slot 1 (baseline) if 1e-4 is chosen",
+      "role": "wave-1 slot 1 (late, tag zero, seed 0: baseline); also the late 1e-4 calibration run",
       "flags": [
         "--goal-fusion",
         "late",
@@ -174,7 +175,7 @@
       "cores": "72-95",
       "seed": 0,
       "after": "pf-bf16check-early-zero-lrg1e-4-tf32-s0",
-      "role": "goal-LR calibration (early, 1e-3); continues as wave-1 slot 5 if 1e-3 is chosen",
+      "role": "wave-1 slot 5 (early, goal half zero); also the early 1e-3 calibration run",
       "flags": [
         "--goal-fusion",
         "early",
@@ -183,12 +184,110 @@
         "--lr-goal",
         "1e-3"
       ]
+    },
+    {
+      "name": "w1-late-tagzero-lrg1e-4-s1",
+      "gpu": 1,
+      "cores": "24-47",
+      "seed": 1,
+      "role": "wave-1 slot 2 (late, tag zero, seed 1: noise floor)",
+      "flags": [
+        "--goal-fusion",
+        "late",
+        "--goal-tag-init",
+        "zero",
+        "--lr-goal",
+        "1e-4"
+      ]
+    },
+    {
+      "name": "w1-early-copy05-lrg1e-3-s0",
+      "gpu": 0,
+      "cores": "0-23",
+      "seed": 0,
+      "role": "wave-1 slot 7 (early, 0.5x ImageNet copy, halves free to drift)",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3"
+      ]
+    },
+    {
+      "name": "w1-late-tagrand-lrg1e-4-s0",
+      "gpu": 2,
+      "cores": "48-71",
+      "seed": 0,
+      "after": "w1-late-tagzero-lrg1e-4-s0",
+      "role": "wave-1 slot 3 (late, tag random N(0, 0.5^2)), queued after slot 1 on GPU 2",
+      "flags": [
+        "--goal-fusion",
+        "late",
+        "--goal-tag-init",
+        "normal:0.5",
+        "--lr-goal",
+        "1e-4"
+      ]
+    },
+    {
+      "name": "w1-late-frozen-lrg1e-4-s0",
+      "gpu": 3,
+      "cores": "72-95",
+      "seed": 0,
+      "after": "w1-early-zero-lrg1e-3-s0",
+      "role": "wave-1 slot 4 (late, frozen ImageNet goal encoder), queued after slot 5 on GPU 3",
+      "flags": [
+        "--goal-fusion",
+        "late",
+        "--goal-encoder",
+        "frozen",
+        "--goal-tag-init",
+        "zero",
+        "--lr-goal",
+        "1e-4"
+      ]
+    },
+    {
+      "name": "w1-late-pooled-lrg1e-4-s0",
+      "gpu": 1,
+      "cores": "24-47",
+      "seed": 0,
+      "after": "w1-late-tagzero-lrg1e-4-s1",
+      "role": "wave-1 slot 8 (late, one pooled goal token), queued after slot 2 on GPU 1",
+      "flags": [
+        "--goal-fusion",
+        "late",
+        "--goal-tokens",
+        "pooled",
+        "--goal-tag-init",
+        "zero",
+        "--lr-goal",
+        "1e-4"
+      ]
+    },
+    {
+      "name": "w1-early-random-lrg1e-3-s0",
+      "gpu": 0,
+      "cores": "0-23",
+      "seed": 0,
+      "after": "w1-early-copy05-lrg1e-3-s0",
+      "role": "wave-1 slot 6 (early, goal half random), queued after slot 7 on GPU 0",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "random",
+        "--lr-goal",
+        "1e-3"
+      ]
     }
   ],
   "deferred": [
     {
       "name": "w1-early-zero-lrg1e-5-s0",
-      "role": "goal-LR calibration (early, 1e-5): fifth calibration slot, runs when a GPU frees up",
+      "role": "goal-LR calibration (early, 1e-5): fifth calibration slot, runs when a GPU frees up; not run: the 10k decision did not need it",
       "flags": [
         "--goal-fusion",
         "early",
@@ -198,5 +297,10 @@
         "1e-5"
       ]
     }
-  ]
+  ],
+  "decision_10k": {
+    "late_lr_goal": 0.0001,
+    "early_lr_goal": 0.001,
+    "evidence": "Tier A at 10k (held-out task means): late 1e-5 vs 1e-4 gap 0.0687 vs 0.0688 (tie), swap 0.014 vs 0.091; early 1e-4 vs 1e-3 gap 0.013 vs 0.035, L1_own 0.0665 vs 0.0697 (+4.8%, inside the 5% guard)"
+  }
 }
