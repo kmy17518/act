@@ -373,7 +373,7 @@ def test_conditioned_train_resume_eval_and_network_without_clip_or_sidecar(tiny_
                                          ['--output-dir', str(split), '--max-steps', '1']))
     assert len(loaded) == 4 and len(encoder.calls) == 4
     first = load_checkpoint(first_path)
-    assert first['model_config']['state_dim'] == 27
+    assert first['model_config']['state_dim'] == 23 + 2
     assert first['adapter_config']['task_conditioning'] == 'onehot'
     assert first['language_cache']['prompt_source'] == source
     for option, value in [('--language-conditioning', 'none'),
@@ -553,7 +553,7 @@ def test_mt_act_train_resume_serve_without_transformers(tiny_root, tmp_path, fak
     first = load_checkpoint(first_path)
     config = first['model_config']
     assert config['language_conditioning'] == 'mt_act' and config['language_encoder'] == 'minilm'
-    assert config['state_dim'] == 25 and config['backbone_norm'] == 'batch' and config['pretrained_backbone'] is False
+    assert config['state_dim'] == 23 and config['backbone_norm'] == 'batch' and config['pretrained_backbone'] is False
     assert config['film_init'] == 'random' and first['adapter_config']['task_conditioning'] == 'onehot'
     assert first['language_cache']['embedding_dim'] == 384 and first['language_cache']['normalized'] is True
     assert any('running_mean' in key for key in first['model'] if 'backbones' in key)
