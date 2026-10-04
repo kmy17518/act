@@ -186,11 +186,15 @@ def main():
     parser.add_argument('manifest')
     parser.add_argument('--poll-seconds', type=float, default=120)
     parser.add_argument('--once', action='store_true')
+    parser.add_argument('--machine', help='Only runs the manifest assigns to this machine (or to none); copied results '
+                        'of other machines\' runs are neither probed nor logged to W&B')
     args = parser.parse_args()
     while True:
         manifest = load(args.manifest)  # re-read: runs may be added during the wave
         queues = {}
         for name, run in manifest['_runs'].items():
+            if args.machine and run.get('machine', args.machine) != args.machine:
+                continue
             for step, checkpoint in pending(manifest, name):
                 queues.setdefault(run.get('gpu', 0), []).append((name, run, step, checkpoint))
 
