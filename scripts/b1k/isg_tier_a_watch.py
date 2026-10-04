@@ -36,8 +36,12 @@ SHORT = {'camera_relocalization-standard': 'reloc',
          'camera_relocalization-obstructed-footstool_1': 'reloc_obstructed'}
 
 
-def probe_cores(gpu):
-    """Twelve of cores 96-143 per GPU (the trainers are pinned to 0-95)."""
+def probe_cores(gpu, manifest=None):
+    """The manifest's `probe_cores[gpu]` if given, else twelve of cores 96-143 per GPU (machine 1: the trainers are
+    pinned to 0-95)."""
+    ranges = (manifest or {}).get('probe_cores')
+    if ranges:
+        return ranges[int(gpu) % len(ranges)]
     first = 96 + 12 * (int(gpu) % 4)
     return f'{first}-{first + 11}'
 
@@ -130,7 +134,7 @@ def probe(manifest, name, run, step, checkpoint):
         gpu = run.get('gpu', 0)
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu), OMP_NUM_THREADS='4')
         heldout = ['--heldout-dataset', config['heldout_dataset']] if config['heldout_dataset'] else []
-        subprocess.run(['taskset', '-c', probe_cores(gpu), str(CHECKOUT / '.venv/bin/python'), '-u',
+        subprocess.run(['taskset', '-c', probe_cores(gpu, manifest), str(CHECKOUT / '.venv/bin/python'), '-u',
                         str(CHECKOUT / 'scripts/b1k/isg_tier_a.py'), str(checkpoint), *heldout, '--output', str(raw),
                         '--device', 'cuda', '--batch-size', '64'],
                        check=True, env=env, stdout=subprocess.DEVNULL, cwd=CHECKOUT)

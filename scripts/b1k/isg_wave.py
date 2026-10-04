@@ -59,6 +59,11 @@ def tier_a_config(manifest):
     return {**LEGACY_TIER_A, **(manifest.get('tier_a') or {})}
 
 
+def service_cores(manifest):
+    """CPU range for the uploaders and the Tier A probes (manifest `service_cores`; default 120-143, machine 1's)."""
+    return manifest.get('service_cores', '120-143')
+
+
 def max_steps(manifest, run):
     return int(run.get('max_steps', manifest['common']['max_steps']))
 
@@ -117,7 +122,7 @@ def upload_script(manifest, name):
         "export CUDA_VISIBLE_DEVICES=''",
         # exit 1 is a retryable failure the uploader already journaled; 2 is a safety stop that needs a human
         'while true; do',
-        f'  taskset -c 120-143 {" ".join(shlex.quote(part) for part in command)} >> {shlex.quote(str(where["upload_log"]))} 2>&1',
+        f'  taskset -c {service_cores(manifest)} {" ".join(shlex.quote(part) for part in command)} >> {shlex.quote(str(where["upload_log"]))} 2>&1',
         '  rc=$?; [ "$rc" -eq 1 ] || break; sleep 120', 'done',
         f'echo "$rc" > {shlex.quote(str(where["upload_exit"]))}', 'echo "uploader exited with $rc"', 'exit $rc']
     return '\n'.join(['#!/usr/bin/env bash', *lines, ''])

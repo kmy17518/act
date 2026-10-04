@@ -1,0 +1,291 @@
+{
+  "format": "isg-wave/v1",
+  "wave": 2,
+  "plan": "/tmp/dev/docs/isg-goal-conditioning-plan.md \u00a76.2, \"Early wins\" slate, started before the Tier B verdict at the user's request (2026-10-03)",
+  "description": "Refinements of the wave-1 Tier A winner, early fusion with a 0.5x ImageNet copy as the goal half and goal LR 1e-3 (runs w1-early-copy05-lrg1e-3-s0/s1). Code: branch isg-wave2-dev, except w2-early-copy05-lrg1e-3-s2, which machine 1 launches from the isg-wave1 checkout like seeds 0 and 1. Machine 2 first runs m2-calib-early-copy05-lrg1e-3-s0 (plan \u00a76.0 item 5; pass = mean training L1 over steps 501-1000 within 0.3 % of machine 1's 0.12560) and only then its four runs. On a machine without 144 cores set \"service_cores\" (uploaders) and \"probe_cores\" (one range per GPU, Tier A) and adapt each run's \"cores\".",
+  "dataset": "/tmp/dev/datasets/isg-init",
+  "frame_cache": "/tmp/dev/datasets/isg-init-act-frame-cache-224x224",
+  "train_split": "/tmp/dev/datasets/isg-init/isg_meta/train_split.json",
+  "tasks": [
+    "camera_relocalization-standard",
+    "configuration_matching-articulation_open_large_scale-dishwasher",
+    "configuration_matching-articulation_open_small_scale-blender_eyedvd-breakfast_table",
+    "alignment-axial-board_game-breakfast_table"
+  ],
+  "hf_owner": "kmy17518",
+  "hf_repo_prefix": "act-isg-",
+  "wandb": {
+    "entity": "kmy17518",
+    "project": "b1k-isg-goal",
+    "base_url": "https://api.wandb.ai"
+  },
+  "runs_root": "/tmp/dev/runs/isg",
+  "staging_root": "/tmp/dev/hf-staging/isg",
+  "logs_root": "/tmp/dev/logs/isg",
+  "tmux_server": "isg",
+  "tier_a": {
+    "heldout_dataset": "/tmp/dev/datasets/isg-init-eval",
+    "dir": "tierA-eval50",
+    "wandb_suffix": "tae",
+    "wandb_prefix": "tierA-eval50",
+    "summary": "tier-a-eval50-summary.json",
+    "note": "Held-out = the test set kmy17518/isg-init-eval (split eval50: 50 episodes per testbed task, board game included, instances no training demo uses; settle windows cut with --settle-steps 0 like training). The earlier results on isg-init's own 39 held-out episodes stay in <run>/tierA/ and W&B <run>-ta."
+  },
+  "common": {
+    "max_steps": 50000,
+    "eval_every": 10000,
+    "flags": [
+      "--settle-steps",
+      "0",
+      "--gripper-state",
+      "sum",
+      "--image-size",
+      "224",
+      "224",
+      "--regime",
+      "image",
+      "--goal-views",
+      "zed_link",
+      "--goal-source",
+      "episode_last",
+      "--policy-class",
+      "ACT",
+      "--hidden-dim",
+      "512",
+      "--dim-feedforward",
+      "3200",
+      "--enc-layers",
+      "4",
+      "--dec-layers",
+      "7",
+      "--nheads",
+      "8",
+      "--chunk-size",
+      "100",
+      "--position-embedding",
+      "sine",
+      "--no-pre-norm",
+      "--kl-weight",
+      "10",
+      "--dropout",
+      "0.1",
+      "--lr",
+      "1e-5",
+      "--lr-backbone",
+      "1e-5",
+      "--weight-decay",
+      "1e-4",
+      "--batch-size",
+      "1560",
+      "--loader-batch-size",
+      "128",
+      "--num-workers",
+      "8",
+      "--prefetch-factor",
+      "2",
+      "--torch-threads",
+      "2",
+      "--worker-threads",
+      "1",
+      "--arrow-threads",
+      "1",
+      "--opencv-threads",
+      "1",
+      "--device",
+      "cuda",
+      "--matmul-precision",
+      "high",
+      "--autocast",
+      "bf16-backbone",
+      "--compile",
+      "regions-autotune",
+      "--save-every",
+      "5000",
+      "--save-first-step",
+      "--save-total-limit",
+      "0",
+      "--export-every",
+      "10000",
+      "--wandb-mode",
+      "online"
+    ]
+  },
+  "base": {
+    "runs": [
+      "w1-early-copy05-lrg1e-3-s0",
+      "w1-early-copy05-lrg1e-3-s1"
+    ],
+    "flags": [
+      "--goal-fusion",
+      "early",
+      "--goal-stem-init",
+      "copy:0.5",
+      "--lr-goal",
+      "1e-3"
+    ]
+  },
+  "runs": [
+    {
+      "name": "m2-calib-early-copy05-lrg1e-3-s0",
+      "machine": "M2",
+      "gpu": 0,
+      "cores": "0-23",
+      "seed": 0,
+      "max_steps": 1000,
+      "upload": false,
+      "role": "cross-machine calibration: the first 1,000 steps of w1-early-copy05-lrg1e-3-s0 on machine 2 with the wave-2 code",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--save-every",
+        "1000"
+      ]
+    },
+    {
+      "name": "w2-early-copy025-lrg1e-3-s0",
+      "machine": "M2",
+      "gpu": 0,
+      "cores": "0-23",
+      "seed": 0,
+      "role": "0.25x ImageNet copy as the goal half",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.25",
+        "--lr-goal",
+        "1e-3"
+      ]
+    },
+    {
+      "name": "w2-early-gain-lrg1e-3-s0",
+      "machine": "M2",
+      "gpu": 1,
+      "cores": "24-47",
+      "seed": 0,
+      "role": "learned per-filter goal gain (starts as the 0.5x copy)",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:1",
+        "--goal-stem-gain",
+        "0.5",
+        "--lr-goal",
+        "1e-3"
+      ]
+    },
+    {
+      "name": "w2-early-diff-lrg1e-3-s0",
+      "machine": "M2",
+      "gpu": 2,
+      "cores": "48-71",
+      "seed": 0,
+      "role": "explicit goal-minus-current input channel",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--goal-stem-diff"
+      ]
+    },
+    {
+      "name": "w2-early-wrist-lrg1e-3-s0",
+      "machine": "M2",
+      "gpu": 3,
+      "cores": "72-95",
+      "seed": 0,
+      "role": "head + wrist pairing: each camera paired with its own final frame",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--goal-views",
+        "zed_link",
+        "left_realsense_link",
+        "right_realsense_link"
+      ]
+    },
+    {
+      "name": "w2-early-copy05-lrg1e-3-s2",
+      "machine": "M1",
+      "gpu": 1,
+      "cores": "24-47",
+      "seed": 2,
+      "role": "wave-1 winner, seed 2 (isg-wave1 code)",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3"
+      ]
+    },
+    {
+      "name": "w2-early-depth1-lrg1e-3-s0",
+      "machine": "M1",
+      "gpu": 2,
+      "cores": "48-71",
+      "seed": 0,
+      "role": "fusion depth: goal merged after ResNet layer 1",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--goal-fusion-depth",
+        "1"
+      ]
+    },
+    {
+      "name": "w2-early-depth2-lrg1e-3-s0",
+      "machine": "M1",
+      "gpu": 3,
+      "cores": "72-95",
+      "seed": 0,
+      "role": "fusion depth: goal merged after ResNet layer 2",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--goal-fusion-depth",
+        "2"
+      ]
+    },
+    {
+      "name": "w2-early-depth3-lrg1e-3-s0",
+      "machine": "M1",
+      "gpu": 0,
+      "cores": "0-23",
+      "seed": 0,
+      "after": "w1-early-zero-lrg1e-4-s0",
+      "role": "fusion depth: goal merged after ResNet layer 3 (queued behind the goal-LR resume on GPU 0)",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--goal-fusion-depth",
+        "3"
+      ]
+    }
+  ]
+}
