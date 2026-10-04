@@ -286,6 +286,63 @@
         "--goal-fusion-depth",
         "3"
       ]
+    },
+    {
+      "name": "w2-early-depth1-lrg1e-3-s1",
+      "machine": "M1",
+      "gpu": 2,
+      "cores": "48-71",
+      "seed": 1,
+      "after": "w2-early-depth1-lrg1e-3-s0",
+      "role": "fusion depth 1, seed 1 (pairs with w1-early-copy05-lrg1e-3-s1); queued after w2-early-depth1-lrg1e-3-s0",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--goal-fusion-depth",
+        "1"
+      ]
+    },
+    {
+      "name": "w2-early-depth2-lrg1e-3-s1",
+      "machine": "M1",
+      "gpu": 3,
+      "cores": "72-95",
+      "seed": 1,
+      "after": "w2-early-depth2-lrg1e-3-s0",
+      "role": "fusion depth 2, seed 1 (pairs with w1-early-copy05-lrg1e-3-s1); queued after w2-early-depth2-lrg1e-3-s0",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--goal-fusion-depth",
+        "2"
+      ]
+    },
+    {
+      "name": "w2-early-depth3-lrg1e-3-s1",
+      "machine": "M1",
+      "gpu": 1,
+      "cores": "24-47",
+      "seed": 1,
+      "after": "w2-early-copy05-lrg1e-3-s2",
+      "role": "fusion depth 3, seed 1 (pairs with w1-early-copy05-lrg1e-3-s1); queued after w2-early-copy05-lrg1e-3-s2",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--goal-fusion-depth",
+        "3"
+      ]
     }
   ]
 }

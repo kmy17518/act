@@ -360,8 +360,10 @@ class Collector:
         down = age > STALE
         was_down = self.state.setdefault('down', {}).get(name, False)
         if down and not was_down:
-            proposal = (' Proposed recovery (plan §7), not done without the user\'s OK: resume its runs on machine 1 from '
-                        'their Hub resume checkpoints under the same W&B ids.' if name == 'M2' else '')
+            proposal = (' Recovery (plan §7, pre-approved by the user on 2026-10-03): machine 1 takes over its unfinished '
+                        'runs from their Hub resume checkpoints under the same W&B ids as soon as a machine-1 GPU is free '
+                        '(queued seed replicates yield). M2 must not restart any run before reading m1/decisions.md.'
+                        if name == 'M2' else '')
             self.decide(f'down:{name}:{iso(updated)}', 'all',
                         [f'{name} is flagged as down: its status.json was last updated at {iso(updated)}, more than an hour '
                          f'ago.{proposal}'], f'{name} flagged as down (status.json older than 1 h)')
