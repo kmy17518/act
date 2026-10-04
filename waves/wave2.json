@@ -28,7 +28,7 @@
     "dir": "tierA-eval50",
     "wandb_suffix": "tae",
     "wandb_prefix": "tierA-eval50",
-    "summary": "tier-a-eval50-summary.json",
+    "summary": "tier-a-eval50-summary-wave2.json",
     "note": "Held-out = the test set kmy17518/isg-init-eval (split eval50: 50 episodes per testbed task, board game included, instances no training demo uses; settle windows cut with --settle-steps 0 like training). The earlier results on isg-init's own 39 held-out episodes stay in <run>/tierA/ and W&B <run>-ta."
   },
   "common": {
