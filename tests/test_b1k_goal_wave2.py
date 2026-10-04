@@ -185,3 +185,62 @@ def test_wave2_options_are_recorded_and_resume_exactly(tiny_root, tmp_path, fusi
                                                                   str(first_path), '--max-steps', '2'])))
     for key in expected['model']:
         torch.testing.assert_close(expected['model'][key], resumed['model'][key], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize('depth,channels', [(1, 64), (2, 128), (3, 256)])
+def test_fusion_depth_merges_after_stage_k_with_the_base_parameters_and_the_exact_absent_goal(depth, channels):
+    base, early = base_and_goal_policies('early', goal_fusion_depth=depth, goal_stem_init='copy:0.5')
+    early_state = early.state_dict()
+    assert set(early_state) - set(base.state_dict()) == {'model.backbones.0.0.goal_proj_merge.weight'}
+    for key, value in base.state_dict().items():
+        torch.testing.assert_close(value, early_state[key], atol=0, rtol=0)
+    merge = early.model.backbones[0][0].goal_proj_merge
+    assert merge.weight.shape == (channels, channels, 1, 1)
+    torch.testing.assert_close(merge.weight[:, :, 0, 0], 0.5 * torch.eye(channels), atol=0, rtol=0)
+    assert 'goal_weight' not in dict(early.model.backbones[0][0].body.conv1.named_parameters())
+    assert_masked_goal_is_the_base(base, early, inputs(size=64))
+
+
+def test_fusion_depth_zero_merge_starts_blind_and_a_plain_copy_cannot_tell_goal_from_current():
+    x = inputs(size=64)
+    base, zero = base_and_goal_policies('early', goal_fusion_depth=2, goal_stem_init='zero')
+    _, copy = base_and_goal_policies('early', goal_fusion_depth=2, goal_stem_init='copy:1')
+    images, goal = head_goal_swapped(x)
+    with torch.no_grad():
+        torch.testing.assert_close(zero(x['qpos'], x['images'], goal=x['goal']), base(x['qpos'], x['images']))
+        # f_K(current) + 1.0 * f_K(goal) is symmetric in the two images
+        torch.testing.assert_close(copy(x['qpos'], images, goal=goal), copy(x['qpos'], x['images'], goal=x['goal']),
+                                   atol=1e-5, rtol=1e-5)
+    torch.manual_seed(5)
+    policy = make_policy(goal_config(goal_fusion='early', goal_fusion_depth=1, goal_stem_init='copy:0.5', lr_goal=1e-3),
+                         'cpu')
+    names = {id(p): n for n, p in policy.named_parameters()}
+    assert [names[id(p)] for p in policy.configure_optimizers().param_groups[2]['params']] == \
+        ['model.backbones.0.0.goal_proj_merge.weight']
+    for overrides, message in [(dict(goal_fusion='late'), 'early fusion only'),
+                               (dict(goal_stem_gain=0.5), 'paired stem'),
+                               (dict(camera_batch=True), 'camera_batch')]:
+        with pytest.raises(ValueError, match=message):
+            make_policy(goal_config(**{'goal_fusion': 'early', 'goal_fusion_depth': 2, **overrides}), 'cpu')
+    args = parser().parse_args(['--dataset-path', 'x', '--output-dir', 'y', '--regime', 'image', '--goal-fusion', 'late',
+                                '--goal-fusion-depth', '1'])
+    with pytest.raises(ValueError, match='--goal-fusion-depth'):
+        resolve_regime(args)
+
+
+def test_fusion_depth_is_recorded_and_resumes_exactly(tiny_root, tmp_path):
+    torch.set_num_threads(1)
+    common = ['--dataset-path', str(tiny_root), '--batch-size', '2', '--num-workers', '0', '--torch-threads', '1',
+              '--device', 'cpu', '--chunk-size', '4', '--image-size', '64', '64', '--hidden-dim', '32',
+              '--dim-feedforward', '64', '--enc-layers', '1', '--dec-layers', '1', '--nheads', '4',
+              '--no-pretrained-backbone', '--save-every', '1', '--lr', '1e-3', '--lr-backbone', '1e-3', '--regime', 'image',
+              '--goal-fusion', 'early', '--goal-fusion-depth', '2', '--goal-stem-init', 'copy:0.5', '--lr-goal', '1e-2']
+    expected = load_checkpoint(train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'full'),
+                                                                   '--max-steps', '2'])))
+    first_path = train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'split'), '--max-steps', '1']))
+    first = load_checkpoint(first_path)
+    assert first['model_config']['goal_fusion_depth'] == 2 and first['conditioning']['goal']['fusion_depth'] == 2
+    resumed = load_checkpoint(train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'split'), '--resume',
+                                                                  str(first_path), '--max-steps', '2'])))
+    for key in expected['model']:
+        torch.testing.assert_close(expected['model'][key], resumed['model'][key], atol=0, rtol=0)

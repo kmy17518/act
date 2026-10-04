@@ -416,6 +416,9 @@ class BackboneBase(nn.Module):
         self.num_channels = num_channels
         # Plain list (not registered): the per-camera BatchNorm layers whose statistics set select_camera switches.
         self.per_camera_norms = [module for module in self.body.modules() if isinstance(module, PerCameraBatchNorm2d)]
+        # Early fusion at depth K >= 1 (enable_goal_merge): the goal is merged after ResNet stage `layer{K}`.
+        self.goal_depth = 0
+        self.goal_proj_merge = None
 
     def select_camera(self, camera):
         """Route the next pass to `camera`'s BatchNorm statistics (no-op without per-camera normalization)."""
@@ -426,7 +429,55 @@ class BackboneBase(nn.Module):
         """Goal-image early fusion: make the stem accept `[current; goal]` 6-channel inputs (see PairedConv2d)."""
         return pair_stem(self.body, init, gain, diff)
 
-    def forward(self, tensor, lang_emb=None, film_identity=False):
+    def enable_goal_merge(self, depth, init='zero'):
+        """Goal-image early fusion at depth K (1-3): the current image and the goal image both run through the shared
+        stem and stages 1..K; the goal's stage-K features enter the current ones through a goal-only 1x1 convolution
+        `goal_proj_merge` (no bias), and only the merged map continues through stages K+1..4. Its start follows the
+        stem's goal-half options: `zero` (goal invisible until trained), `random` (nn.Conv2d default) or `copy:SCALE`
+        (SCALE x identity, so the stage-K goal features are added at that scale, the depth-K analogue of the stem's
+        scaled copy). Depth 0 is the paired stem (`pair_stem`)."""
+        if self.language_conditioning != 'none' or not isinstance(self.body, IntermediateLayerGetter) \
+                or set(self.body.return_layers) != {'layer4'}:
+            raise ValueError('Fusion depth >= 1 is implemented for the plain backbone returning its last stage only')
+        if depth not in (1, 2, 3):
+            raise ValueError(f'Goal fusion depth must be 1, 2 or 3 for a merge after a ResNet stage, got {depth}')
+        block = getattr(self.body, f'layer{depth}')[-1]
+        channels = block.conv3.out_channels if hasattr(block, 'conv3') else block.conv2.out_channels
+        init = parse_goal_stem_init(init)
+        self.goal_depth = depth
+        self.goal_proj_merge = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        with torch.no_grad():
+            if init == 'zero':
+                self.goal_proj_merge.weight.zero_()
+            elif init.startswith('copy:'):
+                self.goal_proj_merge.weight.zero_()
+                self.goal_proj_merge.weight[:, :, 0, 0] = float(init[5:]) * torch.eye(channels)
+        return self.goal_proj_merge
+
+    def paired_forward(self, tensor, goal, goal_scale=None):
+        """The body's forward pass with the goal merged after stage `layer{goal_depth}` (see enable_goal_merge);
+        `goal_scale` (B,), when given, multiplies the merged goal term (0 = absent goal: exactly the base pass)."""
+        split, merged, out = f'layer{self.goal_depth}', False, OrderedDict()
+        x = tensor
+        for name, module in self.body.items():
+            x = module(x)
+            if not merged:
+                goal = module(goal)
+                if name == split:
+                    term = self.goal_proj_merge(goal)
+                    if goal_scale is not None:
+                        term = term * goal_scale.to(term.dtype)[:, None, None, None]
+                    x = x + term
+                    merged = True
+            if name in self.body.return_layers:
+                out[self.body.return_layers[name]] = x
+        return out
+
+    def forward(self, tensor, lang_emb=None, film_identity=False, goal=None, goal_scale=None):
+        if goal is not None:
+            if not self.goal_depth:
+                raise ValueError('Goal images enter this backbone through its paired stem, not a stage merge')
+            return self.paired_forward(tensor, goal, goal_scale)
         if self.language_conditioning != 'none':
             if lang_emb is None and not film_identity:
                 raise ValueError(f'{self.language_conditioning} requires language embeddings; a deliberate identity '
@@ -479,16 +530,18 @@ class Joiner(nn.Sequential):
         # this dtype and hand fp32 features to the rest of the network. None keeps the caller's precision.
         self.body_autocast_dtype = None
 
-    def forward(self, tensor_list: NestedTensor, lang_emb=None, camera=None, film_identity=False):
+    def forward(self, tensor_list: NestedTensor, lang_emb=None, camera=None, film_identity=False, goal=None,
+                goal_scale=None):
         if camera is not None:
             self[0].select_camera(camera)
         elif self[0].per_camera_norms:
             raise ValueError('Per-camera BatchNorm statistics need the camera index of this pass')
+        goal_kwargs = {} if goal is None else {'goal': goal, 'goal_scale': goal_scale}
         if self.body_autocast_dtype is None:
-            xs = self[0](tensor_list, lang_emb=lang_emb, film_identity=film_identity)
+            xs = self[0](tensor_list, lang_emb=lang_emb, film_identity=film_identity, **goal_kwargs)
         else:
             with torch.autocast(device_type=tensor_list.device.type, dtype=self.body_autocast_dtype):
-                xs = self[0](tensor_list, lang_emb=lang_emb, film_identity=film_identity)
+                xs = self[0](tensor_list, lang_emb=lang_emb, film_identity=film_identity, **goal_kwargs)
             xs = {name: x.float() for name, x in xs.items()}
         out: List[NestedTensor] = []
         pos = []

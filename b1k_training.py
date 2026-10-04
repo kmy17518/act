@@ -72,6 +72,7 @@ def goal_config(model_config):
     return {'goal_fusion': fusion, 'goal_views': views, 'goal_encoder': encoder, **late,
             'goal_stem_gain': None if gain is None else float(gain),
             'goal_stem_diff': bool(model_config.get('goal_stem_diff', False)),
+            'goal_fusion_depth': int(model_config.get('goal_fusion_depth', 0)),
             'goal_role_embedding': bool(model_config.get('goal_role_embedding', True)),
             'language_on_goal_encoder': bool(model_config.get('language_on_goal_encoder', False)),
             'goal_tag_init': parse_goal_tag_init(model_config.get('goal_tag_init', 'zero')),
@@ -550,6 +551,7 @@ def conditioning_record(model_config, adapter, dataset, root, episode_split=None
                  'entry': goal['goal_entry'] if goal['goal_fusion'] == 'late' else None,
                  'stem_gain': goal['goal_stem_gain'] if goal['goal_fusion'] == 'early' else None,
                  'stem_diff': goal['goal_stem_diff'] if goal['goal_fusion'] == 'early' else None,
+                 'fusion_depth': goal['goal_fusion_depth'] if goal['goal_fusion'] == 'early' else None,
                  'lr_goal': goal['lr_goal'],
                  'source': adapter.get('goal_source') if goal['goal_views'] else None,
                  'sampling_policy': 'fixed_terminal_frame_per_episode' if goal['goal_views'] else None,
@@ -631,6 +633,10 @@ def validate_goal_mechanism(args):
         raise ValueError('--goal-pos, --goal-content and --goal-entry apply to --goal-fusion late')
     if args.goal_fusion != 'early' and (args.goal_stem_gain is not None or args.goal_stem_diff):
         raise ValueError('--goal-stem-gain and --goal-stem-diff apply to --goal-fusion early')
+    if args.goal_fusion_depth and (args.goal_fusion != 'early' or args.goal_stem_gain is not None or args.goal_stem_diff
+                                   or args.camera_batch):
+        raise ValueError('--goal-fusion-depth >= 1 needs --goal-fusion early without --goal-stem-gain/--goal-stem-diff '
+                         'and without --backbone-camera-batch')
     if args.goal_entry == 'queries' and (args.goal_tokens != 'pooled' or args.goal_role_embedding):
         raise ValueError('--goal-entry queries requires --goal-tokens pooled and --no-goal-role-embedding')
 
@@ -737,6 +743,10 @@ def parser():
                         'needs --goal-tokens pooled --no-goal-role-embedding)')
     p.add_argument('--goal-stem-gain', type=float, default=None, action=LanguageOption, metavar='START',
                    help='Early fusion: learned per-filter gain on the goal half of the paired stem, starting at START')
+    p.add_argument('--goal-fusion-depth', type=int, choices=[0, 1, 2, 3], default=0, action=LanguageOption,
+                   help='Early fusion: where the goal joins the head camera, 0 = the paired stem (default), K = 1-3 = '
+                        'after ResNet stage K through a goal-only 1x1 convolution started by --goal-stem-init '
+                        '(copy:SCALE = SCALE x identity); the goal runs through the shared stem and stages 1..K')
     p.add_argument('--goal-stem-diff', action=ExplicitBooleanOption, default=False,
                    help='Early fusion: explicit goal-minus-current difference channel in the paired stem '
                         '(zero-initialized)')
@@ -858,7 +868,7 @@ def _train(args, output, root, resources):
                              ('language_on_goal_encoder', False), ('goal_tag_init', 'zero'),
                              ('goal_stem_init', 'zero'), ('goal_tokens', 'grid'), ('lr_goal', None),
                              ('goal_pos', 'sine'), ('goal_content', 'goal'), ('goal_entry', 'encoder'),
-                             ('goal_stem_gain', None), ('goal_stem_diff', False)]:
+                             ('goal_stem_gain', None), ('goal_stem_diff', False), ('goal_fusion_depth', 0)]:
             saved_value = model_config.get(key, default)
             if getattr(args, f'_{key}_explicit', False) and getattr(args, key) != saved_value:
                 raise ValueError(f'--{key.replace("_", "-")} differs from checkpoint')
@@ -936,6 +946,7 @@ def _train(args, output, root, resources):
                         'goal_tokens': args.goal_tokens, 'lr_goal': args.lr_goal,
                         'goal_pos': args.goal_pos, 'goal_content': args.goal_content, 'goal_entry': args.goal_entry,
                         'goal_stem_gain': args.goal_stem_gain, 'goal_stem_diff': bool(args.goal_stem_diff),
+                        'goal_fusion_depth': int(args.goal_fusion_depth),
                         'dilation': False, 'masks': False, 'action_dim': 23}
         if args.language_conditioning != 'none':
             model_config['film_init'] = args.film_init
@@ -1074,9 +1085,10 @@ def _train(args, output, root, resources):
                 goal['goal_role_embedding'], goal['language_on_goal_encoder'],
                 sum(parameter.numel() for parameter in policy.parameters()))
     if goal['goal_fusion'] != 'none':
-        LOGGER.info('Goal mechanism: tag init %s, stem init %s (gain %s, diff %s), tokens %s, positions %s, content %s, '
-                    'entry %s, goal LR %s (%d goal-group parameters)', goal['goal_tag_init'], goal['goal_stem_init'],
-                    goal['goal_stem_gain'], goal['goal_stem_diff'], goal['goal_tokens'], goal['goal_pos'],
+        LOGGER.info('Goal mechanism: tag init %s, stem init %s (gain %s, diff %s, fusion depth %s), tokens %s, positions '
+                    '%s, content %s, entry %s, goal LR %s (%d goal-group parameters)', goal['goal_tag_init'],
+                    goal['goal_stem_init'], goal['goal_stem_gain'], goal['goal_stem_diff'], goal['goal_fusion_depth'],
+                    goal['goal_tokens'], goal['goal_pos'],
                     goal['goal_content'], goal['goal_entry'], goal['lr_goal'],
                     sum(p.numel() for g in optimizer.param_groups[2:] for p in g['params']))
     begin = time.monotonic()

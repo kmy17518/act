@@ -75,7 +75,7 @@ class DETRVAE(nn.Module):
                  mt_act_language_dim=None, camera_batch=False, goal_fusion='none', goal_views=(),
                  goal_role_embedding=True, goal_encoder='shared_base', language_on_goal_encoder=False,
                  goal_tag_init='zero', goal_stem_init='zero', goal_tokens='grid', goal_pos='sine', goal_content='goal',
-                 goal_entry='encoder', goal_stem_gain=None, goal_stem_diff=False):
+                 goal_entry='encoder', goal_stem_gain=None, goal_stem_diff=False, goal_fusion_depth=0):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -122,6 +122,9 @@ class DETRVAE(nn.Module):
                 embedding; requires goal_tokens='pooled' and no goal tag).
             goal_stem_gain / goal_stem_diff: early fusion's learned per-filter goal gain (its start) and explicit
                 difference channel (see backbone.PairedConv2d).
+            goal_fusion_depth: early fusion's merge point: 0 pairs the goal with its camera in the stem (PairedConv2d);
+                K = 1-3 merges the goal's stage-K features into the current ones through a goal-only 1x1 convolution
+                whose start follows `goal_stem_init` (see backbone.BackboneBase.enable_goal_merge).
         """
         super().__init__()
         self.num_queries = num_queries
@@ -140,6 +143,16 @@ class DETRVAE(nn.Module):
                 raise ValueError(f'{label} must be one of {choices}, got {value!r}')
         late_options = (goal_pos, goal_content, goal_entry) != ('sine', 'goal', 'encoder')
         early_options = goal_stem_gain is not None or bool(goal_stem_diff)
+        goal_fusion_depth = int(goal_fusion_depth)
+        if goal_fusion_depth not in (0, 1, 2, 3):
+            raise ValueError(f'goal_fusion_depth must be 0, 1, 2 or 3, got {goal_fusion_depth}')
+        if goal_fusion_depth and goal_fusion != 'early':
+            raise ValueError('goal_fusion_depth applies to early fusion only')
+        if goal_fusion_depth and early_options:
+            raise ValueError('goal_stem_gain / goal_stem_diff modify the paired stem (goal_fusion_depth 0)')
+        if goal_fusion_depth and camera_batch:
+            raise ValueError('goal_fusion_depth >= 1 needs one backbone pass per camera (no camera_batch)')
+        self.goal_fusion_depth = goal_fusion_depth
         if late_options and goal_fusion != 'late':
             raise ValueError('goal_pos / goal_content / goal_entry apply to late fusion only')
         if early_options and goal_fusion != 'early':
@@ -211,7 +224,10 @@ class DETRVAE(nn.Module):
                 raise ValueError('Early fusion pairs the goal with its camera inside the shared stem; use goal_encoder=shared_base')
             if goal_tokens != 'grid':
                 raise ValueError('goal_tokens applies to late fusion only')
-            self.backbones[0][0].pair_stem(goal_stem_init, goal_stem_gain, bool(goal_stem_diff))
+            if goal_fusion_depth:
+                self.backbones[0][0].enable_goal_merge(goal_fusion_depth, goal_stem_init)
+            else:
+                self.backbones[0][0].pair_stem(goal_stem_init, goal_stem_gain, bool(goal_stem_diff))
         elif goal_fusion == 'late':
             if goal_stem_init != 'zero':
                 raise ValueError('goal_stem_init applies to early fusion only')
@@ -336,7 +352,7 @@ class DETRVAE(nn.Module):
                     for view, cam_id in enumerate(self.goal_views):
                         goal_half[:, cam_id] = goal[:, view]
                     parts = [stacked, goal_half]
-                    if self.backbones[0][0].body.conv1.goal_diff_weight is not None:
+                    if getattr(self.backbones[0][0].body.conv1, 'goal_diff_weight', None) is not None:
                         diff = torch.zeros_like(stacked)
                         for view, cam_id in enumerate(self.goal_views):
                             diff[:, cam_id] = self.goal_difference(stacked[:, cam_id], goal[:, view], goal_present, view)
@@ -356,14 +372,20 @@ class DETRVAE(nn.Module):
                 all_cam_pos = []
                 for cam_id, cam_name in enumerate(self.camera_names):
                     cam_image = image[:, cam_id]
+                    goal_kwargs = {}
                     if self.goal_fusion == 'early' and cam_id in self.goal_views:
-                        # [current; goal] channel stacking; both halves carry the same normalization
                         view = self.goal_views.index(cam_id)
-                        parts = [cam_image, goal[:, view]]
-                        if self.backbones[0][0].body.conv1.goal_diff_weight is not None:
-                            parts.append(self.goal_difference(cam_image, goal[:, view], goal_present, view))
-                        cam_image = torch.cat(parts, dim=1)
-                    features, pos = self.backbones[0](cam_image, lang_emb=lang_emb, camera=cam_id) # HARDCODED
+                        if self.goal_fusion_depth:
+                            # merged after stage K inside the backbone; an absent goal scales the merge to zero
+                            goal_kwargs = {'goal': goal[:, view],
+                                           'goal_scale': None if goal_present is None else goal_present[:, view]}
+                        else:
+                            # [current; goal] channel stacking; both halves carry the same normalization
+                            parts = [cam_image, goal[:, view]]
+                            if getattr(self.backbones[0][0].body.conv1, 'goal_diff_weight', None) is not None:
+                                parts.append(self.goal_difference(cam_image, goal[:, view], goal_present, view))
+                            cam_image = torch.cat(parts, dim=1)
+                    features, pos = self.backbones[0](cam_image, lang_emb=lang_emb, camera=cam_id, **goal_kwargs) # HARDCODED
                     features = features[0] # take the last layer feature
                     pos = pos[0]
                     all_cam_features.append(self.input_proj(features))
@@ -599,6 +621,7 @@ def build(args):
         goal_entry=getattr(args, 'goal_entry', 'encoder'),
         goal_stem_gain=getattr(args, 'goal_stem_gain', None),
         goal_stem_diff=bool(getattr(args, 'goal_stem_diff', False)),
+        goal_fusion_depth=int(getattr(args, 'goal_fusion_depth', 0)),
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
