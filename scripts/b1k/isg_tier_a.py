@@ -15,8 +15,13 @@ and reports, in normalized action units:
   swap       mean over frames of the largest |(d) - (a)| over the valid chunk (does it know which image is the goal)
 Frame selection, the other-goal draw and the subsets are deterministic in the seed, so checkpoints compare paired.
 
-    isg_tier_a.py CHECKPOINT [--dataset-path ROOT] [--frame-cache DIR] [--split FILE] [--frames-per-task 256]
-                  [--seed 0] [--device cuda] [--batch-size 64] [--output JSON]
+`--heldout-dataset ROOT` takes the held-out episodes from a separate LeRobot root (the test set kmy17518/isg-init-eval,
+collected on instances no training demo uses), listed by its `isg_meta/eval_split.json` (or `--split`). Tasks are
+matched by name (the root has its own task indices), its frames are decoded from video and rounded to uint8 exactly
+like the training frame cache, and the training subset still comes from the checkpoint's dataset root and frame cache.
+
+    isg_tier_a.py CHECKPOINT [--dataset-path ROOT] [--frame-cache DIR] [--heldout-dataset ROOT] [--split FILE]
+                  [--frames-per-task 256] [--seed 0] [--device cuda] [--batch-size 64] [--output JSON]
 """
 
 import argparse
@@ -30,7 +35,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from b1k_dataset import CAMERAS, B1KDataset  # noqa: E402
+from b1k_dataset import CAMERAS, B1KDataset, quantize_image  # noqa: E402
 from b1k_language import language_embedding_table, language_for_tasks  # noqa: E402
 from b1k_training import goal_config, load_checkpoint, make_policy, prepare_goals, prepare_images  # noqa: E402
 
@@ -90,21 +95,34 @@ class Probe:
             kwargs['lang_emb'] = language_for_tasks(task_id, self.embeddings, self.task_map)
         return self.policy(qpos, images, goal=goal, goal_valid=goal_valid, **kwargs).float()
 
+    def checkpoint_task_ids(self, dataset):
+        """Dataset task index -> checkpoint task index, by task name (a separate held-out root has its own indices)."""
+        by_name = {name: index for index, name in self.task_map.items()}
+        return {index: by_name[name] for index, name in dataset.task_map.items()}
+
+    @staticmethod
+    def frames_uint8(images):
+        """Uncached float (camera, 3, H, W) frames to the uint8 (camera, H, W, 3) frames the training cache holds."""
+        if images.dtype == torch.uint8:
+            return images
+        return torch.from_numpy(np.stack([quantize_image(image) for image in images]))
+
     @torch.no_grad()
     def evaluate(self, dataset, frames, others):
         rows = []
+        task_ids = self.checkpoint_task_ids(dataset)
         for start in range(0, len(frames), self.batch_size):
             chunk = list(zip(frames[start:start + self.batch_size], others[start:start + self.batch_size]))
             samples = [dataset.sample_at(episode, frame) for (episode, frame), _ in chunk]
             other_goals = [dataset.goal_for(dataset.positions[other if other is not None else episode])
                            for (episode, _), other in chunk]
-            images = prepare_images(torch.stack([s[0] for s in samples]).to(self.device))
+            images = prepare_images(torch.stack([self.frames_uint8(s[0]) for s in samples]).to(self.device))
             qpos = torch.stack([torch.as_tensor(s[1]) for s in samples]).float().to(self.device)
             actions = torch.stack([s[2] for s in samples]).to(self.device)[:, :self.policy.model.num_queries]
             valid = ~torch.stack([s[3] for s in samples]).to(self.device)[:, :self.policy.model.num_queries]
             goal = prepare_goals(torch.stack([s[4] for s in samples]).to(self.device))
             other = prepare_goals(torch.stack(other_goals).to(self.device))
-            task_id = torch.stack([s[5] for s in samples]).to(self.device)
+            task_id = torch.tensor([task_ids[int(s[5])] for s in samples], dtype=torch.int64, device=self.device)
             own = self.predict(qpos, images, goal, task_id)
             swapped_images, swapped_goal = images.clone(), goal.clone()
             for view, camera in enumerate(self.cameras):
@@ -157,13 +175,24 @@ def run(args):
     torch.set_num_threads(args.threads)
     checkpoint = load_checkpoint(args.checkpoint)
     adapter, train_config = checkpoint['adapter_config'], checkpoint.get('train_config', {})
-    root = Path(args.dataset_path or checkpoint.get('conditioning', {}).get('dataset_root') or train_config['dataset_path'])
+    root = Path(args.dataset_path or checkpoint.get('conditioning', {}).get('dataset_root')
+                or train_config['dataset_path']).resolve()
     frame_cache = args.frame_cache or train_config.get('frame_cache')
-    split_path = Path(args.split) if args.split else (root / 'isg_meta/eval_split.json'
-                                                       if (root / 'isg_meta/eval_split.json').exists()
-                                                       else root / 'isg_meta/train_split.json')
+    heldout_root = Path(args.heldout_dataset).resolve() if args.heldout_dataset else root
+    separate_root = heldout_root != root
+    if args.split:
+        split_path = Path(args.split)
+    elif (heldout_root / 'isg_meta/eval_split.json').exists():
+        split_path = heldout_root / 'isg_meta/eval_split.json'
+    elif separate_root:
+        raise SystemExit(f'--heldout-dataset {heldout_root} has no isg_meta/eval_split.json; pass --split')
+    else:
+        split_path = root / 'isg_meta/train_split.json'
     held_out, split_name = held_out_lists(split_path)
     tasks = list(checkpoint['task_map'].values())
+    if adapter.get('task_conditioning', 'onehot') == 'onehot' and separate_root:
+        raise SystemExit('One-hot checkpoints index tasks by the training dataset\'s task order; --heldout-dataset '
+                         'supports checkpoints without the task one-hot only')
     settle = (checkpoint.get('settle_steps') or {}).get('spec', 'all')
     train_episodes = (checkpoint.get('episode_split') or {}).get('episodes')
     if not train_episodes:
@@ -171,9 +200,9 @@ def run(args):
     probe = Probe(checkpoint, args.device, args.batch_size)
     goal = probe.goal
 
-    def dataset_for(task_names, episodes):
-        dataset = B1KDataset(root, task_names, probe.config['num_queries'], adapter['image_size'],
-                             frame_cache=Path(frame_cache).resolve() if frame_cache else None,
+    def dataset_for(task_names, episodes, subset_root=root, cache=frame_cache):
+        dataset = B1KDataset(subset_root, task_names, probe.config['num_queries'], adapter['image_size'],
+                             frame_cache=Path(cache).resolve() if cache else None,
                              goal_views=goal['goal_views'], goal_source=adapter.get('goal_source', 'episode_last'),
                              task_onehot=adapter.get('task_conditioning', 'onehot') == 'onehot', episodes=episodes,
                              settle_steps=settle, gripper_state=adapter.get('gripper_state', 'fingers'))
@@ -185,10 +214,11 @@ def run(args):
               'source_commit': checkpoint.get('conditioning', {}).get('source_commit'),
               'goal': {key: goal[key] for key in ('goal_fusion', 'goal_encoder', 'goal_tag_init', 'goal_stem_init',
                                                   'goal_tokens', 'lr_goal')},
-              'probe': {'frames_per_task': args.frames_per_task, 'seed': args.seed, 'split': str(split_path),
-                        'split_name': split_name,
+              'probe': {'frames_per_task': args.frames_per_task, 'seed': args.seed,
+                        'split': str(split_path), 'split_name': split_name,
                         'split_sha256': hashlib.sha256(split_path.read_bytes()).hexdigest(),
-                        'settle_steps': settle, 'device': str(args.device), 'probe_commit': None}}
+                        'heldout_dataset': str(heldout_root), 'settle_steps': settle, 'device': str(args.device),
+                        'probe_commit': None}}
     for subset in ('heldout', 'train'):
         if subset == 'heldout':
             lists = {task: held_out[task] for task in tasks if task in held_out}
@@ -202,7 +232,12 @@ def run(args):
         if not lists:
             result[subset] = {}
             continue
-        dataset = dataset_for(sorted(lists), sorted(e for episodes in lists.values() for e in episodes))
+        separate = subset == 'heldout' and separate_root
+        dataset = dataset_for(sorted(lists), sorted(e for episodes in lists.values() for e in episodes),
+                              *((heldout_root, None) if separate else ()))
+        if separate and dataset.settle:
+            result['probe']['heldout_settle'] = {key: dataset.settle[key] for key in ('file', 'sha256', 'frames',
+                                                                                      'recorded_frames')}
         per_task = {}
         for index, task in enumerate(tasks):
             if task not in lists:
@@ -222,7 +257,10 @@ def parser():
     p.add_argument('checkpoint')
     p.add_argument('--dataset-path', help='Default: the checkpoint\'s dataset root')
     p.add_argument('--frame-cache', help='Default: the checkpoint\'s training frame cache')
-    p.add_argument('--split', help='Default: <root>/isg_meta/eval_split.json if present, else train_split.json')
+    p.add_argument('--heldout-dataset', help='Separate LeRobot root of the held-out episodes (tasks matched by name; '
+                   'decoded from video). Default: the checkpoint\'s dataset root')
+    p.add_argument('--split', help='Default: <held-out root>/isg_meta/eval_split.json if present, else (without '
+                   '--heldout-dataset) <root>/isg_meta/train_split.json')
     p.add_argument('--frames-per-task', type=int, default=256)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')

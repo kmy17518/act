@@ -1,5 +1,30 @@
 # ACT radio training run — 2026-09-16
 
+## ISG goal-conditioning study, pre-flight and wave 1 (Tier A) — 2026-10-03
+
+Plan `/tmp/dev/docs/isg-goal-conditioning-plan.md` (§6.0, §6.1), manifest `waves/wave1.json`, code tag `isg-wave1`
+(branch `isg-wip` on `goal-image-late@0e3444f`). Machine 1 only (4× GB300). Data: `isg-init`, the four testbed tasks
+(relocalization standard, dishwasher open, blender open, board-game alignment), split `train100` (400 episodes),
+`--settle-steps 0` (268,733 frames), 224 px frame cache, `--regime image` (head goal, last recorded frame),
+`--gripper-state sum` (state 23 = action 23). Radio architecture/optimizer, batch 1,560, 50k steps, `--matmul-precision
+high --autocast bf16-backbone --compile regions-autotune`, fast stem. W&B `kmy17518/b1k-isg-goal` (run id = run name;
+Tier A in `<run>-ta`), HF `kmy17518/act-isg-<run>` (eval every 10k + one resume checkpoint, replaced ones permanently
+deleted). Tier A: `scripts/b1k/isg_tier_a.py`, 256 frames per task and subset, held-out = the split's 39 held-out
+episodes (none for board game).
+
+- **bf16 check** (early zero, goal LR 1e-4, steps 501–1,000): L1 0.12539 bf16-backbone vs 0.12542 TF32 (−0.03 %),
+  0.337 vs 0.400 s/step, 116 vs 131 GiB → bf16-backbone for all waves.
+- **Goal-LR calibration** (first 10k steps of 50k runs): late tag-zero 1e-5 / 1e-4 → `gap_heldout` 0.0687 / 0.0688,
+  `swap` 0.014 / 0.091 → 1e-4; early zero 1e-4 / 1e-3 → `gap_heldout` 0.013 / 0.035, `L1_own` 0.0665 / 0.0697 → 1e-3.
+- **Wave 1 at 50k**, held-out `L1_own` / `gap_heldout`: early zero 0.0539 / 0.041, early 0.5× copy 0.0539 / 0.051,
+  early random 0.0540 / 0.041, late tag-zero 0.0624 / 0.083 (seed 1: 0.0707 / 0.097), late tag-random 0.0624 / 0.086,
+  late pooled token 0.0556 / 0.002, late frozen encoder 0.0571 / 0.004. δ (seeds 0/1, max of 40k and 50k): `L1_own`
+  0.0088, `gap_heldout` 0.0144. Pooled and frozen do not read the goal; early vs late (−0.0085) is below 2δ.
+  Relocalization goals do not generalize at 100 demos (baseline `gap_heldout` 0.007 vs `gap_train` 0.056).
+- Cost per step: early 0.334 s, 116 GiB; late grid 0.375 s, 143 GiB; late frozen 0.353 s, 136 GiB; late pooled 0.334 s,
+  124 GiB. Seed 1 of the baseline ends at training L1 0.028 vs 0.013 for every seed-0 run (relocalization not
+  memorized); Tier B (closed loop) has not run.
+
 ## Goal-image-late step time at batch 1,024 — 2026-09-29
 
 Recipe of the image-late condition (`run_navpickup_conditioning_smoke.sh`: 240 px, TF32, `--compile regions-autotune`) on `/tmp/dev/datasets/2026-challenge-demos-radio-pickup-goal` (its own 240 px frame cache), GPU 2, 100-step probes, mean wall clock per optimizer step over steps 21–99 (`/tmp/dev/scripts/act-image-late-bench.py`):
