@@ -68,34 +68,38 @@ def test_collector_applies_the_rules_once_and_never_touches_local_runs(setup):
                                                              's_per_step': 0.34},
                                               'w2-m2-bad': {'state': 'running', 'step': 20500, 'train_l1_last500': 0.05,
                                                             's_per_step': 0.34}}})
-    write(inbox / 'm2/calibration.json', {'gpus': ['B200'] * 4, 'mean_train_l1_501_1000': 0.12571})
+    write(inbox / 'm2/calibration.json', {'machine1_reference': {'mean_train_l1_501_1000': 0.12560},
+                                          'gpus': ['B200'] * 4, 'measured': {'mean_train_l1_501_1000': 0.12571},
+                                          'result': 'PASS'})
     write(inbox / 'm2/tierA-eval50/w2-m2-good/step_00020000.json', tier_a_result(20000, 0.061, 0.05))
     write(inbox / 'm2/tierA-eval50/w2-m2-bad/step_00020000.json', tier_a_result(20000, 0.070, 0.001))
     write(inbox / 'm2/tierA-eval50/w2-m1-local/step_00020000.json', tier_a_result(20000, 0.5, 0.5))
     old = isg_collect.iso(isg_collect.utc_now() - timedelta(hours=2))
     write(inbox / 'lab/status.json', {'updated_at': old, 'blocked': 'simulator crashed'})
-    write(inbox / 'lab/instances.json', {'episodes': [{'episode_index': e, 'instance': f'i{e}', 'first_frame_verified': True}
-                                                      for e in range(200)]})
-    write(inbox / 'lab/env.json', {'action_horizon': 16})
+    write(inbox / 'lab/instances.json', {str(e): {'task': TASKS[e // 50], 'instance': f'i{e}', 'method': 'records',
+                                                  'first_frame_mean_abs_diff': 2.5 + e % 7} for e in range(200)})
+    write(inbox / 'lab/env.json', {'server': {'action_horizon': 16}, 'horizons': {'reloc': 900}})
     for run, success in (('w1-early-copy05-lrg1e-3-s0', 1), ('w1-late-tagzero-lrg1e-4-s0', 0)):
         base = inbox / 'lab/tierB' / run / 'step_00050000'
         for e in range(200):
-            write(base / TASKS[e // 50] / f'episode_{e:06d}.json', {'success': success if e % 10 else 1 - success,
-                                                                     'task_score': float(success)})
+            write(base / TASKS[e // 50] / f'episode_{e:06d}.json',
+                  {'success': success if e % 10 else 1 - success, 'error': None,
+                   'score': {'geodesic_m': 1.0 - success, 'angle_error_deg': 5.0 * (1 - success), 'bucket': 3}})
         write(base / 'summary.json', {'success_rate': 0.9 if success else 0.1})
     collector.cycle()
     log = (coord / 'm1/decisions.md').read_text()
-    assert 'Calibration confirmed' in log and '+0.09 %' in log
+    assert 'Calibration confirmed' in log and '+0.09 %' in log and '0.12571' in log
     assert '`w2-m2-good` at 20k: keep' in log and '`w2-m2-bad` at 20k: **kill**' in log
     assert 'lab is flagged as down' in log and 'Lab results are trusted from now on' in log
     assert '`w1-early-copy05-lrg1e-3-s0` beats every other finalist' in log
-    assert log.count('\n## ') == 6 and all(' — to ' in line for line in log.splitlines() if line.startswith('## '))
+    assert log.count('\n## ') == 7 and all(' — to ' in line for line in log.splitlines() if line.startswith('## '))
     assert (runs / 'w2-m2-good/tierA-eval50/step_00020000.json').exists()
     assert not (runs / 'w2-m1-local/tierA-eval50').exists()  # a locally trained run is never touched
     text = report.read_text()
     assert text.index('<!-- coord:begin -->') < text.index('body') and 'which seed next?' in text
     assert 'simulator crashed' in text and '**DOWN**' in text
-    assert plan.read_text().count('| coordination |') == 6
+    assert plan.read_text().count('| coordination |') == 7  # the six decisions and the first-frame rule
+    assert 'first-frame check' in text.lower() and 'score' in text
     collector.cycle()  # a second cycle on the same inputs records nothing new
     assert (coord / 'm1/decisions.md').read_text() == log
 
@@ -103,10 +107,15 @@ def test_collector_applies_the_rules_once_and_never_touches_local_runs(setup):
 def test_failed_calibration_and_untrusted_lab(setup):
     collector, inbox, runs, plan, report, coord = setup
     write(inbox / 'm2/calibration.json', {'mean_train_l1_501_1000': 0.1270})
-    write(inbox / 'lab/instances.json', {'episodes': [{'episode_index': e, 'first_frame_verified': e < 150} for e in range(200)]})
-    write(inbox / 'lab/env.json', {'action_horizon': [8, 16]})
+    write(inbox / 'lab/instances.json', {str(e): {'task': TASKS[e // 50], 'instance': f'i{e}', 'method': 'records',
+                                                  'first_frame_mean_abs_diff': 3.0 if e < 150 else 41.0} for e in range(200)})
+    write(inbox / 'lab/env.json', {'action_horizon': 16, 'smoke': {'action_horizon': 8}})
     collector.cycle()
     log = (coord / 'm1/decisions.md').read_text()
     assert 'Calibration failed' in log and 'must not start' in log
-    assert 'trusted' not in log  # never trusted, so no trust change is recorded
+    assert 'trusted from now on' not in log  # never trusted, so no trust change is recorded
+    write(inbox / 'm2/calibration.json', {'mean_train_l1_501_1000': 0.1259, 'pass': True})  # +0.24 %: agrees
+    write(inbox / 'm2/calibration.json', {'mean_train_l1_501_1000': 0.1300, 'pass': True})  # disagrees: escalated
+    collector.cycle()
+    assert 'machine 1 review' in report.read_text() and (coord / 'm1/decisions.md').read_text().count('Calibration') == 1
     assert 'verifies 150/200' in report.read_text() and 'no single fixed action horizon' in report.read_text()

@@ -41,6 +41,10 @@ PLAN = Path('/tmp/dev/docs/isg-goal-conditioning-plan.md')
 REPORT = Path('/tmp/dev/report.md')
 CALIBRATION_REFERENCE, CALIBRATION_TOLERANCE = 0.12560, 0.003
 STALE = timedelta(hours=1)
+# lab/instances.json: a mapping counts as verified when its first head frame matches the test episode's first frame to
+# within this mean absolute difference on the 0-255 scale (values that are all <= 1 are read as the 0-1 scale)
+FIRST_FRAME_MAX_DIFF = 20.0
+REFERENCE_KEYS = ('ref', 'machine1', 'machine_1', 'expected', 'target', 'baseline', 'm1_')
 GOAL_TASKS = ('camera_relocalization-standard', 'configuration_matching-articulation_open_large_scale-dishwasher',
               'configuration_matching-articulation_open_small_scale-blender_eyedvd-breakfast_table')
 CONTROL_TASK = 'alignment-axial-board_game-breakfast_table'
@@ -96,7 +100,10 @@ def download(api, inbox):
 
 def status_runs(status):
     """Machine 2's per-run records as {name: record}, from a dict keyed by run or a list of records."""
-    runs = (status or {}).get('runs') or {}
+    runs = (status or {}).get('runs')
+    if runs is None:  # any top-level mapping of run records
+        runs = next((v for v in (status or {}).values() if isinstance(v, dict) and v and
+                     all(isinstance(r, dict) and ('state' in r or 'step' in r) for r in v.values())), {})
     if isinstance(runs, list):
         runs = {r.get('name') or r.get('run'): r for r in runs if isinstance(r, dict)}
     return {name: record for name, record in runs.items() if isinstance(record, dict)}
@@ -172,29 +179,55 @@ def noise_floor(wave1):
 
 
 def find_number(value, prefer=('501', 'mean')):
-    """The first numeric value under a key mentioning l1 (preferring one that also mentions 501), searched recursively."""
+    """Machine 2's own value: the first number under a key mentioning l1 (preferring one that also mentions 501), skipping
+    anything under a key that names machine 1's reference (ref, expected, target, baseline, machine1, ...)."""
     found = []
 
     def walk(node, path):
         if isinstance(node, dict):
             for key, child in node.items():
                 walk(child, path + [str(key).lower()])
-        elif isinstance(node, (int, float)) and not isinstance(node, bool) and path and 'l1' in path[-1]:
-            found.append((path[-1], float(node)))
+        elif isinstance(node, (int, float)) and not isinstance(node, bool) and path and 'l1' in path[-1] \
+                and not any(marker in part for part in path for marker in REFERENCE_KEYS):
+            found.append(('.'.join(path), float(node)))
     walk(value, [])
     for marker in prefer:
         for key, number in found:
-            if marker in key:
+            if marker in key.rsplit('.', 1)[-1]:
                 return key, number
     return (found[0] if found else (None, None))
 
 
+def own_verdict(value):
+    """Machine 2's own pass/fail statement, if calibration.json has one (bool or PASS/FAIL string)."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if any(m in str(key).lower() for m in ('pass', 'result', 'verdict')) and not any(m in str(key).lower() for m in REFERENCE_KEYS):
+                if isinstance(child, bool):
+                    return child
+                if isinstance(child, str) and child.strip().upper() in ('PASS', 'PASSED', 'FAIL', 'FAILED'):
+                    return child.strip().upper().startswith('PASS')
+        for child in value.values():
+            verdict = own_verdict(child)
+            if verdict is not None:
+                return verdict
+    return None
+
+
 def instance_coverage(instances):
-    """(episodes 0-199 with a verified first frame, entries parsed) from lab/instances.json."""
+    """(episodes 0-199 mapped to an instance with a verified first frame, entries parsed, first-frame diffs) from
+    lab/instances.json: `{episode_index: {task, instance, method, first_frame_mean_abs_diff}}`. Verified = the diff is
+    at most FIRST_FRAME_MAX_DIFF (0-255 scale; all values <= 1 are read as the 0-1 scale), or an explicit true flag."""
     items = instances.get('episodes', instances.get('instances', instances)) if isinstance(instances, dict) else instances
     if isinstance(items, dict):
         items = [dict(v, episode_index=v.get('episode_index', k)) if isinstance(v, dict) else {} for k, v in items.items()]
-    verified = set()
+    verified, diffs = set(), {}
+    for item in items or []:
+        if isinstance(item, dict):
+            value = item.get('first_frame_mean_abs_diff')
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value == value:
+                diffs[str(item.get('episode_index', item.get('episode')))] = float(value)
+    scale = 255.0 if diffs and max(diffs.values()) <= 1.0 else 1.0
 
     def ok(node):
         if isinstance(node, dict):
@@ -207,32 +240,64 @@ def instance_coverage(instances):
             episode = int(item.get('episode_index', item.get('episode')))
         except (TypeError, ValueError):
             continue
-        if 0 <= episode < 200 and any(ok(v) if isinstance(v, dict) else v is True
-                                      for k, v in item.items() if any(m in str(k).lower() for m in ('verif', 'first_frame'))):
+        diff = diffs.get(str(item.get('episode_index', item.get('episode'))))
+        flagged = any(ok(v) if isinstance(v, dict) else v is True
+                      for k, v in item.items() if any(m in str(k).lower() for m in ('verif', 'first_frame')))
+        if 0 <= episode < 200 and item.get('instance') not in (None, '') and \
+                (flagged or (diff is not None and diff * scale <= FIRST_FRAME_MAX_DIFF)):
             verified.add(episode)
-    return len(verified), len(items or [])
+    return len(verified), len(items or []), sorted(d * scale for d in diffs.values())
 
 
 def fixed_action_horizon(env):
-    value = (env or {}).get('action_horizon', (env or {}).get('action_horizons'))
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, list) and len(set(value)) == 1 and isinstance(value[0], int):
-        return value[0]
+    """The single action horizon of env.json: every value under a key containing 'action_horizon' (at any depth) must
+    be the same integer."""
+    values = []
+
+    def walk(node, key=''):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, str(k).lower())
+        elif isinstance(node, list) and 'action_horizon' in key:
+            for v in node:
+                walk(v, key)
+        elif 'action_horizon' in key and isinstance(node, int) and not isinstance(node, bool):
+            values.append(node)
+    walk(env or {})
+    return values[0] if values and len(set(values)) == 1 else None
+
+
+SCORE_KEYS = {GOAL_TASKS[0]: ('geodesic', 'distance'), GOAL_TASKS[1]: ('angle',), GOAL_TASKS[2]: ('angle',),
+              CONTROL_TASK: ('align', 'error')}
+
+
+def primary_score(task, score):
+    """The task's continuous metric (lower is better) from the episode's `score`: a number, or the first number under
+    a key naming it (relocalization geodesic distance, opening-angle error, alignment error)."""
+    if isinstance(score, (int, float)) and not isinstance(score, bool):
+        return float(score)
+    if isinstance(score, dict):
+        numbers = {k: v for k, v in score.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        for marker in SCORE_KEYS.get(task, ()):
+            for key, value in numbers.items():
+                if marker in key.lower() and 'bucket' not in key.lower():
+                    return float(value)
     return None
 
 
+def tier_b_files(inbox, run, step):
+    return sorted((inbox / 'lab/tierB' / run / f'step_{step:08d}').glob('*/episode_*.json'))
+
+
 def tier_b_episodes(inbox, run, step):
+    """{(task, episode): (success, primary score)} of the episodes that finished without an evaluator error."""
     episodes = {}
-    for path in (inbox / 'lab/tierB' / run / f'step_{step:08d}').glob('*/episode_*.json'):
+    for path in tier_b_files(inbox, run, step):
         record = read_json(path) or {}
         success = record.get('success')
-        score = record.get('task_score', record.get('score'))
-        if isinstance(success, (bool, int, float)):
-            episodes[(path.parent.name, path.stem)] = (float(success),
-                                                        float(score) if isinstance(score, (int, float)) else None)
+        if record.get('error') or not isinstance(success, (bool, int, float)):
+            continue
+        episodes[(path.parent.name, path.stem)] = (float(success), primary_score(path.parent.name, record.get('score')))
     return episodes
 
 
@@ -319,6 +384,12 @@ class Collector:
         delta = value / CALIBRATION_REFERENCE - 1
         passed = abs(delta) <= CALIBRATION_TOLERANCE
         token = hashlib.sha256(json.dumps(calibration, sort_keys=True).encode()).hexdigest()[:12]
+        claimed = own_verdict(calibration)
+        if claimed is not None and claimed != passed:
+            self.escalations.append(f'M2 calibration: machine 2 says {"PASS" if claimed else "FAIL"}, machine 1 reads '
+                                    f'`{key}` = {value:.5f} ({delta * 100:+.2f} %) as {"pass" if passed else "fail"}; '
+                                    'no decision posted, review calibration.json')
+            return f'{value:.5f} (`{key}`): disagrees with machine 2\'s own verdict; escalated, no decision posted'
         verdict = (f'Calibration confirmed: mean training L1 over steps 501–1000 = {value:.5f} ({delta * 100:+.2f} % vs '
                    f'machine 1\'s {CALIBRATION_REFERENCE}, within 0.3 %). M2 may start '
                    '`w2-early-{copy025,gain,diff,wrist}-lrg1e-3-s0`.' if passed else
@@ -363,7 +434,13 @@ class Collector:
         return rows
 
     def lab_trust(self, instances, env):
-        covered, parsed = instance_coverage(instances) if instances is not None else (0, 0)
+        self.decide('rule:first-frame-threshold', 'lab',
+                    [f'Machine 1 counts an episode → instance mapping as verified when `first_frame_mean_abs_diff` is at '
+                     f'most {FIRST_FRAME_MAX_DIFF:g} on the 0–255 scale (values that are all ≤ 1 are read as the 0–1 scale). '
+                     'Tier B results are trusted once all 200 test episodes meet it and env.json fixes one action horizon.'],
+                    f'lab verification criterion: first-frame mean abs diff <= {FIRST_FRAME_MAX_DIFF:g} (0-255)')
+        covered, parsed, diffs = instance_coverage(instances) if instances is not None else (0, 0, [])
+        self.first_frame_diffs = diffs
         horizon = fixed_action_horizon(env)
         trusted = covered == 200 and horizon is not None
         reasons = []
@@ -385,8 +462,11 @@ class Collector:
         finalists = [(e['run'], int(e['step'])) for e in (queue or {}).get('entries', [])]
         summaries = {(r, s): read_json(self.inbox / 'lab/tierB' / r / f'step_{s:08d}' / 'summary.json')
                      for r, s in finalists}
-        if not finalists or any(v is None for v in summaries.values()):
-            return None, summaries
+        incomplete = [r for r, s in finalists if len(tier_b_files(self.inbox, r, s)) < 200]
+        if not finalists or any(v is None for v in summaries.values()) or incomplete:
+            return ({'pending': 'waiting for complete results (200 episode files and a summary.json) of '
+                     + ', '.join(f'`{r}`' for r in incomplete)} if incomplete and all(v is not None for v in summaries.values())
+                    else None), summaries
         if not trusted:
             return {'pending': 'every finalist has a summary.json, but lab results are not trusted yet'}, summaries
         episodes = {f: tier_b_episodes(self.inbox, *f) for f in finalists}
@@ -432,6 +512,7 @@ class Collector:
                 items = (status or {}).get(key)
                 items = items if isinstance(items, list) else [items] if items else []
                 asks += [f'- **{name} {key.replace("_", " ")}:** {item}' for item in items]
+        asks += [f'- **machine 1 review:** {item}' for item in self.escalations]
         out += ['**Needs a decision / blocked:**', *(asks or ['- none']), '']
         out += [f'**Helper health:** M2 — {health["M2"][0]}; lab — {health["lab"][0]}.', '']
         out += ['### Machine 2', '', f'- Calibration (`m2/calibration.json`): {calibration_text}.']
@@ -466,8 +547,14 @@ class Collector:
             out += ['', '20k triage:', *[f'- {r}' for r in kill_rows]]
         out += ['', '### Lab', '']
         if lab:
-            out.append(f'- Status: current run {lab.get("current_run", "—")}, episodes {lab.get("episodes_done", "—")}/200, '
-                       f'{fmt(lab.get("episodes_per_hour"), 1)} episodes/h.')
+            fields = {k: v for k, v in lab.items() if k not in ('needs_decision', 'blocked') and not isinstance(v, (list, dict))}
+            out.append('- Status: ' + ', '.join(f'{k} {v}' for k, v in fields.items()) + '.')
+        diffs = getattr(self, 'first_frame_diffs', [])
+        if diffs:
+            median = diffs[len(diffs) // 2]
+            out.append(f'- First-frame check: {len(diffs)} episodes, mean abs diff median {median:.2f}, max {diffs[-1]:.2f} '
+                       f'(0–255 scale; threshold {FIRST_FRAME_MAX_DIFF:g}); above 3× the median: '
+                       f'{sum(d > 3 * median for d in diffs)}.')
         out.append(f'- Trust: {"**trusted**" if trusted else "not trusted: " + "; ".join(reasons)} (instances verified '
                    f'{covered}/200, action horizon {horizon if horizon is not None else "—"}).')
         smoke = sorted(p.relative_to(self.inbox).as_posix() for p in (self.inbox / 'lab/smoke').rglob('*') if p.is_file()) \
@@ -482,6 +569,9 @@ class Collector:
         if verdict:
             out += ['', '### Wave verdict (Tier B)', '', verdict.get('text', verdict.get('pending', ''))]
             out += [f'- {d}' for d in verdict.get('details', [])]
+            out.append('- Per-task lines: success difference ± paired SE; "score" is the difference of the task\'s '
+                       'continuous metric (geodesic distance, angle error or alignment error; lower is better), errored '
+                       'episodes excluded from the pairs.')
             for (a, b), r in (verdict.get('pairs') or {}).items():
                 if r:
                     out.append(f'- `{a}` − `{b}` per task: ' + '; '.join(
@@ -546,7 +636,7 @@ class Collector:
 
     def cycle(self):
         now = utc_now()
-        self.decisions = []
+        self.decisions, self.escalations, self.first_frame_diffs = [], [], []
         download(self.api, self.inbox)
         wave1, wave2 = load(self.wave1_path), load(self.wave2_path)
         self.wave1 = wave1
