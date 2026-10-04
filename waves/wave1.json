@@ -116,7 +116,7 @@
       "gpu": 0,
       "cores": "0-23",
       "seed": 0,
-      "role": "goal-LR calibration (early, 1e-4) and bf16 arm of the bf16 check: stopped at 10k (early goal LR = 1e-3)",
+      "role": "goal-LR calibration (early, 1e-4): stopped at 10k on 2026-10-03, resumed from its 10k checkpoint to 50k at 22:15 PDT to settle the early goal LR (the 10k rule re-run on the test set no longer picks 1e-3)",
       "flags": [
         "--goal-fusion",
         "early",
