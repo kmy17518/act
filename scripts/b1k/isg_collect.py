@@ -734,7 +734,7 @@ class Collector:
                 else:
                     queue['entries'].append(self.eval50_setting(target))
                     status = 'its eval50 evaluation is queued'
-                self.decide(f'trainsuccess:{entry["run"]}:{entry["step"]}', 'all', [
+                self.decide(f'trainsuccess:{entry["run"]}:{entry["step"]}', 'lab', [
                     f'`{entry["run"]}` at step {entry["step"]} succeeds on training instances '
                     f'({round(row["success"] * row["valid"])} of {row["valid"]} episodes so far, execution setting {setting}); '
                     f'{status}.'], f'{entry["run"]}@{entry["step"]} succeeds on training instances')
