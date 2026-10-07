@@ -18,10 +18,14 @@ Every cycle (default every 30 minutes):
      serve_b1k.py arguments); tagged results live in lab/diagnostics/exec/<tag>/<run>/step_XXXXXXXX/, and every episode
      must report the setting it was queued with. Once the execution-setting test is complete (with the lab's own tests
      of `exec_test.lab_runs` in the manifests) the eval50 setting is chosen once and applied to unstarted eval50 entries;
-  7. upload `docs/` and `m1/` in one commit when anything changed.
-It never writes under `m2/` or `lab/`, never starts uploaders, and writes locally only under /tmp.
+  7. check that this checkout reached GitHub (`git ls-remote` of kmy17518/act isg-wave2-dev, the branch machine 2 and
+     the lab pull; this checkout's `origin` is a local clone): unpushed commits or uncommitted manifest changes are
+     reported at the top of docs/report.md, and a decision naming a commit or runs that GitHub lacks is held;
+  8. upload `docs/` and `m1/` in one commit when anything changed.
+It never writes under `m2/` or `lab/`, never starts uploaders, never pushes, and writes locally only under /tmp.
 
     isg_collect.py [--interval 1800] [--once]
+    isg_collect.py --decide M2|lab|all --line TEXT [--line TEXT ...] [--log TEXT]   (manual decision, same push check)
 """
 
 import argparse
@@ -32,7 +36,9 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
+import subprocess
 import sys
 import time
 
@@ -334,6 +340,89 @@ def record_setting(record):
     return setting_of_args(command) if isinstance(command, list) else None
 
 
+GITHUB_URL, GITHUB_BRANCH = 'https://github.com/kmy17518/act.git', 'isg-wave2-dev'  # what machine 2 and the lab pull
+GITHUB_REF = 'refs/remotes/github/isg-wave2-dev'  # last fetched copy; this checkout's `origin` is a local clone
+RUN_NAME = re.compile(r'`((?:w1|w2|r1)-[a-z0-9.-]+-s\d+)`')
+COMMIT_LIKE = re.compile(r'\b[0-9a-f]{7,40}\b')
+PUSH_COMMAND = ('git -C /tmp/dev/baselines/act-isg-w2 push origin isg-wave2-dev && '
+                'git -C /tmp/dev/baselines/act push origin isg-wave2-dev')
+
+
+def git(*args, check=True):
+    result = subprocess.run(['git', '-C', str(CHECKOUT), *args], capture_output=True, text=True, timeout=120)
+    if check and result.returncode:
+        raise RuntimeError(f'git {" ".join(args[:2])}: {result.stderr.strip()[:200]}')
+    return result
+
+
+def github_state(manifest_paths):
+    """This checkout against GitHub's isg-wave2-dev: `git ls-remote`, then a fetch into GITHUB_REF for ancestry and the
+    pushed manifests' run names. When GitHub cannot be reached, the last fetched copy stands in (`ok` is False)."""
+    error = None
+    try:
+        listed = git('ls-remote', GITHUB_URL, f'refs/heads/{GITHUB_BRANCH}').stdout.split()
+        if not listed:
+            raise RuntimeError(f'GitHub has no branch {GITHUB_BRANCH}')
+        git('fetch', '--quiet', GITHUB_URL, f'+refs/heads/{GITHUB_BRANCH}:{GITHUB_REF}')
+    except Exception as exc:
+        error = f'{type(exc).__name__}: {exc}'[:300]
+    if git('rev-parse', '--verify', '--quiet', GITHUB_REF, check=False).returncode:
+        return {'ok': False, 'error': error or 'no fetched copy of the GitHub branch'}
+    runs = set()
+    for path in manifest_paths:
+        path = Path(path)
+        try:
+            relative = path.resolve().relative_to(CHECKOUT) if path.is_absolute() else path
+        except ValueError:
+            continue
+        shown = git('show', f'{GITHUB_REF}:{relative.as_posix()}', check=False)
+        if shown.returncode == 0:
+            manifest = json.loads(shown.stdout)
+            runs |= {r['name'] for r in manifest.get('runs', []) + manifest.get('deferred', [])}
+    head = git('rev-parse', 'HEAD').stdout.strip()
+    return {'ok': error is None, 'error': error, 'remote': git('rev-parse', GITHUB_REF).stdout.strip(), 'head': head,
+            'pushed': git('merge-base', '--is-ancestor', head, GITHUB_REF, check=False).returncode == 0,
+            'unpushed': git('log', '--oneline', f'{GITHUB_REF}..HEAD').stdout.splitlines(),
+            'dirty': git('status', '--porcelain', '--', 'waves', 'splits').stdout.splitlines(), 'runs': sorted(runs)}
+
+
+def push_gate(text, github, local_runs):
+    """Why a decision may not be posted yet: it names a commit of this checkout that GitHub's branch lacks, or a run of
+    the local manifests that the manifests on GitHub lack (machine 2 starts runs from what it pulls)."""
+    commits = [c for c in dict.fromkeys(COMMIT_LIKE.findall(text))
+               if git('rev-parse', '--verify', '--quiet', f'{c}^{{commit}}', check=False).returncode == 0]
+    runs = [r for r in dict.fromkeys(RUN_NAME.findall(text)) if r in local_runs]
+    if not commits and not runs:
+        return []
+    if 'runs' not in github:
+        return [f'GitHub could not be checked ({github.get("error")})']
+    reasons = [f'commit {c} is not on GitHub' for c in commits
+               if git('merge-base', '--is-ancestor', c, GITHUB_REF, check=False).returncode != 0]
+    missing = [r for r in runs if r not in set(github['runs'])]
+    if missing:
+        reasons.append('runs ' + ', '.join(f'`{r}`' for r in missing) + ' are not in the manifests on GitHub')
+    return reasons
+
+
+def push_status(github):
+    """Report line on whether machine 1's work reached GitHub, and the failure to escalate (None when pushed)."""
+    if 'runs' not in github:
+        problem = f'GitHub could not be checked: {github.get("error")}'
+        return f'**GitHub push check:** {problem}.', problem
+    stale = '' if github['ok'] else f' (last fetched copy; GitHub unreachable now: {github["error"]})'
+    if github['pushed'] and not github['dirty']:
+        return (f'**GitHub push check:** `{GITHUB_BRANCH}` on GitHub is at {github["remote"][:7]}, which contains machine 1\'s '
+                f'HEAD {github["head"][:7]}{stale}.'), None
+    parts = []
+    if not github['pushed']:
+        parts.append(f'machine 1\'s HEAD {github["head"][:7]} has {len(github["unpushed"])} commits that GitHub\'s '
+                     f'`{GITHUB_BRANCH}` ({github["remote"][:7]}) lacks: ' + '; '.join(github['unpushed'][:5]))
+    if github['dirty']:
+        parts.append('uncommitted manifest or split changes: ' + ', '.join(line[3:] for line in github['dirty'][:5]))
+    problem = 'NOT PUSHED: ' + '; '.join(parts) + f'{stale}. Push with `{PUSH_COMMAND}`'
+    return f'**GitHub push check: {problem}.**', problem
+
+
 def planned(queue, run, step, split):
     """Whether the queue already holds a planned evaluation: eval50 under any execution setting, training instances only
     untagged (tagged training entries are execution-setting tests)."""
@@ -543,10 +632,16 @@ class Collector:
         self.state_path = COORD / 'state.json'
         self.state = read_json(self.state_path) or {'recorded': [], 'uploaded': {}, 'lab_trusted': False}
         self.decisions, self.escalations, self.first_frame_diffs = [], [], []
+        self.github, self.local_runs = {}, set()
 
     def decide(self, key, audience, lines, log_line):
-        """Append a decision once (keyed) to m1/decisions.md and the plan's decision log."""
+        """Append a decision once (keyed) to m1/decisions.md and the plan's decision log, unless it names commits or runs
+        that have not reached GitHub (then it is held and escalated; the next cycle retries)."""
         if key in self.state['recorded']:
+            return False
+        reasons = push_gate(' '.join(lines), self.github, self.local_runs)
+        if reasons:
+            self.escalations.append(f'decision to {audience} held until the push lands ({log_line}): ' + '; '.join(reasons))
             return False
         stamp = iso(utc_now())
         with (self.m1 / 'decisions.md').open('a') as stream:
@@ -865,7 +960,7 @@ class Collector:
     # ------------------------------------------------------------------------------------------ report
 
     def coord_section(self, now, m2, lab, health, calibration_text, kill_rows, trust, queue, rows, comparisons, copied,
-                      execution, load):
+                      execution, load, push_line):
         trusted, horizon, covered, reasons = trust
         asks = []
         for name, status in (('M2', m2), ('lab', lab)):
@@ -912,6 +1007,7 @@ class Collector:
                 f'({load["mapped"]} mapped). The lab\'s own tests outside the queue are not included.'
                 + (f' **Over {LAB_HOURS_WARN:.0f} h.**' if total > LAB_HOURS_WARN else '')]
         out += ['', '**Paired comparisons:**', *(comparisons or ['- none yet (needs two complete entries on the same episodes)'])]
+        out += ['', push_line]
         out += ['', f'**Helper health:** M2 — {health["M2"][0]}; lab — {health["lab"][0]}. Lab trust: '
                 f'{"trusted" if trusted else "not trusted: " + "; ".join(reasons)} (instances {covered}/200, action horizon {horizon}).']
         runs = status_runs(m2)
@@ -954,8 +1050,6 @@ class Collector:
     # ------------------------------------------------------------------------------------------ cycle
 
     def upload(self):
-        import re
-        from huggingface_hub import CommitOperationAdd
         files = {'docs/plan.md': PLAN, 'docs/report.md': REPORT, 'm1/decisions.md': self.m1 / 'decisions.md',
                  'm1/tierB-queue.json': self.m1 / 'tierB-queue.json'}
         if SPEC.exists():
@@ -963,20 +1057,30 @@ class Collector:
         changed = {remote: local for remote, local in files.items() if digest(local) != self.state['uploaded'].get(remote)}
         if not changed:
             return []
-        for remote, local in changed.items():
+        return self.upload_files(changed)
+
+    def upload_files(self, files):
+        """Upload {remote path: local file} in one commit of the coordination repo (never a token-shaped string)."""
+        from huggingface_hub import CommitOperationAdd
+        for remote, local in files.items():
             if re.search(r'\bhf_[A-Za-z0-9]{30,}\b|\bghp_[A-Za-z0-9]{30,}\b', Path(local).read_text()):
                 raise RuntimeError(f'Refusing to upload {remote}: it contains a token-shaped string')
-        self.api.create_commit(REPO, repo_type='dataset', operations=[CommitOperationAdd(r, str(l)) for r, l in changed.items()],
-                               commit_message=f'm1 {iso(utc_now())}: ' + ', '.join(sorted(changed)))
-        for remote, local in changed.items():
+        self.api.create_commit(REPO, repo_type='dataset', operations=[CommitOperationAdd(r, str(l)) for r, l in files.items()],
+                               commit_message=f'm1 {iso(utc_now())}: ' + ', '.join(sorted(files)))
+        for remote, local in files.items():
             self.state['uploaded'][remote] = digest(local)
-        return sorted(changed)
+        return sorted(files)
 
     def cycle(self):
         now = utc_now()
         self.decisions, self.escalations, self.first_frame_diffs = [], [], []
         download(self.api, self.inbox)
         manifests = [load(p) for p in self.manifest_paths]
+        self.github = github_state(self.manifest_paths)
+        self.local_runs = {name for manifest in manifests for name in manifest['_runs']}
+        push_line, push_problem = push_status(self.github)
+        if push_problem:
+            self.escalations.append(push_problem)
         m2, lab = read_json(self.inbox / 'm2/status.json'), read_json(self.inbox / 'lab/status.json')
         copied = copy_m2_tier_a(manifests, self.inbox)
         delta = noise_floor(manifests[0])
@@ -996,7 +1100,7 @@ class Collector:
             queue_path.write_text(json.dumps(queue, indent=2) + '\n')
         lab_hours = self.lab_load(queue, rows, manifests, read_json(self.inbox / 'lab/env.json'))
         self.render_report(self.coord_section(now, m2, lab, health, calibration_text, kill_rows, trust, queue, rows,
-                                              self.comparisons(rows, valid), copied, execution, lab_hours), manifests)
+                                              self.comparisons(rows, valid), copied, execution, lab_hours, push_line), manifests)
         uploaded = self.upload()
         self.save()
         print(json.dumps({'event': 'cycle', 'at': iso(now), 'copied': len(copied), 'queued': added, 'decisions': self.decisions,
@@ -1014,10 +1118,26 @@ def main():
                         help='Wave manifests in report order (repeat); default waves/wave1.json, wave2.json, reloc1.json')
     parser.add_argument('--interval', type=float, default=1800)
     parser.add_argument('--once', action='store_true')
+    parser.add_argument('--decide', metavar='AUDIENCE', choices=['M2', 'lab', 'all'],
+                        help='Post one decision through the GitHub push check, upload m1/decisions.md and the plan, exit')
+    parser.add_argument('--line', action='append', default=[], help='A bullet of the --decide decision (repeat)')
+    parser.add_argument('--log', help='Plan decision-log text of the --decide decision (default: its first bullet)')
     args = parser.parse_args()
     from huggingface_hub import HfApi
     manifests = args.manifest or [CHECKOUT / f'waves/{n}.json' for n in ('wave1', 'wave2', 'reloc1')]
     collector = Collector(HfApi(token=os.environ.get('HF_TOKEN')), manifests)
+    if args.decide:
+        if not args.line:
+            parser.error('--decide needs at least one --line')
+        collector.github = github_state(collector.manifest_paths)
+        collector.local_runs = {name for path in collector.manifest_paths for name in load(path)['_runs']}
+        key = 'manual:' + hashlib.sha256('\n'.join([args.decide, *args.line]).encode()).hexdigest()[:16]
+        if not collector.decide(key, args.decide, args.line, args.log or args.line[0][:150]):
+            print('Not posted: ' + ('; '.join(collector.escalations) or 'this decision is already recorded'), file=sys.stderr)
+            return 1
+        collector.upload_files({'m1/decisions.md': collector.m1 / 'decisions.md', 'docs/plan.md': PLAN})
+        print('posted and uploaded m1/decisions.md and docs/plan.md')
+        return 0
     while True:
         try:
             collector.cycle()

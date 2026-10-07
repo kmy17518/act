@@ -28,6 +28,13 @@ def episode(success, geodesic, error=None):
                                                           'orientation_error_deg': 10 * geodesic, 'within_tolerance': success}}
 
 
+def github(paths, pushed=True, without=()):
+    """GitHub as the collector sees it: every local run pushed unless listed in `without`."""
+    runs = sorted({n for p in paths for n in isg_collect.load(p)['_runs']} - set(without))
+    return {'ok': True, 'error': None, 'remote': 'a' * 40, 'head': 'a' * 40 if pushed else 'b' * 40, 'pushed': pushed,
+            'unpushed': [] if pushed else ['bbbbbbb reloc1: new runs'], 'dirty': [], 'runs': runs}
+
+
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
     runs = tmp_path / 'runs'
@@ -62,6 +69,7 @@ def setup(tmp_path, monkeypatch):
     monkeypatch.setattr(isg_collect, 'download', lambda api, inbox: inbox.mkdir(parents=True, exist_ok=True))
     monkeypatch.setattr(isg_collect.Collector, 'upload', lambda self: [])
     monkeypatch.setattr(isg_collect.Collector, 'extend_queue', lambda self, manifests, queue: [])
+    monkeypatch.setattr(isg_collect, 'github_state', lambda paths: github(paths))
     return isg_collect.Collector(None, [tmp_path / 'wave1.json', tmp_path / 'reloc1.json']), coord / 'in', runs, report, coord
 
 
@@ -227,6 +235,27 @@ def test_replay_that_reached_tolerance_passes(setup):
     assert '3/3 episodes reach tolerance at some step. Passed' in (coord / 'm1/decisions.md').read_text()
     never = dict(boundary, first_success_step=-1, binary_success_ever=False)
     assert isg_collect.reached_tolerance(boundary) and not isg_collect.reached_tolerance(never)
+
+
+def test_decisions_naming_unpushed_runs_are_held(setup, monkeypatch):
+    collector, inbox, runs, report, coord = setup
+    manifest = json.loads(Path(collector.manifest_paths[1]).read_text())
+    manifest['runs'].append({'name': 'r1-new-s0', 'machine': 'M2', 'seed': 0, 'flags': []})
+    Path(collector.manifest_paths[1]).write_text(json.dumps(manifest))
+    queue = json.loads((coord / 'm1/tierB-queue.json').read_text())
+    queue['entries'].append({'run': 'r1-new-s0', 'step': 100000, 'split': 'train', 'episodes': [8]})
+    write(coord / 'm1/tierB-queue.json', queue)
+    write(inbox / 'lab/tierB-train/r1-new-s0/step_00100000' / R / 'episode_000008.json', run_episode(True, 0.04))
+    monkeypatch.setattr(isg_collect, 'github_state', lambda paths: github(paths, pushed=False, without=('r1-new-s0',)))
+    collector.cycle()
+    text = report.read_text()
+    assert 'r1-new-s0' not in (coord / 'm1/decisions.md').read_text()
+    assert 'held until the push lands' in text and 'runs `r1-new-s0` are not in the manifests on GitHub' in text
+    assert '**GitHub push check: NOT PUSHED' in text and 'bbbbbbb reloc1: new runs' in text
+    monkeypatch.setattr(isg_collect, 'github_state', lambda paths: github(paths))
+    collector.cycle()
+    assert '`r1-new-s0` at step 100000 succeeds on training instances' in (coord / 'm1/decisions.md').read_text()
+    assert 'contains machine 1\'s HEAD' in report.read_text()
 
 
 def test_failed_replay_pauses_the_queue(setup):
