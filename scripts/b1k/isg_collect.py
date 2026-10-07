@@ -277,8 +277,9 @@ CORRECTION = ('Correction (2026-10-07): the evaluator does not need the policy t
               'step the camera pose is within tolerance, then holds the robot itself with no-op actions for max(50 steps, 20 % '
               'of the steps), adds a second window twice as long if the goal stops holding or something moved, and only then '
               'gives its verdict; `settle_windows: [10]` is only the short no-op window after a never-reached goal. The '
-              'dataset\'s settle windows are this same epilogue, so `--settle-steps 0` matches the evaluator, and the settle-20 '
-              'runs were replaced by settle-0 seed replicates. Evidence: lab/env.json `episode_rules`; settling is not the '
+              'dataset\'s settle windows are this same epilogue, so `--settle-steps 0` matches the evaluator and the settle-20 '
+              'rationale is withdrawn: r1-early-copy05-st20-s0 was stopped at step 975 (kept, marked stopped); GPU 2 trains '
+              'r1-late-tagzero-st0-s1, GPU 0 queues r1-early-wrist-st0-s1, machine 2\'s GPU 1 runs r1-early-zero-st0-s0. Evidence: lab/env.json `episode_rules`; settling is not the '
               'bottleneck either (none of the 150 relocalization episodes of the three finalists was within tolerance at any step).')
 METRICS = ('geodesic_distance_m', 'position_error_m', 'orientation_error_deg', 'within_tolerance')
 

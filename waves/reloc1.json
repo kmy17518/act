@@ -264,35 +264,6 @@
       ]
     },
     {
-      "name": "r1-early-copy05-st0-s2",
-      "machine": "M1",
-      "gpu": 0,
-      "cores": "0-23",
-      "seed": 2,
-      "after": "r1-early-copy05-train10-st0-s0",
-      "role": "base, seed 2 (after the overfit run on GPU 0)",
-      "tierB": [
-        {
-          "step": 100000,
-          "split": "train",
-          "episodes": "train20"
-        },
-        {
-          "step": 100000,
-          "split": "eval50",
-          "episodes": null
-        }
-      ],
-      "flags": [
-        "--goal-fusion",
-        "early",
-        "--goal-stem-init",
-        "copy:0.5",
-        "--lr-goal",
-        "1e-3"
-      ]
-    },
-    {
       "name": "r1-early-copy05-st0-s1",
       "machine": "M2",
       "gpu": 2,
@@ -350,11 +321,11 @@
     },
     {
       "name": "r1-early-wrist-st0-s1",
-      "machine": "M2",
-      "gpu": 1,
-      "cores": "24-47",
+      "machine": "M1",
+      "gpu": 0,
+      "cores": "0-23",
       "seed": 1,
-      "role": "head+wrist pairing, seed 1",
+      "role": "head+wrist pairing, seed 1 (machine 1, after the overfit run on GPU 0)",
       "tierB": [
         {
           "step": 100000,
@@ -378,6 +349,54 @@
         "zed_link",
         "left_realsense_link",
         "right_realsense_link"
+      ],
+      "after": "r1-early-copy05-train10-st0-s0"
+    },
+    {
+      "name": "r1-early-zero-st0-s0",
+      "machine": "M2",
+      "gpu": 1,
+      "cores": "24-47",
+      "seed": 0,
+      "role": "early fusion, zero goal half, settle 0",
+      "tierB": [
+        {
+          "step": 100000,
+          "split": "train",
+          "episodes": "train20"
+        },
+        {
+          "step": 100000,
+          "split": "eval50",
+          "episodes": null
+        }
+      ],
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "zero",
+        "--lr-goal",
+        "1e-3"
+      ]
+    },
+    {
+      "name": "r1-early-copy05-st20-s0",
+      "machine": "M1",
+      "gpu": 2,
+      "cores": "48-71",
+      "seed": 0,
+      "stopped": true,
+      "role": "STOPPED 2026-10-07 at step 975: the settle-20 rationale was withdrawn (the evaluator settles the robot itself). Local results kept in /tmp/dev/runs/isg/r1-early-copy05-st20-s0; its Hub repo (step-1 checkpoint only) was deleted. Never relaunch or evaluate.",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--settle-steps",
+        "20"
       ]
     }
   ]
