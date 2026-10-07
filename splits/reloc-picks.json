@@ -1,6 +1,6 @@
 {
  "format": "isg-reloc-picks/v1",
- "rule": "random.Random(0), stratified by distance bucket; train20 contains train10, replay_train is a subset of train10",
+ "rule": "train10: random.Random(0), stratified by distance bucket (the overfit run's training set, unchanged). train20 (from 2026-10-07 18:10Z): the relocalization train100 episodes whose instances the lab reproduces with sweep seed 0 (instances 00xx and 21xx = episodes 98-125): all 8 of (0,3] m, all 6 of (3,5] m and 6 of the 8 in (5,10] m (the four already evaluated, 101 111 113 121, plus the two lowest remaining, 98 100), which keeps the train split's 40/30/30 distance mix; replay_train is a subset of train20",
  "train10": [
   8,
   39,
@@ -14,33 +14,33 @@
   121
  ],
  "train20": [
-  8,
-  12,
-  15,
-  19,
-  28,
-  38,
-  39,
-  43,
-  52,
-  59,
-  67,
-  70,
-  74,
-  78,
-  82,
+  98,
+  99,
+  100,
   101,
+  104,
   105,
+  107,
+  108,
+  109,
+  110,
   111,
+  112,
   113,
-  121
+  116,
+  117,
+  120,
+  121,
+  122,
+  124,
+  125
  ],
  "replay_train": [
-  39,
-  59,
-  74,
-  82,
-  113
+  98,
+  99,
+  107,
+  113,
+  116
  ],
  "replay_eval50": [
   2,
@@ -48,5 +48,38 @@
   33,
   34,
   45
- ]
+ ],
+ "superseded": {
+  "at": "2026-10-07T18:10:00Z",
+  "reason": "15 of the 20 need the sweep seed of instances 10xx-14xx, which the lab does not have",
+  "train20": [
+   8,
+   12,
+   15,
+   19,
+   28,
+   38,
+   39,
+   43,
+   52,
+   59,
+   67,
+   70,
+   74,
+   78,
+   82,
+   101,
+   105,
+   111,
+   113,
+   121
+  ],
+  "replay_train": [
+   39,
+   59,
+   74,
+   82,
+   113
+  ]
+ }
 }
