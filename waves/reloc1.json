@@ -176,36 +176,6 @@
       ]
     },
     {
-      "name": "r1-early-copy05-st20-s0",
-      "machine": "M1",
-      "gpu": 2,
-      "cores": "48-71",
-      "seed": 0,
-      "role": "settle 20: the evaluator needs ~10 settled steps to count success",
-      "tierB": [
-        {
-          "step": 100000,
-          "split": "train",
-          "episodes": "train20"
-        },
-        {
-          "step": 100000,
-          "split": "eval50",
-          "episodes": null
-        }
-      ],
-      "flags": [
-        "--goal-fusion",
-        "early",
-        "--goal-stem-init",
-        "copy:0.5",
-        "--lr-goal",
-        "1e-3",
-        "--settle-steps",
-        "20"
-      ]
-    },
-    {
       "name": "r1-late-tagzero-st0-s0",
       "machine": "M1",
       "gpu": 3,
@@ -231,41 +201,6 @@
         "zero",
         "--lr-goal",
         "1e-4"
-      ]
-    },
-    {
-      "name": "r1-early-wrist-st20-s0",
-      "machine": "M1",
-      "gpu": 0,
-      "cores": "0-23",
-      "seed": 0,
-      "role": "head+wrist pairing with settle 20 (the two most promising relocalization changes), after the overfit run on GPU 0",
-      "after": "r1-early-copy05-train10-st0-s0",
-      "tierB": [
-        {
-          "step": 100000,
-          "split": "train",
-          "episodes": "train20"
-        },
-        {
-          "step": 100000,
-          "split": "eval50",
-          "episodes": null
-        }
-      ],
-      "flags": [
-        "--goal-fusion",
-        "early",
-        "--goal-stem-init",
-        "copy:0.5",
-        "--lr-goal",
-        "1e-3",
-        "--goal-views",
-        "zed_link",
-        "left_realsense_link",
-        "right_realsense_link",
-        "--settle-steps",
-        "20"
       ]
     },
     {
@@ -301,12 +236,12 @@
       ]
     },
     {
-      "name": "r1-late-tagzero-st20-s0",
-      "machine": "M2",
-      "gpu": 1,
-      "cores": "24-47",
-      "seed": 0,
-      "role": "late fusion, settle 20",
+      "name": "r1-late-tagzero-st0-s1",
+      "machine": "M1",
+      "gpu": 2,
+      "cores": "48-71",
+      "seed": 1,
+      "role": "late fusion baseline, seed 1",
       "tierB": [
         {
           "step": 100000,
@@ -325,9 +260,36 @@
         "--goal-tag-init",
         "zero",
         "--lr-goal",
-        "1e-4",
-        "--settle-steps",
-        "20"
+        "1e-4"
+      ]
+    },
+    {
+      "name": "r1-early-copy05-st0-s2",
+      "machine": "M1",
+      "gpu": 0,
+      "cores": "0-23",
+      "seed": 2,
+      "after": "r1-early-copy05-train10-st0-s0",
+      "role": "base, seed 2 (after the overfit run on GPU 0)",
+      "tierB": [
+        {
+          "step": 100000,
+          "split": "train",
+          "episodes": "train20"
+        },
+        {
+          "step": 100000,
+          "split": "eval50",
+          "episodes": null
+        }
+      ],
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3"
       ]
     },
     {
@@ -384,6 +346,38 @@
         "copy:0.5",
         "--lr-goal",
         "1e-4"
+      ]
+    },
+    {
+      "name": "r1-early-wrist-st0-s1",
+      "machine": "M2",
+      "gpu": 1,
+      "cores": "24-47",
+      "seed": 1,
+      "role": "head+wrist pairing, seed 1",
+      "tierB": [
+        {
+          "step": 100000,
+          "split": "train",
+          "episodes": "train20"
+        },
+        {
+          "step": 100000,
+          "split": "eval50",
+          "episodes": null
+        }
+      ],
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--goal-views",
+        "zed_link",
+        "left_realsense_link",
+        "right_realsense_link"
       ]
     }
   ]

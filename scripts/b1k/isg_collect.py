@@ -273,6 +273,13 @@ RELOC = GOAL_TASKS[0]
 SPLIT_ORDER = {'replay': 0, 'train': 1, 'eval50': 2}
 SPLIT_SIZES = {'train': 100, 'eval50': 50}
 FLOOR = 0.10  # plan §5 floor guard: no success-based comparison while every candidate is below ~10 % success
+CORRECTION = ('Correction (2026-10-07): the evaluator does not need the policy to hold still. It stops the policy at the first '
+              'step the camera pose is within tolerance, then holds the robot itself with no-op actions for max(50 steps, 20 % '
+              'of the steps), adds a second window twice as long if the goal stops holding or something moved, and only then '
+              'gives its verdict; `settle_windows: [10]` is only the short no-op window after a never-reached goal. The '
+              'dataset\'s settle windows are this same epilogue, so `--settle-steps 0` matches the evaluator, and the settle-20 '
+              'runs were replaced by settle-0 seed replicates. Evidence: lab/env.json `episode_rules`; settling is not the '
+              'bottleneck either (none of the 150 relocalization episodes of the three finalists was within tolerance at any step).')
 METRICS = ('geodesic_distance_m', 'position_error_m', 'orientation_error_deg', 'within_tolerance')
 
 
@@ -565,7 +572,7 @@ class Collector:
                'Scope from 2026-10-07: camera_relocalization-standard only. Funnel: (1) open-loop replay of recorded actions '
                '(positive control) → (2) training instances → (3) eval50, only for checkpoints that succeed on training '
                f'instances plus each run\'s final checkpoint. Horizon {queue.get("horizon_steps")} steps; queue paused: '
-               f'{queue.get("paused")}.', '', '**Needs a decision / blocked:**', *(asks or ['- none']), '',
+               f'{queue.get("paused")}.', '', CORRECTION, '', '**Needs a decision / blocked:**', *(asks or ['- none']), '',
                '| Stage | Run | Step | Episodes | Success | Within tol. | Geodesic m | Position m | Orientation deg | Errors |',
                '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
         for row in sorted(rows, key=lambda r: SPLIT_ORDER.get(r['entry']['split'], 9)):
