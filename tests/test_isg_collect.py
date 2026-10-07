@@ -191,6 +191,28 @@ def test_training_success_with_a_complete_eval50_result_is_not_requeued(setup):
     assert 'it already has a complete eval50 result (0% success), so nothing is re-queued' in (coord / 'm1/decisions.md').read_text()
 
 
+def test_two_stage_eval50(setup, monkeypatch, tmp_path):
+    collector, inbox, runs, report, coord = setup
+    stage1 = list(range(0, 50, 2))
+    write(tmp_path / 'picks.json', {'eval25': stage1})
+    real_read = isg_collect.read_json
+    monkeypatch.setattr(isg_collect, 'read_json', lambda path: real_read(tmp_path / 'picks.json')
+                        if str(path).endswith('splits/reloc-picks.json') else real_read(path))
+    queue = json.loads((coord / 'm1/tierB-queue.json').read_text())
+    queue['entries'] += [{'run': run, 'step': 50000, 'split': 'eval50', 'episodes': stage1} for run in ('a', 'b', 'c')]
+    write(coord / 'm1/tierB-queue.json', queue)
+    for e, success in zip((8, 39, 43), (1, 0, 0)):  # a succeeds on a training episode
+        write(inbox / 'lab/tierB-train/a/step_00050000' / R / f'episode_{e:06d}.json', run_episode(bool(success), 0.04 if success else 0.5))
+    for e in stage1:  # b: one of its 25 stage-1 episodes succeeds; c: none
+        write(inbox / 'lab/tierB/b/step_00050000' / R / f'episode_{e:06d}.json', run_episode(e == 10, 0.04 if e == 10 else 2.0))
+        write(inbox / 'lab/tierB/c/step_00050000' / R / f'episode_{e:06d}.json', run_episode(False, 2.0))
+    collector.cycle()
+    evals = {e['run']: e['episodes'] for e in json.loads((coord / 'm1/tierB-queue.json').read_text())['entries'] if e['split'] == 'eval50'}
+    assert evals == {'a': None, 'b': None, 'c': stage1}
+    log = (coord / 'm1/decisions.md').read_text()
+    assert '`a`@50k eval50: its checkpoint succeeds on training episodes' in log and '`b`@50k eval50: 1 of its first 25 stage-1 episodes succeed' in log
+
+
 def test_failed_replay_pauses_the_queue(setup):
     collector, inbox, runs, report, coord = setup
     for split, eps in (('eval50', (2, 3)), ('train', (39,))):

@@ -678,6 +678,8 @@ class Collector:
                     if not info or not getattr(info[0], 'lfs', None):
                         continue
                     episodes = plan.get('episodes')
+                    if plan['split'] == 'eval50' and episodes is None and picks.get('eval25'):
+                        episodes = 'eval25'  # stage 1; funnel() completes it to all 50 when warranted
                     entry.update({'repo': repo, 'file': file, 'sha256': info[0].lfs.sha256, 'tasks': [RELOC],
                                   'episodes': picks.get(episodes) if isinstance(episodes, str) else episodes,
                                   'note': plan.get('note', f'{name} at {int(plan["step"]) // 1000}k on {plan["split"]}')})
@@ -736,7 +738,28 @@ class Collector:
                     f'`{entry["run"]}` at step {entry["step"]} succeeds on training instances '
                     f'({round(row["success"] * row["valid"])} of {row["valid"]} episodes so far, execution setting {setting}); '
                     f'{status}.'], f'{entry["run"]}@{entry["step"]} succeeds on training instances')
+        self.complete_eval50(queue, rows)
         return rows, valid
+
+    def complete_eval50(self, queue, rows):
+        """Two-stage eval50: an entry listing the 25 stage-1 episodes (splits/reloc-picks.json `eval25`) becomes the full
+        eval50 set when any of them succeeds or its checkpoint succeeds on training episodes (any execution setting)."""
+        stage1 = sorted((read_json(CHECKOUT / 'splits/reloc-picks.json') or {}).get('eval25') or [])
+        trained = {(r['entry']['run'], r['entry']['step']) for r in rows
+                   if r['entry']['split'] == 'train' and r['valid'] and (r['success'] or 0) > 0}
+        for row in rows:
+            entry = row['entry']
+            if entry['split'] != 'eval50' or not stage1 or sorted(entry.get('episodes') or []) != stage1:
+                continue
+            successes = round((row['success'] or 0) * row['valid'])
+            if successes or (entry['run'], entry['step']) in trained:
+                entry['episodes'] = None
+                why = (f'{successes} of its first {row["valid"]} stage-1 episodes succeed' if successes else
+                       'its checkpoint succeeds on training episodes')
+                self.decide(f'eval50full:{entry["run"]}:{entry["step"]}:{entry.get("tag")}', 'lab', [
+                    f'`{entry["run"]}`@{entry["step"] // 1000}k eval50: {why}, so the entry now covers all 50 test episodes '
+                    '(`"episodes": null`). Run only the missing ones and keep the episode files you have.'],
+                    f'{entry["run"]}@{entry["step"]} eval50 completed to 50')
 
     def exec_decision(self, queue, rows, manifests):
         """Execution-setting test: the per-setting table for the report and, once every test result is in (queued
@@ -801,6 +824,8 @@ class Collector:
                 for plan in run.get('tierB', []):
                     if not planned(queue, name, int(plan['step']), plan['split']):
                         episodes = plan.get('episodes')
+                        if plan['split'] == 'eval50' and episodes is None and picks.get('eval25'):
+                            episodes = 'eval25'
                         projected += runnable(plan['split'] == 'eval50', picks.get(episodes) if isinstance(episodes, str) else episodes)
         minutes, source = episode_minutes(self.inbox, env, queue.get('horizon_steps'))
         return {'queued': queued, 'projected': projected, 'hours_queued': queued * minutes / 60,
@@ -844,7 +869,8 @@ class Collector:
         out = ['<!-- coord:begin -->', f'## Relocalization phase (collector, {now.astimezone(PDT):%Y-%m-%d %H:%M} PDT)', '',
                'Scope from 2026-10-07: camera_relocalization-standard only. Funnel: (1) open-loop replay of recorded actions '
                '(positive control) → (2) training instances → (3) eval50, only for checkpoints that succeed on training '
-               f'instances plus each run\'s final checkpoint. Horizon {queue.get("horizon_steps")} steps; queue paused: '
+               'instances plus each run\'s final checkpoint, in two stages: 25 stratified test episodes first, all 50 when any '
+               f'of the 25 succeed or the checkpoint succeeds on training episodes. Horizon {queue.get("horizon_steps")} steps; queue paused: '
                f'{queue.get("paused")}.', '', CORRECTION, '', '**Needs a decision / blocked:**', *(asks or ['- none']), '',
                '| Stage | Run | Step | Episodes | Success | Within tol. | Geodesic m | Position m | Orientation deg | Errors |',
                '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
