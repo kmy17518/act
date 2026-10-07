@@ -1,0 +1,31 @@
+{
+ "format": "isg-episode-split/v1",
+ "name": "reloc-train10",
+ "description": "Overfit test of the relocalization phase: 10 of the 100 camera_relocalization-standard train100 episodes of kmy17518/isg-init, stratified by distance bucket (4/3/3 for (0,3], (3,5], (5,10] m), random.Random(0). Pass as --episode-split splits/reloc-train10.json.",
+ "source": {
+  "split": "train100",
+  "file": "isg_meta/train_split.json",
+  "sha256": "e724729a73d876ddacac69955373eca8905c48951e0a5d7bcc302eb9b46c8e66"
+ },
+ "totals": {
+  "train": 10
+ },
+ "tasks": {
+  "camera_relocalization-standard": {
+   "task_index": 0,
+   "selection": "stratified",
+   "train": [
+    8,
+    39,
+    43,
+    52,
+    59,
+    74,
+    82,
+    111,
+    113,
+    121
+   ]
+  }
+ }
+}

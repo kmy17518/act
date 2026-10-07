@@ -3,8 +3,8 @@
 
 Every cycle (default every 30 minutes):
   1. download `m2/` and `lab/` of the coordination repo into /tmp/dev/coord/in/ (a fresh copy each cycle);
-  2. copy machine 2's Tier A results `m2/tierA-eval50/<run>/step_*.json` into `<runs_root>/<run>/tierA-eval50/`, only
-     for runs that `waves/wave2.json` assigns to "M2" and that have no local training log;
+  2. copy machine 2's Tier A results `m2/tierA-eval50/<run>/step_*.json` into `<runs_root>/<run>/tierA-eval50/` for runs
+     any manifest (`--manifest`, repeatable) assigns to "M2" and that have no local training log;
   3. render the report for `waves/wave1.json` and `waves/wave2.json` plus a "Machine 2 and lab" section at its top
      (helper `needs_decision` / `blocked` items first);
   4. apply machine 1's rules and record every decision in `m1/decisions.md` and the plan's decision log: the machine-2
@@ -109,25 +109,25 @@ def status_runs(status):
     return {name: record for name, record in runs.items() if isinstance(record, dict)}
 
 
-def copy_m2_tier_a(wave2, inbox):
+def copy_m2_tier_a(manifests, inbox):
+    """Copy machine 2's Tier A results into the local run directories of the runs any manifest assigns to M2."""
     copied = []
-    for name, run in wave2['_runs'].items():
-        if run.get('machine') != 'M2':
-            continue
-        source = inbox / 'm2/tierA-eval50' / name
-        run_dir = Path(wave2['runs_root']) / name
-        if not source.is_dir():
-            continue
-        if (run_dir / 'metrics.jsonl').exists():
-            print(json.dumps({'event': 'skip_local_run', 'run': name}), flush=True)  # never touch a local run
-            continue
-        target = run_dir / tier_a_config(wave2)['dir']
-        for path in sorted(source.glob('step_*.json')):
-            destination = target / path.name
-            if digest(destination) != digest(path):
-                target.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(path, destination)
-                copied.append(f'{name}/{path.name}')
+    for manifest in manifests:
+        for name, run in manifest['_runs'].items():
+            source = inbox / 'm2/tierA-eval50' / name
+            run_dir = Path(manifest['runs_root']) / name
+            if run.get('machine') != 'M2' or not source.is_dir():
+                continue
+            if (run_dir / 'metrics.jsonl').exists():
+                print(json.dumps({'event': 'skip_local_run', 'run': name}), flush=True)  # never touch a local run
+                continue
+            target = run_dir / tier_a_config(manifest)['dir']
+            for path in sorted(source.glob('step_*.json')):
+                destination = target / path.name
+                if digest(destination) != digest(path):
+                    target.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(path, destination)
+                    copied.append(f'{name}/{path.name}')
     return copied
 
 
@@ -166,12 +166,14 @@ def local_training(run_dir, lo, hi):
 
 
 def noise_floor(wave1):
-    """δ of plan §5 on the test set: max |seed 0 - seed 1| of the late tag-zero baseline over 40k and 50k."""
-    deltas = {'L1_own': None, 'gap': None}
-    for key, getter in (('L1_own', l1_own), ('gap', goal_gap)):
+    """delta of plan §5 on relocalization (the only task in scope from 2026-10-07): max |seed 0 - seed 1| of the
+    late tag-zero baseline's relocalization L1_own and gap on the test set over 40k and 50k."""
+    deltas = {}
+    for key in ('L1_own', 'gap'):
         values = []
         for step in (40000, 50000):
-            a, b = (getter(tier_a(wave1, f'w1-late-tagzero-lrg1e-4-s{seed}', step)) for seed in (0, 1))
+            a, b = (((tier_a(wave1, f'w1-late-tagzero-lrg1e-4-s{seed}', step) or {}).get('heldout', {}).get('tasks', {})
+                     .get(GOAL_TASKS[0]) or {}).get(key) for seed in (0, 1))
             if a is not None and b is not None:
                 values.append(abs(a - b))
         deltas[key] = max(values) if values else None
@@ -267,71 +269,84 @@ def fixed_action_horizon(env):
     return values[0] if values and len(set(values)) == 1 else None
 
 
-SCORE_KEYS = {GOAL_TASKS[0]: ('geodesic', 'distance'), GOAL_TASKS[1]: ('angle',), GOAL_TASKS[2]: ('angle',),
-              CONTROL_TASK: ('align', 'error')}
+RELOC = GOAL_TASKS[0]
+SPLIT_ORDER = {'replay': 0, 'train': 1, 'eval50': 2}
+SPLIT_SIZES = {'train': 100, 'eval50': 50}
+FLOOR = 0.10  # plan §5 floor guard: no success-based comparison while every candidate is below ~10 % success
+METRICS = ('geodesic_distance_m', 'position_error_m', 'orientation_error_deg', 'within_tolerance')
 
 
-def primary_score(task, score):
-    """The task's continuous metric (lower is better) from the episode's `score`: a number, or the first number under
-    a key naming it (relocalization geodesic distance, opening-angle error, alignment error)."""
-    if isinstance(score, (int, float)) and not isinstance(score, bool):
-        return float(score)
-    if isinstance(score, dict):
-        numbers = {k: v for k, v in score.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
-        for marker in SCORE_KEYS.get(task, ()):
-            for key, value in numbers.items():
-                if marker in key.lower() and 'bucket' not in key.lower():
-                    return float(value)
+def entry_dir(inbox, entry):
+    if entry['split'] == 'replay':
+        return inbox / 'lab/diagnostics/replay' / entry.get('replay_split', 'eval50')
+    prefix = 'lab/tierB' if entry['split'] == 'eval50' else 'lab/tierB-train'
+    return inbox / prefix / entry['run'] / f'step_{int(entry["step"]):08d}'
+
+
+def entry_key(entry):
+    return (entry['run'], entry.get('step'), entry['split'], entry.get('replay_split'))
+
+
+def score_value(record, key):
+    """A metric at the top level of an episode record or under its `score` dict (booleans count as 0/1)."""
+    for source in (record, record.get('score') if isinstance(record.get('score'), dict) else {}):
+        value = source.get(key)
+        if isinstance(value, (bool, int, float)):
+            return float(value)
     return None
 
 
-def tier_b_files(inbox, run, step):
-    return sorted((inbox / 'lab/tierB' / run / f'step_{step:08d}').glob('*/episode_*.json'))
-
-
-def tier_b_episodes(inbox, run, step):
-    """{(task, episode): (success, primary score)} of the episodes that finished without an evaluator error."""
-    episodes = {}
-    for path in tier_b_files(inbox, run, step):
-        record = read_json(path) or {}
-        success = record.get('success')
-        if record.get('error') or not isinstance(success, (bool, int, float)):
+def entry_results(inbox, entry):
+    """({episode_index: record}, expected episode count, summary.json) of one queue entry (relocalization only)."""
+    directory = entry_dir(inbox, entry)
+    files = directory.glob('episode_*.json') if entry['split'] == 'replay' else (directory / RELOC).glob('episode_*.json')
+    results = {}
+    for path in files:
+        try:
+            results[int(path.stem.split('_')[1])] = read_json(path) or {}
+        except (IndexError, ValueError):
             continue
-        episodes[(path.parent.name, path.stem)] = (float(success), primary_score(path.parent.name, record.get('score')))
-    return episodes
+    wanted = entry.get('episodes')
+    if wanted is not None:
+        results = {e: r for e, r in results.items() if e in set(wanted)}
+    expected = len(wanted) if wanted is not None else SPLIT_SIZES.get(entry['split'], 0)
+    return results, expected, read_json(directory / 'summary.json')
 
 
-def paired_comparison(a, b, rng_seed=0, resamples=10000):
-    keys = sorted(set(a) & set(b))
-    if not keys:
+def summarize(results):
+    valid = {e: r for e, r in results.items() if not r.get('error') and isinstance(r.get('success'), (bool, int, float))}
+    row = {'done': len(results), 'valid': len(valid), 'errors': len(results) - len(valid),
+           'success': sum(float(r['success']) for r in valid.values()) / len(valid) if valid else None}
+    for key in METRICS:
+        values = [v for v in (score_value(r, key) for r in valid.values()) if v is not None]
+        row[key] = sum(values) / len(values) if values else None
+    return row, valid
+
+
+def paired(a, b, key, rng_seed=0, resamples=10000):
+    """Mean of a - b over the common valid episodes (success or a continuous score), bootstrap 95 % CI."""
+    values = [(float(a[e]['success']), float(b[e]['success'])) if key == 'success' else (score_value(a[e], key), score_value(b[e], key))
+              for e in sorted(set(a) & set(b))]
+    diff = np.array([x - y for x, y in values if x is not None and y is not None])
+    if len(diff) < 2:
         return None
-    diff = np.array([a[k][0] - b[k][0] for k in keys])
-    rng = np.random.default_rng(rng_seed)
-    means = diff[rng.integers(0, len(diff), (resamples, len(diff)))].mean(axis=1)
+    means = diff[np.random.default_rng(rng_seed).integers(0, len(diff), (resamples, len(diff)))].mean(axis=1)
     lo, hi = np.percentile(means, [2.5, 97.5])
-    tasks = {}
-    for task in sorted({k[0] for k in keys}):
-        d = np.array([a[k][0] - b[k][0] for k in keys if k[0] == task])
-        scores = [a[k][1] - b[k][1] for k in keys if k[0] == task and a[k][1] is not None and b[k][1] is not None]
-        tasks[task] = {'n': len(d), 'diff': float(d.mean()),
-                       'se': float(d.std(ddof=1) / np.sqrt(len(d))) if len(d) > 1 else float('inf'),
-                       'score_diff': float(np.mean(scores)) if scores else None,
-                       'score_se': float(np.std(scores, ddof=1) / np.sqrt(len(scores))) if len(scores) > 1 else None}
-    a_wins = lo > 0 and all(t['diff'] >= -2 * t['se'] for t in tasks.values())
-    b_wins = hi < 0 and all(t['diff'] <= 2 * t['se'] for t in tasks.values())
-    return {'n': len(keys), 'diff': float(diff.mean()), 'ci': [float(lo), float(hi)], 'tasks': tasks,
-            'outcome': 'a' if a_wins else 'b' if b_wins else 'tie'}
+    return {'n': len(diff), 'diff': float(diff.mean()), 'ci': [float(lo), float(hi)]}
 
 
-# ---------------------------------------------------------------------------------------------- rules
+def reloc(result, key):
+    return ((result or {}).get('heldout', {}).get('tasks', {}).get(RELOC) or {}).get(key)
+
 
 class Collector:
-    def __init__(self, api, wave1_path, wave2_path):
+    def __init__(self, api, manifests):
         self.api = api
-        self.wave1_path, self.wave2_path = wave1_path, wave2_path
+        self.manifest_paths = [Path(p) for p in manifests]
         self.inbox, self.m1 = COORD / 'in', COORD / 'm1'
         self.state_path = COORD / 'state.json'
         self.state = read_json(self.state_path) or {'recorded': [], 'uploaded': {}, 'lab_trusted': False}
+        self.decisions, self.escalations, self.first_frame_diffs = [], [], []
 
     def decide(self, key, audience, lines, log_line):
         """Append a decision once (keyed) to m1/decisions.md and the plan's decision log."""
@@ -341,11 +356,9 @@ class Collector:
         with (self.m1 / 'decisions.md').open('a') as stream:
             stream.write(f'\n## {stamp} — to {audience}\n' + ''.join(f'- {line}\n' for line in lines))
         plan = PLAN.read_text()
-        row = (f'| {stamp[:10]} | coordination | {log_line} | `m1/decisions.md` entry {stamp} in '
-               f'`{REPO}` | see entry |\n')
-        PLAN.write_text(plan if plan.endswith('\n') else plan + '\n')
         with PLAN.open('a') as stream:
-            stream.write(row)
+            stream.write(('' if plan.endswith('\n') else '\n') +
+                         f'| {stamp[:10]} | coordination | {log_line} | `m1/decisions.md` entry {stamp} in `{REPO}` | see entry |\n')
         self.state['recorded'].append(key)
         self.decisions.append(f'{stamp} to {audience}: {log_line}')
         return True
@@ -360,13 +373,11 @@ class Collector:
         down = age > STALE
         was_down = self.state.setdefault('down', {}).get(name, False)
         if down and not was_down:
-            proposal = (' Recovery (plan §7, pre-approved by the user on 2026-10-03): machine 1 takes over its unfinished '
-                        'runs from their Hub resume checkpoints under the same W&B ids as soon as a machine-1 GPU is free '
-                        '(queued seed replicates yield). M2 must not restart any run before reading m1/decisions.md.'
-                        if name == 'M2' else '')
-            self.decide(f'down:{name}:{iso(updated)}', 'all',
-                        [f'{name} is flagged as down: its status.json was last updated at {iso(updated)}, more than an hour '
-                         f'ago.{proposal}'], f'{name} flagged as down (status.json older than 1 h)')
+            proposal = (' Recovery (plan §7, pre-approved by the user): machine 1 takes over its unfinished runs from their '
+                        'Hub resume checkpoints under the same W&B ids as soon as a machine-1 GPU is free. M2 must not '
+                        'restart any run before reading m1/decisions.md.' if name == 'M2' else '')
+            self.decide(f'down:{name}:{iso(updated)}', 'all', [f'{name} is flagged as down: its status.json was last updated '
+                        f'at {iso(updated)}, more than an hour ago.{proposal}'], f'{name} flagged as down (status.json older than 1 h)')
         elif was_down and not down:
             self.decide(f'up:{name}:{iso(updated)}', 'all', [f'{name} is reporting again (status.json {iso(updated)}).'],
                         f'{name} reporting again')
@@ -402,205 +413,193 @@ class Collector:
                     f'({value:.5f}, {delta * 100:+.2f} %)')
         return f'{value:.5f} (`{key}`), {delta * 100:+.2f} % vs {CALIBRATION_REFERENCE}: **{"pass" if passed else "fail"}**'
 
-    def kill_rule(self, wave1, wave2, runs, delta):
-        """Plan §5 triage at 20k for machine-2 runs against the wave-2 base run of the same seed."""
+    def kill_rule(self, manifests, runs, delta):
+        """Plan §5 triage at 20k for machine-2 runs, on relocalization numbers, against the manifest's base run."""
         rows = []
-        base_name = (wave2.get('base') or {}).get('runs', ['w1-early-copy05-lrg1e-3-s0'])[0]
-        base = tier_a(wave1, base_name, 20000)
-        base_l1_train, base_s = local_training(Path(wave1['runs_root']) / base_name, 19501, 20000)
-        for name, run in wave2['_runs'].items():
-            if run.get('machine') != 'M2' or name.startswith('m2-calib'):
+        for manifest in manifests:
+            base_name = (manifest.get('base') or {}).get('runs', [None])[0]
+            if not base_name:
                 continue
-            result = tier_a(wave2, name, 20000)
-            if result is None or l1_own(base) is None:
-                continue
-            record = runs.get(name, {})
-            l1, gap = l1_own(result), goal_gap(result)
-            train_l1, s_step = record.get('train_l1_last500'), record.get('s_per_step')
-            reasons = []
-            if isinstance(train_l1, (int, float)) and (train_l1 != train_l1 or (base_l1_train and train_l1 > 2 * base_l1_train)):
-                reasons.append(f'training L1 {train_l1:.4f} non-finite or > 2× the base run\'s {base_l1_train:.4f}')
-            if l1 is not None and l1 >= 1.10 * l1_own(base) and gap is not None and delta['gap'] is not None and gap <= delta['gap']:
-                reasons.append(f'held-out L1_own {l1:.4f} ≥ 1.10 × base {l1_own(base):.4f} and goal-task gap {gap:.4f} ≤ δ '
-                               f'{delta["gap"]:.4f}')
-            if isinstance(s_step, (int, float)) and base_s and s_step > 2 * base_s:
-                reasons.append(f'{s_step:.3f} s/step is below half the expected speed ({base_s:.3f} s/step on machine 1)')
-            kill = bool(reasons)
-            text = (f'`{name}` at 20k: **kill** (plan §5): ' + '; '.join(reasons) + '. Stop it; its GPU waits for machine 1.'
-                    if kill else
-                    f'`{name}` at 20k: keep. Held-out L1_own {fmt(l1)} vs base `{base_name}` {fmt(l1_own(base))} '
-                    f'(threshold {fmt(1.10 * l1_own(base))}), goal-task gap {fmt(gap)} (δ {fmt(delta["gap"])}), '
-                    f'{fmt(s_step, 3)} s/step.')
-            self.decide(f'kill20k:{name}', 'M2', [text], f'M2 20k triage {name}: {"kill" if kill else "keep"}')
-            rows.append(text)
+            base_manifest = next((m for m in manifests if base_name in m['_runs']), manifest)
+            base = tier_a(base_manifest, base_name, 20000)
+            base_train, base_s = local_training(Path(manifest['runs_root']) / base_name, 19501, 20000)
+            for name, run in manifest['_runs'].items():
+                if run.get('machine') != 'M2' or name.startswith('m2-calib') or reloc(base, 'L1_own') is None:
+                    continue
+                result = tier_a(manifest, name, 20000)
+                if result is None:
+                    continue
+                l1, gap, record = reloc(result, 'L1_own'), reloc(result, 'gap'), runs.get(name, {})
+                train_l1, s_step = record.get('train_l1_last500'), record.get('s_per_step')
+                reasons = []
+                if isinstance(train_l1, (int, float)) and (train_l1 != train_l1 or (base_train and train_l1 > 2 * base_train)):
+                    reasons.append(f'training L1 {train_l1:.4f} non-finite or > 2x the base run\'s {base_train:.4f}')
+                if l1 is not None and gap is not None and delta['gap'] is not None and \
+                        l1 >= 1.10 * reloc(base, 'L1_own') and gap <= delta['gap']:
+                    reasons.append(f'relocalization L1_own {l1:.4f} >= 1.10 x base {reloc(base, "L1_own"):.4f} and gap '
+                                   f'{gap:.4f} <= delta {delta["gap"]:.4f}')
+                if isinstance(s_step, (int, float)) and base_s and s_step > 2 * base_s:
+                    reasons.append(f'{s_step:.3f} s/step is below half the expected speed ({base_s:.3f} s/step)')
+                text = (f'`{name}` at 20k: **kill** (plan §5): ' + '; '.join(reasons) + '. Stop it; its GPU waits for machine 1.'
+                        if reasons else f'`{name}` at 20k: keep. Relocalization L1_own {fmt(l1)} vs base `{base_name}` '
+                        f'{fmt(reloc(base, "L1_own"))}, gap {fmt(gap)} (delta {fmt(delta["gap"])}), {fmt(s_step, 3)} s/step.')
+                self.decide(f'kill20k:{name}', 'M2', [text], f'M2 20k triage {name}: {"kill" if reasons else "keep"}')
+                rows.append(text)
         return rows
 
     def lab_trust(self, instances, env):
-        self.decide('rule:first-frame-threshold', 'lab',
-                    [f'Machine 1 counts an episode → instance mapping as verified when `first_frame_mean_abs_diff` is at '
-                     f'most {FIRST_FRAME_MAX_DIFF:g} on the 0–255 scale (values that are all ≤ 1 are read as the 0–1 scale). '
-                     'Tier B results are trusted once all 200 test episodes meet it and env.json fixes one action horizon.'],
-                    f'lab verification criterion: first-frame mean abs diff <= {FIRST_FRAME_MAX_DIFF:g} (0-255)')
         covered, parsed, diffs = instance_coverage(instances) if instances is not None else (0, 0, [])
         self.first_frame_diffs = diffs
         horizon = fixed_action_horizon(env)
         trusted = covered == 200 and horizon is not None
-        reasons = []
-        if covered != 200:
-            reasons.append(f'instances.json verifies {covered}/200 test episodes ({parsed} entries parsed)'
-                           if instances is not None else 'no instances.json yet')
+        reasons = [] if covered == 200 else [f'instances.json verifies {covered}/200 test episodes' if instances is not None
+                                             else 'no instances.json yet']
         if horizon is None:
             reasons.append('env.json shows no single fixed action horizon' if env is not None else 'no env.json yet')
         if trusted != self.state.get('lab_trusted', False):
             self.state['lab_trusted'] = trusted
             self.decide(f'labtrust:{trusted}:{iso(utc_now())}', 'lab',
-                        [f'Lab results are trusted from now on: instances.json verifies all 200 test episodes and '
-                         f'env.json fixes the action horizon at {horizon}.' if trusted else
-                         'Lab results are no longer trusted: ' + '; '.join(reasons) + '.'],
-                        f'lab results {"trusted" if trusted else "not trusted"}')
+                        [f'Lab results are trusted from now on (instances 200/200, action horizon {horizon}).' if trusted else
+                         'Lab results are no longer trusted: ' + '; '.join(reasons) + '.'], f'lab results {"trusted" if trusted else "not trusted"}')
         return trusted, horizon, covered, reasons
 
-    def verdict(self, queue, trusted, wave1):
-        finalists = [(e['run'], int(e['step'])) for e in (queue or {}).get('entries', [])]
-        summaries = {(r, s): read_json(self.inbox / 'lab/tierB' / r / f'step_{s:08d}' / 'summary.json')
-                     for r, s in finalists}
-        incomplete = [r for r, s in finalists if len(tier_b_files(self.inbox, r, s)) < 200]
-        if not finalists or any(v is None for v in summaries.values()) or incomplete:
-            return ({'pending': 'waiting for complete results (200 episode files and a summary.json) of '
-                     + ', '.join(f'`{r}`' for r in incomplete)} if incomplete and all(v is not None for v in summaries.values())
-                    else None), summaries
-        if not trusted:
-            return {'pending': 'every finalist has a summary.json, but lab results are not trusted yet'}, summaries
-        episodes = {f: tier_b_episodes(self.inbox, *f) for f in finalists}
-        pairs = {}
-        for a, b in combinations(finalists, 2):
-            pairs[(a[0], b[0])] = paired_comparison(episodes[a], episodes[b])
-        beaten = {r: False for r, _ in finalists}
-        wins = {r: 0 for r, _ in finalists}
-        for (a, b), result in pairs.items():
-            if result and result['outcome'] == 'a':
-                beaten[b] = True
-                wins[a] += 1
-            elif result and result['outcome'] == 'b':
-                beaten[a] = True
-                wins[b] += 1
-        cost = {r: local_training(Path(wave1['runs_root']) / r, 1, 50000)[1] or float('inf') for r, _ in finalists}
-        undefeated = sorted([r for r, _ in finalists if not beaten[r]], key=lambda r: (cost[r], r))
-        winner = next((r for r, _ in finalists if wins[r] == len(finalists) - 1), None)
-        text = (f'Wave-1 verdict (Tier B, {len(finalists)} finalists, paired bootstrap over the test instances): '
-                + (f'`{winner}` beats every other finalist.' if winner else
-                   'no finalist beats all others; undefeated, cheapest first: '
-                   + ', '.join(f'`{r}` ({cost[r]:.3f} s/step)' for r in undefeated)
-                   + '. The plan\'s tie rule takes the cheaper variant; equal costs leave "simpler" to the user.'))
-        details = [f'`{a}` − `{b}`: success diff {r["diff"]:+.3f}, 95 % CI [{r["ci"][0]:+.3f}, {r["ci"][1]:+.3f}] over '
-                   f'{r["n"]} instances → {dict(a=a, b=b, tie="tie")[r["outcome"]]}' for (a, b), r in pairs.items() if r]
-        token = hashlib.sha256(json.dumps({str(k): v for k, v in pairs.items()}, sort_keys=True, default=str).encode()).hexdigest()[:12]
-        self.decide(f'verdict:{token}', 'all', [text, *details], 'wave-1 verdict (Tier B): '
-                    + (winner or 'tie among ' + ', '.join(undefeated)))
-        family = 'late' if (winner or undefeated[0]).startswith('w1-late') else 'early'
-        return {'text': text, 'details': details, 'pairs': pairs, 'family': family, 'winner': winner,
-                'undefeated': undefeated}, summaries
+    # ------------------------------------------------------------------------------------------ Tier B queue
+
+    def extend_queue(self, manifests, queue):
+        """Append the manifests' planned evaluations (run field "tierB") whose eval checkpoint is on the Hub."""
+        picks = read_json(CHECKOUT / 'splits/reloc-picks.json') or {}
+        keys = {entry_key(e) for e in queue['entries']}
+        added = []
+        for manifest in manifests:
+            for name, run in manifest['_runs'].items():
+                for plan in run.get('tierB', []):
+                    entry = {'run': name, 'step': int(plan['step']), 'split': plan['split']}
+                    if entry_key(entry) in keys:
+                        continue
+                    repo, file = f'{manifest["hf_owner"]}/{manifest["hf_repo_prefix"]}{name}', f'eval/step-{int(plan["step"]):08d}.pt'
+                    try:
+                        info = self.api.get_paths_info(repo, [file], expand=True)
+                    except Exception:  # repo not created yet
+                        continue
+                    if not info or not getattr(info[0], 'lfs', None):
+                        continue
+                    episodes = plan.get('episodes')
+                    entry.update({'repo': repo, 'file': file, 'sha256': info[0].lfs.sha256, 'tasks': [RELOC],
+                                  'episodes': picks.get(episodes) if isinstance(episodes, str) else episodes,
+                                  'note': plan.get('note', f'{name} at {int(plan["step"]) // 1000}k on {plan["split"]}')})
+                    queue['entries'].append(entry)
+                    keys.add(entry_key(entry))
+                    added.append(f'{name}@{plan["step"]}/{plan["split"]}')
+        return added
+
+    def funnel(self, queue):
+        """Results per queue entry, the replay positive control and the eval50 step of the funnel."""
+        rows, valid = [], {}
+        for entry in queue['entries']:
+            results, expected, summary = entry_results(self.inbox, entry)
+            row, ok = summarize(results)
+            row.update(entry=entry, expected=expected, complete=row['done'] >= expected > 0 and summary is not None)
+            rows.append(row)
+            valid[entry_key(entry)] = ok
+        replays = [r for r in rows if r['entry']['split'] == 'replay']
+        if replays and all(r['complete'] for r in replays):
+            within = sum(int(bool(score_value(rec, 'within_tolerance') or rec.get('success')))
+                         for r in replays for rec in valid[entry_key(r['entry'])].values())
+            total = sum(r['valid'] for r in replays)
+            passed = total > 0 and within == total and sum(r['errors'] for r in replays) == 0
+            token = hashlib.sha256(f'{within}/{total}'.encode()).hexdigest()[:8]
+            if self.decide(f'replay:{token}', 'lab', [
+                    f'Positive control (open-loop replay of recorded actions): {within}/{total} episodes end within tolerance. '
+                    + ('Passed: the action path is sound; continue with the queue.' if passed else
+                       'Failed: the action path (base velocity semantics, control rate, settle check) is wrong; the queue is '
+                       'paused until a re-run of the replays ends within tolerance for every episode.')],
+                    f'replay positive control {"passed" if passed else "failed"} ({within}/{total})'):
+                queue['paused'] = not passed
+        for row in rows:
+            entry = row['entry']
+            if entry['split'] == 'train' and row['complete'] and (row['success'] or 0) > 0:
+                target = dict(entry, split='eval50', episodes=None, note=f'{entry["run"]} at {entry["step"] // 1000}k: '
+                              'succeeds on training instances, so eval50 (funnel step 3)')
+                if entry_key(target) not in {entry_key(e) for e in queue['entries']}:
+                    queue['entries'].append(target)
+                self.decide(f'trainsuccess:{entry["run"]}:{entry["step"]}', 'all', [
+                    f'`{entry["run"]}` at step {entry["step"]} succeeds on training instances ({row["success"]:.0%} of '
+                    f'{row["valid"]}); its eval50 evaluation is queued.'], f'{entry["run"]}@{entry["step"]} succeeds on training instances')
+        return rows, valid
+
+    def comparisons(self, rows, valid):
+        """Paired comparisons of complete entries on the same split and episodes, under the floor guard."""
+        out, groups = [], {}
+        for row in rows:
+            entry = row['entry']
+            if row['complete'] and entry['split'] != 'replay':
+                groups.setdefault((entry['split'], tuple(entry.get('episodes') or ())), []).append(row)
+        for (split, _), members in groups.items():
+            if len(members) < 2:
+                continue
+            best = max((m['success'] or 0) for m in members)
+            keys = ('success',) if best >= FLOOR else ('geodesic_distance_m', 'orientation_error_deg')
+            out.append(f'- {split}: ' + ('success-based (some candidate reaches 10 %).' if best >= FLOOR else
+                       f'floor guard: every candidate is below 10 % success (best {best:.0%}), so success is not compared; '
+                       'paired final geodesic distance and orientation error (lower is better) instead.'))
+            for a, b in combinations(members, 2):
+                for key in keys:
+                    result = paired(valid[entry_key(a['entry'])], valid[entry_key(b['entry'])], key)
+                    if result:
+                        out.append(f'  - `{a["entry"]["run"]}`@{a["entry"]["step"]} − `{b["entry"]["run"]}`@{b["entry"]["step"]}, '
+                                   f'{key}: {result["diff"]:+.3f} (95 % CI [{result["ci"][0]:+.3f}, {result["ci"][1]:+.3f}], '
+                                   f'n {result["n"]})')
+        return out
 
     # ------------------------------------------------------------------------------------------ report
 
-    def coord_section(self, now, m2, lab, health, calibration_text, kill_rows, trust, verdict, summaries, wave2,
-                      copied, delta):
+    def coord_section(self, now, m2, lab, health, calibration_text, kill_rows, trust, queue, rows, comparisons, copied):
         trusted, horizon, covered, reasons = trust
-        out = ['<!-- coord:begin -->',
-               f'## Machine 2 and lab (collector, {now.astimezone(PDT):%Y-%m-%d %H:%M} PDT)', '']
         asks = []
         for name, status in (('M2', m2), ('lab', lab)):
             for key in ('needs_decision', 'blocked'):
                 items = (status or {}).get(key)
-                items = items if isinstance(items, list) else [items] if items else []
-                asks += [f'- **{name} {key.replace("_", " ")}:** {item}' for item in items]
+                asks += [f'- **{name} {key.replace("_", " ")}:** {item}' for item in (items if isinstance(items, list) else [items] if items else [])]
         asks += [f'- **machine 1 review:** {item}' for item in self.escalations]
-        out += ['**Needs a decision / blocked:**', *(asks or ['- none']), '']
-        out += [f'**Helper health:** M2 — {health["M2"][0]}; lab — {health["lab"][0]}.', '']
-        out += ['### Machine 2', '', f'- Calibration (`m2/calibration.json`): {calibration_text}.']
-        if m2:
-            out.append(f'- Commit {m2.get("git_commit", "—")}, GPUs: {m2.get("gpus", m2.get("GPUs", "—"))}.')
+        out = ['<!-- coord:begin -->', f'## Relocalization phase (collector, {now.astimezone(PDT):%Y-%m-%d %H:%M} PDT)', '',
+               'Scope from 2026-10-07: camera_relocalization-standard only. Funnel: (1) open-loop replay of recorded actions '
+               '(positive control) → (2) training instances → (3) eval50, only for checkpoints that succeed on training '
+               f'instances plus each run\'s final checkpoint. Horizon {queue.get("horizon_steps")} steps; queue paused: '
+               f'{queue.get("paused")}.', '', '**Needs a decision / blocked:**', *(asks or ['- none']), '',
+               '| Stage | Run | Step | Episodes | Success | Within tol. | Geodesic m | Position m | Orientation deg | Errors |',
+               '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
+        for row in sorted(rows, key=lambda r: SPLIT_ORDER.get(r['entry']['split'], 9)):
+            entry = row['entry']
+            stage = 'replay ' + entry.get('replay_split', '') if entry['split'] == 'replay' else entry['split']
+            out.append(f'| {stage} | `{entry["run"]}` | {entry.get("step") or "—"} | {row["done"]}/{row["expected"]}'
+                       f'{"" if row["complete"] else " (running)"} | {fmt(row["success"], 2)} | {fmt(row["within_tolerance"], 2)} | '
+                       f'{fmt(row["geodesic_distance_m"], 2)} | {fmt(row["position_error_m"], 2)} | '
+                       f'{fmt(row["orientation_error_deg"], 1)} | {row["errors"]} |')
+        out += ['', '**Paired comparisons:**', *(comparisons or ['- none yet (needs two complete entries on the same episodes)'])]
+        out += ['', f'**Helper health:** M2 — {health["M2"][0]}; lab — {health["lab"][0]}. Lab trust: '
+                f'{"trusted" if trusted else "not trusted: " + "; ".join(reasons)} (instances {covered}/200, action horizon {horizon}).']
         runs = status_runs(m2)
         if runs:
-            out += ['', '| Run | State | Step / max | s/step | Train L1 (last 500) | Peak GiB | ETA h | Exit | Uploader | Tier A steps |',
-                    '| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |']
-            for name, r in runs.items():
-                uploader = r.get('uploader') if isinstance(r.get('uploader'), str) else json.dumps(r.get('uploader', '—'))
-                out.append(f'| `{name}` | {r.get("state", "—")} | {r.get("step", "—")} / {r.get("max_steps", "—")} | '
-                           f'{fmt(r.get("s_per_step"), 3)} | {fmt(r.get("train_l1_last500"))} | {fmt(r.get("peak_gib"), 0)} | '
-                           f'{fmt(r.get("eta_h"), 1)} | {r.get("exit_code", "—")} | {uploader[:60]} | '
-                           f'{r.get("tier_a_steps", r.get("tierA_steps", "—"))} |')
-        rows = []
-        for name, run in wave2['_runs'].items():
-            if run.get('machine') != 'M2':
-                continue
-            for path in sorted((Path(wave2['runs_root']) / name / tier_a_config(wave2)['dir']).glob('step_*.json')):
-                result = read_json(path) or {}
-                base = tier_a(self.wave1, 'w1-early-copy05-lrg1e-3-s0', int(result.get('step', 0)))
-                control = (result.get('heldout', {}).get('tasks', {}).get(CONTROL_TASK) or {}).get('gap')
-                rows.append(f'| `{name}` | {result.get("step")} | {fmt(l1_own(result))} | {fmt(goal_gap(result))} | '
-                            f'{fmt(control)} | {fmt(l1_own(result) - l1_own(base)) if l1_own(base) is not None and l1_own(result) is not None else "—"} |')
-        if rows:
-            out += ['', 'Machine-2 Tier A on the test set (copied from `m2/tierA-eval50/`); Δ against the wave-2 base '
-                    f'`w1-early-copy05-lrg1e-3-s0` at the same step (δ L1_own {fmt(delta["L1_own"])}, δ gap {fmt(delta["gap"])}):', '',
-                    '| Run | Step | L1_own | gap (goal tasks) | gap board game | Δ L1_own vs base |',
-                    '| --- | ---: | ---: | ---: | ---: | ---: |', *rows]
-        if kill_rows:
-            out += ['', '20k triage:', *[f'- {r}' for r in kill_rows]]
-        out += ['', '### Lab', '']
-        if lab:
-            fields = {k: v for k, v in lab.items() if k not in ('needs_decision', 'blocked') and not isinstance(v, (list, dict))}
-            out.append('- Status: ' + ', '.join(f'{k} {v}' for k, v in fields.items()) + '.')
-        diffs = getattr(self, 'first_frame_diffs', [])
-        if diffs:
-            median = diffs[len(diffs) // 2]
-            out.append(f'- First-frame check: {len(diffs)} episodes, mean abs diff median {median:.2f}, max {diffs[-1]:.2f} '
-                       f'(0–255 scale; threshold {FIRST_FRAME_MAX_DIFF:g}); above 3× the median: '
-                       f'{sum(d > 3 * median for d in diffs)}.')
-        out.append(f'- Trust: {"**trusted**" if trusted else "not trusted: " + "; ".join(reasons)} (instances verified '
-                   f'{covered}/200, action horizon {horizon if horizon is not None else "—"}).')
-        smoke = sorted(p.relative_to(self.inbox).as_posix() for p in (self.inbox / 'lab/smoke').rglob('*') if p.is_file()) \
-            if (self.inbox / 'lab/smoke').exists() else []
-        out.append(f'- Smoke files: {len(smoke)}' + (f' (`{"`, `".join(smoke[:8])}`{" …" if len(smoke) > 8 else ""})' if smoke else '') + '.')
-        if any(v is not None for v in summaries.values()):
-            out += ['', '| Tier B run | Step | Episodes | Summary |', '| --- | ---: | ---: | --- |']
-            for (run, step), summary in summaries.items():
-                count = len(tier_b_episodes(self.inbox, run, step))
-                out.append(f'| `{run}` | {step} | {count} | '
-                           f'{json.dumps(summary, sort_keys=True)[:300] if summary is not None else "pending"} |')
-        if verdict:
-            out += ['', '### Wave verdict (Tier B)', '', verdict.get('text', verdict.get('pending', ''))]
-            out += [f'- {d}' for d in verdict.get('details', [])]
-            out.append('- Per-task lines: success difference ± paired SE; "score" is the difference of the task\'s '
-                       'continuous metric (geodesic distance, angle error or alignment error; lower is better), errored '
-                       'episodes excluded from the pairs.')
-            for (a, b), r in (verdict.get('pairs') or {}).items():
-                if r:
-                    out.append(f'- `{a}` − `{b}` per task: ' + '; '.join(
-                        f'{SHORT.get(t, t)} {v["diff"]:+.2f} ± {v["se"]:.2f} (score {fmt(v["score_diff"], 2)})'
-                        for t, v in r['tasks'].items()))
-            if verdict.get('family'):
-                out += ['', '**Proposal to the user (wave 2, verdict-dependent):** ' + (
-                    'early fusion won: keep the running early slate; next, second seeds of the best wave-2 refinements.'
-                    if verdict['family'] == 'early' else
-                    'late fusion won: let the early refinements finish, then run the late slate (`--goal-entry decoder`, '
-                    '`--goal-entry queries`, `--goal-content diff`, `--goal-pos none`, late winner seed 2).')]
-        out += ['', f'Copied this cycle: {len(copied)} machine-2 Tier A files. Decisions this cycle: '
+            out += ['', '| M2 run | State | Step / max | s/step | Train L1 (last 500) | Peak GiB | ETA h | Exit |',
+                    '| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |']
+            out += [f'| `{n}` | {r.get("state", "—")} | {r.get("step", "—")} / {r.get("max_steps", "—")} | {fmt(r.get("s_per_step"), 3)} | '
+                    f'{fmt(r.get("train_l1_last500"))} | {fmt(r.get("peak_gib"), 0)} | {fmt(r.get("eta_h"), 1)} | {r.get("exit_code", "—")} |'
+                    for n, r in runs.items() if r.get('state') not in ('finished',) or n.startswith('r1-')]
+        out += ['', f'M2 calibration: {calibration_text}.', *[f'- {r}' for r in kill_rows],
+                '', f'Copied this cycle: {len(copied)} machine-2 Tier A files. Decisions this cycle: '
                 + ('; '.join(self.decisions) if self.decisions else 'none') + '.', '<!-- coord:end -->']
         return '\n'.join(out)
 
-    def render_report(self, coord_text):
+    def render_report(self, coord_text, manifests):
         from isg_report import BEGIN, END, render
         text = REPORT.read_text()
         sections = [(coord_text, '<!-- coord:begin -->', '<!-- coord:end -->', 'top')]
-        for path, begin, end in ((self.wave1_path, BEGIN, END),
-                                 (self.wave2_path, '<!-- isg-runs-wave2:begin -->', '<!-- isg-runs-wave2:end -->')):
+        for manifest, path in zip(manifests, self.manifest_paths):
+            begin, end = (BEGIN, END) if path.stem == 'wave1' else (f'<!-- isg-runs-{path.stem}:begin -->', f'<!-- isg-runs-{path.stem}:end -->')
             try:
-                body = render(load(path))
-                body = body.replace(BEGIN, begin).replace(END, end)
+                body = render(manifest).replace(BEGIN, begin).replace(END, end)
                 if begin != BEGIN:
-                    body = body.replace(begin, begin + '\n## Wave 2 tables (machine 1; machine-2 Tier A copied from the '
-                                        'coordination repo)', 1)
+                    body = body.replace(begin, begin + f'\n## {path.stem} tables (machine 1; machine-2 Tier A copied)', 1)
             except Exception as exc:  # keep the cycle alive; show the failure in the report
                 body = f'{begin}\n_Rendering {path.name} failed: {type(exc).__name__}: {exc}_\n{end}'
             sections.append((body, begin, end, 'end'))
@@ -619,18 +618,17 @@ class Collector:
     # ------------------------------------------------------------------------------------------ cycle
 
     def upload(self):
+        import re
         from huggingface_hub import CommitOperationAdd
         files = {'docs/plan.md': PLAN, 'docs/report.md': REPORT, 'm1/decisions.md': self.m1 / 'decisions.md',
                  'm1/tierB-queue.json': self.m1 / 'tierB-queue.json'}
         changed = {remote: local for remote, local in files.items() if digest(local) != self.state['uploaded'].get(remote)}
         if not changed:
             return []
-        import re
         for remote, local in changed.items():
             if re.search(r'\bhf_[A-Za-z0-9]{30,}\b|\bghp_[A-Za-z0-9]{30,}\b', Path(local).read_text()):
                 raise RuntimeError(f'Refusing to upload {remote}: it contains a token-shaped string')
-        operations = [CommitOperationAdd(remote, str(local)) for remote, local in changed.items()]
-        self.api.create_commit(REPO, repo_type='dataset', operations=operations,
+        self.api.create_commit(REPO, repo_type='dataset', operations=[CommitOperationAdd(r, str(l)) for r, l in changed.items()],
                                commit_message=f'm1 {iso(utc_now())}: ' + ', '.join(sorted(changed)))
         for remote, local in changed.items():
             self.state['uploaded'][remote] = digest(local)
@@ -640,21 +638,28 @@ class Collector:
         now = utc_now()
         self.decisions, self.escalations, self.first_frame_diffs = [], [], []
         download(self.api, self.inbox)
-        wave1, wave2 = load(self.wave1_path), load(self.wave2_path)
-        self.wave1 = wave1
+        manifests = [load(p) for p in self.manifest_paths]
         m2, lab = read_json(self.inbox / 'm2/status.json'), read_json(self.inbox / 'lab/status.json')
-        copied = copy_m2_tier_a(wave2, self.inbox)
-        delta = noise_floor(wave1)
+        copied = copy_m2_tier_a(manifests, self.inbox)
+        delta = noise_floor(manifests[0])
         health = {'M2': self.health('M2', m2, now), 'lab': self.health('lab', lab, now)}
         calibration_text = self.calibration(read_json(self.inbox / 'm2/calibration.json'))
-        kill_rows = self.kill_rule(wave1, wave2, status_runs(m2), delta)
+        kill_rows = self.kill_rule(manifests, status_runs(m2), delta)
         trust = self.lab_trust(read_json(self.inbox / 'lab/instances.json'), read_json(self.inbox / 'lab/env.json'))
-        verdict, summaries = self.verdict(read_json(self.m1 / 'tierB-queue.json'), trust[0], wave1)
-        self.render_report(self.coord_section(now, m2, lab, health, calibration_text, kill_rows, trust, verdict,
-                                              summaries, wave2, copied, delta))
+        queue_path = self.m1 / 'tierB-queue.json'
+        queue = read_json(queue_path)
+        before = json.dumps(queue, sort_keys=True)
+        added = self.extend_queue(manifests, queue)
+        rows, valid = self.funnel(queue)
+        queue['entries'].sort(key=lambda e: SPLIT_ORDER.get(e['split'], 9))
+        if json.dumps(queue, sort_keys=True) != before:
+            queue['updated_at'] = iso(now)
+            queue_path.write_text(json.dumps(queue, indent=2) + '\n')
+        self.render_report(self.coord_section(now, m2, lab, health, calibration_text, kill_rows, trust, queue, rows,
+                                              self.comparisons(rows, valid), copied), manifests)
         uploaded = self.upload()
         self.save()
-        print(json.dumps({'event': 'cycle', 'at': iso(now), 'copied': len(copied), 'decisions': self.decisions,
+        print(json.dumps({'event': 'cycle', 'at': iso(now), 'copied': len(copied), 'queued': added, 'decisions': self.decisions,
                           'uploaded': uploaded, 'm2': health['M2'][0], 'lab': health['lab'][0]}), flush=True)
 
     def save(self):
@@ -665,13 +670,14 @@ class Collector:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--wave1', type=Path, default=CHECKOUT / 'waves/wave1.json')
-    parser.add_argument('--wave2', type=Path, default=CHECKOUT / 'waves/wave2.json')
+    parser.add_argument('--manifest', type=Path, action='append',
+                        help='Wave manifests in report order (repeat); default waves/wave1.json, wave2.json, reloc1.json')
     parser.add_argument('--interval', type=float, default=1800)
     parser.add_argument('--once', action='store_true')
     args = parser.parse_args()
     from huggingface_hub import HfApi
-    collector = Collector(HfApi(token=os.environ.get('HF_TOKEN')), args.wave1, args.wave2)
+    manifests = args.manifest or [CHECKOUT / f'waves/{n}.json' for n in ('wave1', 'wave2', 'reloc1')]
+    collector = Collector(HfApi(token=os.environ.get('HF_TOKEN')), manifests)
     while True:
         try:
             collector.cycle()

@@ -1,0 +1,390 @@
+{
+  "format": "isg-wave/v1",
+  "wave": "reloc1",
+  "plan": "/tmp/dev/docs/isg-goal-conditioning-plan.md, relocalization phase (scope from 2026-10-07)",
+  "description": "Relocalization only (camera_relocalization-standard, train100: 100 episodes). Goal: non-zero closed-loop success. Wave-1 flags (batch 1560, 224 px, bf16-backbone, regime image, gripper sum), 100k steps unless stated; early fusion goal LR 1e-3, late 1e-4. Code: branch isg-wave2-dev. \"tierB\": evaluations the collector queues once the eval checkpoint is on the Hub (train20/train10 = splits/reloc-picks.json).",
+  "dataset": "/tmp/dev/datasets/isg-init",
+  "frame_cache": "/tmp/dev/datasets/isg-init-act-frame-cache-224x224",
+  "train_split": "/tmp/dev/datasets/isg-init/isg_meta/train_split.json",
+  "hf_owner": "kmy17518",
+  "hf_repo_prefix": "act-isg-",
+  "wandb": {
+    "entity": "kmy17518",
+    "project": "b1k-isg-goal",
+    "base_url": "https://api.wandb.ai"
+  },
+  "runs_root": "/tmp/dev/runs/isg",
+  "staging_root": "/tmp/dev/hf-staging/isg",
+  "logs_root": "/tmp/dev/logs/isg",
+  "tmux_server": "isg",
+  "common": {
+    "max_steps": 100000,
+    "eval_every": 10000,
+    "flags": [
+      "--settle-steps",
+      "0",
+      "--gripper-state",
+      "sum",
+      "--image-size",
+      "224",
+      "224",
+      "--regime",
+      "image",
+      "--goal-views",
+      "zed_link",
+      "--goal-source",
+      "episode_last",
+      "--policy-class",
+      "ACT",
+      "--hidden-dim",
+      "512",
+      "--dim-feedforward",
+      "3200",
+      "--enc-layers",
+      "4",
+      "--dec-layers",
+      "7",
+      "--nheads",
+      "8",
+      "--chunk-size",
+      "100",
+      "--position-embedding",
+      "sine",
+      "--no-pre-norm",
+      "--kl-weight",
+      "10",
+      "--dropout",
+      "0.1",
+      "--lr",
+      "1e-5",
+      "--lr-backbone",
+      "1e-5",
+      "--weight-decay",
+      "1e-4",
+      "--batch-size",
+      "1560",
+      "--loader-batch-size",
+      "128",
+      "--num-workers",
+      "8",
+      "--prefetch-factor",
+      "2",
+      "--torch-threads",
+      "2",
+      "--worker-threads",
+      "1",
+      "--arrow-threads",
+      "1",
+      "--opencv-threads",
+      "1",
+      "--device",
+      "cuda",
+      "--matmul-precision",
+      "high",
+      "--autocast",
+      "bf16-backbone",
+      "--compile",
+      "regions-autotune",
+      "--save-every",
+      "5000",
+      "--save-first-step",
+      "--save-total-limit",
+      "0",
+      "--export-every",
+      "10000",
+      "--wandb-mode",
+      "online"
+    ]
+  },
+  "tasks": [
+    "camera_relocalization-standard"
+  ],
+  "tier_a": {
+    "heldout_dataset": "/tmp/dev/datasets/isg-init-eval",
+    "dir": "tierA-eval50",
+    "wandb_suffix": "tae",
+    "wandb_prefix": "tierA-eval50",
+    "summary": "tier-a-eval50-summary-reloc1.json",
+    "note": "Held-out = the test set kmy17518/isg-init-eval (split eval50: 50 episodes per testbed task, board game included, instances no training demo uses; settle windows cut with --settle-steps 0 like training). The earlier results on isg-init's own 39 held-out episodes stay in <run>/tierA/ and W&B <run>-ta."
+  },
+  "base": {
+    "runs": [
+      "r1-early-copy05-st0-s0"
+    ],
+    "flags": [
+      "--goal-fusion",
+      "early",
+      "--goal-stem-init",
+      "copy:0.5",
+      "--lr-goal",
+      "1e-3"
+    ]
+  },
+  "runs": [
+    {
+      "name": "r1-early-copy05-train10-st0-s0",
+      "machine": "M1",
+      "gpu": 0,
+      "cores": "0-23",
+      "seed": 0,
+      "role": "overfit pipeline test: the 10-episode split, 20k steps",
+      "max_steps": 20000,
+      "tierB": [
+        {
+          "step": 20000,
+          "split": "train",
+          "episodes": "train10"
+        }
+      ],
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--episode-split",
+        "splits/reloc-train10.json"
+      ]
+    },
+    {
+      "name": "r1-early-copy05-st0-s0",
+      "machine": "M1",
+      "gpu": 1,
+      "cores": "24-47",
+      "seed": 0,
+      "role": "base: early 0.5x copy, settle 0",
+      "tierB": [
+        {
+          "step": 100000,
+          "split": "train",
+          "episodes": "train20"
+        },
+        {
+          "step": 100000,
+          "split": "eval50",
+          "episodes": null
+        }
+      ],
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3"
+      ]
+    },
+    {
+      "name": "r1-early-copy05-st20-s0",
+      "machine": "M1",
+      "gpu": 2,
+      "cores": "48-71",
+      "seed": 0,
+      "role": "settle 20: the evaluator needs ~10 settled steps to count success",
+      "tierB": [
+        {
+          "step": 100000,
+          "split": "train",
+          "episodes": "train20"
+        },
+        {
+          "step": 100000,
+          "split": "eval50",
+          "episodes": null
+        }
+      ],
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--settle-steps",
+        "20"
+      ]
+    },
+    {
+      "name": "r1-late-tagzero-st0-s0",
+      "machine": "M1",
+      "gpu": 3,
+      "cores": "72-95",
+      "seed": 0,
+      "role": "late fusion baseline, settle 0",
+      "tierB": [
+        {
+          "step": 100000,
+          "split": "train",
+          "episodes": "train20"
+        },
+        {
+          "step": 100000,
+          "split": "eval50",
+          "episodes": null
+        }
+      ],
+      "flags": [
+        "--goal-fusion",
+        "late",
+        "--goal-tag-init",
+        "zero",
+        "--lr-goal",
+        "1e-4"
+      ]
+    },
+    {
+      "name": "r1-early-wrist-st20-s0",
+      "machine": "M1",
+      "gpu": 0,
+      "cores": "0-23",
+      "seed": 0,
+      "role": "head+wrist pairing with settle 20 (the two most promising relocalization changes), after the overfit run on GPU 0",
+      "after": "r1-early-copy05-train10-st0-s0",
+      "tierB": [
+        {
+          "step": 100000,
+          "split": "train",
+          "episodes": "train20"
+        },
+        {
+          "step": 100000,
+          "split": "eval50",
+          "episodes": null
+        }
+      ],
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--goal-views",
+        "zed_link",
+        "left_realsense_link",
+        "right_realsense_link",
+        "--settle-steps",
+        "20"
+      ]
+    },
+    {
+      "name": "r1-early-wrist-st0-s0",
+      "machine": "M2",
+      "gpu": 0,
+      "cores": "0-23",
+      "seed": 0,
+      "role": "head+wrist pairing",
+      "tierB": [
+        {
+          "step": 100000,
+          "split": "train",
+          "episodes": "train20"
+        },
+        {
+          "step": 100000,
+          "split": "eval50",
+          "episodes": null
+        }
+      ],
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--goal-views",
+        "zed_link",
+        "left_realsense_link",
+        "right_realsense_link"
+      ]
+    },
+    {
+      "name": "r1-late-tagzero-st20-s0",
+      "machine": "M2",
+      "gpu": 1,
+      "cores": "24-47",
+      "seed": 0,
+      "role": "late fusion, settle 20",
+      "tierB": [
+        {
+          "step": 100000,
+          "split": "train",
+          "episodes": "train20"
+        },
+        {
+          "step": 100000,
+          "split": "eval50",
+          "episodes": null
+        }
+      ],
+      "flags": [
+        "--goal-fusion",
+        "late",
+        "--goal-tag-init",
+        "zero",
+        "--lr-goal",
+        "1e-4",
+        "--settle-steps",
+        "20"
+      ]
+    },
+    {
+      "name": "r1-early-copy05-st0-s1",
+      "machine": "M2",
+      "gpu": 2,
+      "cores": "48-71",
+      "seed": 1,
+      "role": "base, seed 1",
+      "tierB": [
+        {
+          "step": 100000,
+          "split": "train",
+          "episodes": "train20"
+        },
+        {
+          "step": 100000,
+          "split": "eval50",
+          "episodes": null
+        }
+      ],
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3"
+      ]
+    },
+    {
+      "name": "r1-early-copy05-st0-lrg1e-4-s0",
+      "machine": "M2",
+      "gpu": 3,
+      "cores": "72-95",
+      "seed": 0,
+      "role": "base with goal LR 1e-4",
+      "tierB": [
+        {
+          "step": 100000,
+          "split": "train",
+          "episodes": "train20"
+        },
+        {
+          "step": 100000,
+          "split": "eval50",
+          "episodes": null
+        }
+      ],
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-4"
+      ]
+    }
+  ]
+}
