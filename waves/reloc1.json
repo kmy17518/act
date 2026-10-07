@@ -630,6 +630,38 @@
     "camera_relocalization-obstructed-footstool_1"
    ],
    "after": "cache-reloc-obstructed"
+  },
+  {
+   "name": "r1-early-copy05-reloc2-st0-s1",
+   "machine": "M1",
+   "gpu": 0,
+   "cores": "0-23",
+   "seed": 1,
+   "role": "as r1-early-copy05-reloc2-st0-s0, seed 1 (machine 1 GPU 0, after r1-early-wrist-st0-s1)",
+   "tierB": [
+    {
+     "step": 100000,
+     "split": "train",
+     "episodes": "train20"
+    },
+    {
+     "step": 100000,
+     "split": "eval50",
+     "episodes": null
+    }
+   ],
+   "flags": [
+    "--goal-fusion",
+    "early",
+    "--goal-stem-init",
+    "copy:0.5",
+    "--lr-goal",
+    "1e-3",
+    "--task-names",
+    "camera_relocalization-standard",
+    "camera_relocalization-obstructed-footstool_1"
+   ],
+   "after": "r1-early-wrist-st0-s1"
   }
  ]
 }
