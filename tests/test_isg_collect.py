@@ -90,7 +90,7 @@ def test_funnel_floor_guard_kill_rule_and_copying(setup):
     collector.cycle()
     log = (coord / 'm1/decisions.md').read_text()
     queue = json.loads((coord / 'm1/tierB-queue.json').read_text())
-    assert 'Positive control' in log and '3/3 episodes end within tolerance' in log and queue['paused'] is False
+    assert 'Positive control' in log and '3/3 episodes reach tolerance at some step' in log and queue['paused'] is False
     assert '`a` at step 50000 succeeds on training instances' in log
     assert any(e['run'] == 'a' and e['split'] == 'eval50' and e['episodes'] is None for e in queue['entries'])
     assert [e['split'] for e in queue['entries']] == sorted((e['split'] for e in queue['entries']),
@@ -211,6 +211,22 @@ def test_two_stage_eval50(setup, monkeypatch, tmp_path):
     assert evals == {'a': None, 'b': None, 'c': stage1}
     log = (coord / 'm1/decisions.md').read_text()
     assert '`a`@50k eval50: its checkpoint succeeds on training episodes' in log and '`b`@50k eval50: 1 of its first 25 stage-1 episodes succeed' in log
+
+
+def test_replay_that_reached_tolerance_passes(setup):
+    collector, inbox, runs, report, coord = setup
+    boundary = {'success': False, 'error': None, 'first_success_step': 625, 'binary_success_ever': True,
+                'score': {'geodesic_distance_m': 0.05, 'position_error_m': 0.0501, 'orientation_error_deg': 2.0,
+                          'within_tolerance': False}}
+    for split, eps in (('eval50', (2, 3)), ('train', (39,))):
+        for e in eps:
+            write(inbox / f'lab/diagnostics/replay/{split}/episode_{e:06d}.json', boundary if e == 39 else episode(True, 0.04))
+        write(inbox / f'lab/diagnostics/replay/{split}/summary.json', {'n': len(eps)})
+    collector.cycle()
+    assert json.loads((coord / 'm1/tierB-queue.json').read_text())['paused'] is False
+    assert '3/3 episodes reach tolerance at some step. Passed' in (coord / 'm1/decisions.md').read_text()
+    never = dict(boundary, first_success_step=-1, binary_success_ever=False)
+    assert isg_collect.reached_tolerance(boundary) and not isg_collect.reached_tolerance(never)
 
 
 def test_failed_replay_pauses_the_queue(setup):

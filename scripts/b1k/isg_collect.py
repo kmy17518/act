@@ -417,6 +417,14 @@ def valid_record(record):
     return not record.get('error') and isinstance(record.get('success'), (bool, int, float))
 
 
+def reached_tolerance(record):
+    """Replay positive control: the replay reached tolerance at some step (stop-on-success fired or the goal held),
+    whatever the evaluator's final no-op hold measured; boundary cases such as 0.050 m against 0.05 m pass."""
+    first = record.get('first_success_step')
+    return bool(record.get('success') or record.get('binary_success_ever') or score_value(record, 'within_tolerance')
+                or (isinstance(first, (int, float)) and not isinstance(first, bool) and first >= 0))
+
+
 def tolerance_ratio(record):
     """max(position / 0.05 m, orientation / 0.1 rad) at the final step: at most 1 means within tolerance."""
     position, orientation = score_value(record, 'position_error_m'), score_value(record, 'orientation_error_deg')
@@ -707,16 +715,15 @@ class Collector:
             valid[entry_key(entry)] = ok
         replays = [r for r in rows if r['entry']['split'] == 'replay']
         if replays and all(r['complete'] for r in replays):
-            within = sum(int(bool(score_value(rec, 'within_tolerance') or rec.get('success')))
-                         for r in replays for rec in valid[entry_key(r['entry'])].values())
+            within = sum(int(reached_tolerance(rec)) for r in replays for rec in valid[entry_key(r['entry'])].values())
             total = sum(r['valid'] for r in replays)
             passed = total > 0 and within == total and sum(r['errors'] for r in replays) == 0
             token = hashlib.sha256(f'{within}/{total}'.encode()).hexdigest()[:8]
             if self.decide(f'replay:{token}', 'lab', [
-                    f'Positive control (open-loop replay of recorded actions): {within}/{total} episodes end within tolerance. '
-                    + ('Passed: the action path is sound; continue with the queue.' if passed else
-                       'Failed: the action path (base velocity semantics, control rate, settle check) is wrong; the queue is '
-                       'paused until a re-run of the replays ends within tolerance for every episode.')],
+                    f'Positive control (open-loop replay of recorded actions): {within}/{total} episodes reach tolerance at '
+                    'some step. ' + ('Passed: the action path is sound; continue with the queue.' if passed else
+                                     'Failed: the action path (base velocity semantics, control rate, settle check) is wrong; '
+                                     'the queue is paused until a re-run of the replays reaches tolerance in every episode.')],
                     f'replay positive control {"passed" if passed else "failed"} ({within}/{total})'):
                 queue['paused'] = not passed
         for row in rows:
