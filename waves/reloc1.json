@@ -663,5 +663,71 @@
    ],
    "after": "r1-early-wrist-st0-s1"
   }
- ]
+ ],
+ "exec_test": {
+  "description": "Execution-setting test on 5 training episodes (101, 105, 111, 113, 121): ta = --temporal-agg, ah<N> = --action-horizon N, against the default chunked 16 actions per query. The lab runs lab_runs itself (not in the queue); machine 1 queues the rest as tagged training entries. The collector picks the eval50 setting once every result is in.",
+  "lab_runs": [
+   {
+    "run": "r1-early-zero-st0-s0",
+    "step": 100000,
+    "settings": [
+     "ta",
+     "ah1",
+     "ah4"
+    ]
+   },
+   {
+    "run": "r1-early-copy05-st0-s0",
+    "step": 100000,
+    "settings": [
+     "ta",
+     "ah1",
+     "ah4"
+    ]
+   },
+   {
+    "run": "r1-early-copy05-train10-st0-s0",
+    "step": 20000,
+    "settings": [
+     "ta",
+     "ah1",
+     "ah4"
+    ]
+   }
+  ],
+  "queued": [
+   {
+    "run": "r1-early-copy05-st0-lrg1e-4-s0",
+    "step": 100000,
+    "settings": [
+     "ta",
+     "ah8",
+     "ah4"
+    ]
+   },
+   {
+    "run": "w1-early-copy05-lrg1e-3-s0",
+    "step": 50000,
+    "settings": [
+     "ta",
+     "ah8",
+     "ah4"
+    ]
+   },
+   {
+    "run": "r1-early-copy05-st0-s0",
+    "step": 100000,
+    "settings": [
+     "ah8"
+    ]
+   }
+  ],
+  "episodes": [
+   101,
+   105,
+   111,
+   113,
+   121
+  ]
+ }
 }

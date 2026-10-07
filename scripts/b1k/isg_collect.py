@@ -12,7 +12,13 @@ Every cycle (default every 30 minutes):
      covering all 200 test episodes with verified first frames, one fixed action horizon in `env.json`) and, once
      every queued finalist has a `summary.json`, the plan §5 wave verdict (paired bootstrap over the instances);
   5. flag a helper whose `status.json` is more than an hour old (machine 2: propose the plan §7 recovery, never do it);
-  6. upload `docs/` and `m1/` in one commit when anything changed.
+  6. keep the lab queue `m1/tierB-queue.json` (isg-tierB-queue/v2): append the manifests' planned evaluations, queue
+     eval50 for checkpoints that succeed on training episodes, order it (replays, execution-setting tests, training
+     instances, eval50) and estimate the lab hours it holds. Entries may carry `tag` and `server_args` (extra
+     serve_b1k.py arguments); tagged results live in lab/diagnostics/exec/<tag>/<run>/step_XXXXXXXX/, and every episode
+     must report the setting it was queued with. Once the execution-setting test is complete (with the lab's own tests
+     of `exec_test.lab_runs` in the manifests) the eval50 setting is chosen once and applied to unstarted eval50 entries;
+  7. upload `docs/` and `m1/` in one commit when anything changed.
 It never writes under `m2/` or `lab/`, never starts uploaders, and writes locally only under /tmp.
 
     isg_collect.py [--interval 1800] [--once]
@@ -23,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 from itertools import combinations
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -39,6 +46,7 @@ REPO = 'kmy17518/isg-goal-coordination'
 COORD = Path('/tmp/dev/coord')
 PLAN = Path('/tmp/dev/docs/isg-goal-conditioning-plan.md')
 REPORT = Path('/tmp/dev/report.md')
+SPEC = Path('/tmp/dev/docs/isg-correction-data-spec.md')
 CALIBRATION_REFERENCE, CALIBRATION_TOLERANCE = 0.12560, 0.003
 STALE = timedelta(hours=1)
 # lab/instances.json: a mapping counts as verified when its first head frame matches the test episode's first frame to
@@ -252,8 +260,11 @@ def instance_coverage(instances):
 
 
 def fixed_action_horizon(env):
-    """The single action horizon of env.json: every value under a key containing 'action_horizon' (at any depth) must
-    be the same integer."""
+    """The default action horizon of env.json: its top-level `action_horizon` (per-entry `server_args` may run other
+    settings), else every value under a key containing 'action_horizon' (at any depth) must be the same integer."""
+    top = (env or {}).get('action_horizon')
+    if isinstance(top, int) and not isinstance(top, bool):
+        return top
     values = []
 
     def walk(node, key=''):
@@ -282,17 +293,72 @@ CORRECTION = ('Correction (2026-10-07): the evaluator does not need the policy t
               'r1-late-tagzero-st0-s1, GPU 0 queues r1-early-wrist-st0-s1, machine 2\'s GPU 1 runs r1-early-zero-st0-s0. Evidence: lab/env.json `episode_rules`; settling is not the '
               'bottleneck either (none of the 150 relocalization episodes of the three finalists was within tolerance at any step).')
 METRICS = ('geodesic_distance_m', 'position_error_m', 'orientation_error_deg', 'within_tolerance')
+EXEC_DIR = 'lab/diagnostics/exec'  # results of queue entries with a "tag" (and of the lab's own execution tests)
+DEFAULT_SETTING = 'ah16'  # serve_b1k.py's ACT default: chunked execution, 16 actions per query
+TOL_POSITION_M, TOL_ORIENTATION_DEG = 0.05, math.degrees(0.1)
+MIN_PAIRS = 10  # paired training episodes a setting needs before it can be chosen for eval50
+LAB_HOURS_WARN = 24.0
+
+
+def setting_args(setting):
+    """serve_b1k.py arguments of an execution setting: 'ta' (temporal aggregation) or 'ah<N>' (N actions per query)."""
+    if setting == 'ta':
+        return ['--temporal-agg']
+    return [] if setting == DEFAULT_SETTING else ['--action-horizon', setting[2:]]
+
+
+def setting_of_args(args):
+    """Execution setting of serve_b1k.py arguments: 'ta' with --temporal-agg, else 'ah<N>' (--action-horizon, default 16)."""
+    args = [str(a) for a in (args or [])]
+    if '--temporal-agg' in args:
+        return 'ta'
+    for i, arg in enumerate(args):
+        if arg == '--action-horizon' and i + 1 < len(args):
+            return f'ah{int(args[i + 1])}'
+        if arg.startswith('--action-horizon='):
+            return f'ah{int(arg.split("=", 1)[1])}'
+    return DEFAULT_SETTING
+
+
+def record_setting(record):
+    """Setting an episode actually ran with: the server's own metadata, else its recorded command line (None if unknown)."""
+    meta = record.get('server_metadata') if isinstance(record.get('server_metadata'), dict) else {}
+    if meta.get('execution_mode') == 'temporal_aggregation' or meta.get('temporal_agg') is True:
+        return 'ta'
+    horizon = meta.get('action_horizon')
+    if isinstance(horizon, int) and not isinstance(horizon, bool):
+        return f'ah{horizon}'
+    command = record.get('server_args')
+    if isinstance(command, str):
+        command = command.split()
+    return setting_of_args(command) if isinstance(command, list) else None
+
+
+def planned(queue, run, step, split):
+    """Whether the queue already holds a planned evaluation: eval50 under any execution setting, training instances only
+    untagged (tagged training entries are execution-setting tests)."""
+    return any(e['run'] == run and e.get('step') == step and e['split'] == split and (split == 'eval50' or not e.get('tag'))
+               for e in queue['entries'])
+
+
+def queue_rank(entry):
+    """Queue order by stage: replays, execution-setting tests (tagged training entries), training instances, eval50."""
+    if entry['split'] == 'train':
+        return 1 if entry.get('tag') else 2
+    return {'replay': 0, 'eval50': 3}.get(entry['split'], 9)
 
 
 def entry_dir(inbox, entry):
     if entry['split'] == 'replay':
         return inbox / 'lab/diagnostics/replay' / entry.get('replay_split', 'eval50')
+    if entry.get('tag'):
+        return inbox / EXEC_DIR / entry['tag'] / entry['run'] / f'step_{int(entry["step"]):08d}'
     prefix = 'lab/tierB' if entry['split'] == 'eval50' else 'lab/tierB-train'
     return inbox / prefix / entry['run'] / f'step_{int(entry["step"]):08d}'
 
 
 def entry_key(entry):
-    return (entry['run'], entry.get('step'), entry['split'], entry.get('replay_split'))
+    return (entry['run'], entry.get('step'), entry['split'], entry.get('replay_split'), entry.get('tag'))
 
 
 def score_value(record, key):
@@ -318,7 +384,7 @@ def entry_results(inbox, entry):
     if wanted is not None:
         results = {e: r for e, r in results.items() if e in set(wanted)}
     expected = len(wanted) if wanted is not None else SPLIT_SIZES.get(entry['split'], 0)
-    return results, expected, read_json(directory / 'summary.json')
+    return results, expected, read_json(directory / 'summary.json') or read_json(directory / RELOC / 'summary.json')
 
 
 def summarize(results):
@@ -345,6 +411,120 @@ def paired(a, b, key, rng_seed=0, resamples=10000):
 
 def reloc(result, key):
     return ((result or {}).get('heldout', {}).get('tasks', {}).get(RELOC) or {}).get(key)
+
+
+def valid_record(record):
+    return not record.get('error') and isinstance(record.get('success'), (bool, int, float))
+
+
+def tolerance_ratio(record):
+    """max(position / 0.05 m, orientation / 0.1 rad) at the final step: at most 1 means within tolerance."""
+    position, orientation = score_value(record, 'position_error_m'), score_value(record, 'orientation_error_deg')
+    if position is None or orientation is None:
+        return None
+    return max(position / TOL_POSITION_M, orientation / TOL_ORIENTATION_DEG)
+
+
+def exec_results(inbox):
+    """Execution-setting results on training episodes: ({(run, step): {setting: {episode: record}}}, {directory: complete})
+    from every tagged result directory (queue entries and the lab's own tests), with the default results of
+    lab/tierB-train for the same checkpoints. The setting is the one the server reported, not the tag."""
+    results, complete = {}, {}
+    for directory in sorted((inbox / EXEC_DIR).glob('*/*/step_*')):
+        run, step = directory.parts[-2], int(directory.name[5:])
+        files = sorted((directory / RELOC).glob('episode_*.json'))
+        records = [(int(p.stem.split('_')[1]), read_json(p) or {}) for p in files]
+        records = [(e, r) for e, r in records if r.get('split') in (None, 'train')]
+        if not records:
+            continue
+        summary = read_json(directory / 'summary.json') or read_json(directory / RELOC / 'summary.json')
+        complete[str(directory.relative_to(inbox))] = summary is not None and bool(summary.get('complete', True))
+        for episode, record in records:
+            setting = record_setting(record) or directory.parts[-3]
+            results.setdefault((run, step), {}).setdefault(setting, {})[episode] = record
+    for (run, step), by_setting in results.items():
+        for path in (inbox / 'lab/tierB-train' / run / f'step_{step:08d}' / RELOC).glob('episode_*.json'):
+            record = read_json(path) or {}
+            if (record_setting(record) or DEFAULT_SETTING) == DEFAULT_SETTING:
+                by_setting.setdefault(DEFAULT_SETTING, {})[int(path.stem.split('_')[1])] = record
+    return results, complete
+
+
+def exec_table(results):
+    """Per setting against the default on the same (checkpoint, episode), pooled over checkpoints: paired episodes,
+    successes of both, and the mean paired change in log tolerance ratio (negative: closer to the goal) with a bootstrap
+    95 % CI."""
+    table = {}
+    for (run, step), by_setting in sorted(results.items()):
+        base = by_setting.get(DEFAULT_SETTING, {})
+        for setting, records in by_setting.items():
+            if setting == DEFAULT_SETTING:
+                continue
+            row = table.setdefault(setting, {'diffs': [], 'success': 0, 'base_success': 0, 'checkpoints': []})
+            for episode, record in sorted(records.items()):
+                other = base.get(episode)
+                if other is None or not valid_record(record) or not valid_record(other):
+                    continue
+                a, b = tolerance_ratio(record), tolerance_ratio(other)
+                if a is None or b is None:
+                    continue
+                row['diffs'].append(math.log(max(a, 1e-6)) - math.log(max(b, 1e-6)))
+                row['success'] += int(bool(record['success']))
+                row['base_success'] += int(bool(other['success']))
+                if f'{run}@{step // 1000}k' not in row['checkpoints']:
+                    row['checkpoints'].append(f'{run}@{step // 1000}k')
+    for row in table.values():
+        diff = np.array(row.pop('diffs'))
+        row['n'] = len(diff)
+        if len(diff) >= 2:
+            means = diff[np.random.default_rng(0).integers(0, len(diff), (10000, len(diff)))].mean(axis=1)
+            row.update(mean=float(diff.mean()), ci=[float(x) for x in np.percentile(means, [2.5, 97.5])])
+        else:
+            row.update(mean=float(diff.mean()) if len(diff) else None, ci=None)
+    return table
+
+
+def choose_setting(table):
+    """eval50 execution setting from the execution-test table, or None while no setting has MIN_PAIRS paired episodes:
+    the most extra successes over the default if some setting gains at least 2; otherwise the lowest paired log tolerance
+    ratio whose 95 % CI lies below 0 without losing successes; otherwise the default."""
+    candidates = {s: t for s, t in table.items() if t['n'] >= MIN_PAIRS and t['ci'] is not None}
+    if not candidates:
+        return None, 'no setting has %d paired training episodes yet' % MIN_PAIRS
+    gains = {s: t['success'] - t['base_success'] for s, t in candidates.items()}
+    if max(gains.values()) >= 2:
+        setting = max(candidates, key=lambda s: (gains[s], -candidates[s]['mean']))
+        t = candidates[setting]
+        return setting, (f'{t["success"]} successes against {t["base_success"]} for the default on the same {t["n"]} '
+                         f'training episodes ({", ".join(t["checkpoints"])})')
+    better = [s for s, t in candidates.items() if t['ci'][1] < 0 and gains[s] >= 0]
+    if better:
+        setting = min(better, key=lambda s: candidates[s]['mean'])
+        t = candidates[setting]
+        return setting, (f'final error (tolerance ratio) {math.exp(t["mean"]):.2f}x the default, 95 % CI '
+                         f'[{math.exp(t["ci"][0]):.2f}, {math.exp(t["ci"][1]):.2f}], on {t["n"]} paired training episodes '
+                         f'({", ".join(t["checkpoints"])}); successes {t["success"]} vs {t["base_success"]}')
+    return DEFAULT_SETTING, ('no setting gains 2 successes or lowers the final error with a 95 % CI below 1x: ' +
+                             '; '.join(f'{s} {math.exp(t["mean"]):.2f}x [{math.exp(t["ci"][0]):.2f}, {math.exp(t["ci"][1]):.2f}], '
+                                       f'{t["success"]} vs {t["base_success"]} successes, n {t["n"]}'
+                                       for s, t in sorted(candidates.items())))
+
+
+def episode_minutes(inbox, env, horizon):
+    """Lab minutes per episode as observed: the mean gap between consecutive finishes of the last 50 policy episodes at
+    the queue's horizon (training instances, execution tests, eval50), ignoring gaps over 20 minutes (idle lab); else
+    env.json's `minutes_per_episode` over its parallel evaluators."""
+    records = [read_json(p) or {} for p in list((inbox / 'lab/tierB-train').glob(f'*/step_*/{RELOC}/episode_*.json'))
+               + list((inbox / EXEC_DIR).glob(f'*/*/step_*/{RELOC}/episode_*.json'))
+               + list((inbox / 'lab/tierB').glob(f'*/step_*/{RELOC}/episode_*.json'))]
+    times = sorted(t for t in (parse_time(r.get('finished_at')) for r in records if r.get('horizon') == horizon)
+                   if t is not None)[-50:]
+    gaps = [(b - a).total_seconds() / 60 for a, b in zip(times, times[1:]) if 0 <= (b - a).total_seconds() <= 1200]
+    if len(gaps) >= 10:
+        return float(np.mean(gaps)), f'observed finish rate of the last {len(gaps) + 1} episodes'
+    parallel = max(int((env or {}).get('parallel_evaluators') or 1), 1)
+    minutes = (env or {}).get('minutes_per_episode')
+    return (float(minutes) / parallel if minutes else 5.0 / parallel), f'env.json, {parallel} evaluators'
 
 
 class Collector:
@@ -473,16 +653,22 @@ class Collector:
 
     # ------------------------------------------------------------------------------------------ Tier B queue
 
+    def eval50_setting(self, entry):
+        """Give a new eval50 entry the execution setting chosen from the execution test (no-op before the choice)."""
+        chosen = self.state.get('eval50_setting') or {}
+        if entry['split'] == 'eval50' and chosen.get('tag'):
+            entry.update(tag=chosen['tag'], server_args=list(chosen['server_args']))
+        return entry
+
     def extend_queue(self, manifests, queue):
         """Append the manifests' planned evaluations (run field "tierB") whose eval checkpoint is on the Hub."""
         picks = read_json(CHECKOUT / 'splits/reloc-picks.json') or {}
-        keys = {entry_key(e) for e in queue['entries']}
         added = []
         for manifest in manifests:
             for name, run in manifest['_runs'].items():
                 for plan in run.get('tierB', []):
                     entry = {'run': name, 'step': int(plan['step']), 'split': plan['split']}
-                    if entry_key(entry) in keys:
+                    if planned(queue, name, entry['step'], entry['split']):
                         continue
                     repo, file = f'{manifest["hf_owner"]}/{manifest["hf_repo_prefix"]}{name}', f'eval/step-{int(plan["step"]):08d}.pt'
                     try:
@@ -495,8 +681,7 @@ class Collector:
                     entry.update({'repo': repo, 'file': file, 'sha256': info[0].lfs.sha256, 'tasks': [RELOC],
                                   'episodes': picks.get(episodes) if isinstance(episodes, str) else episodes,
                                   'note': plan.get('note', f'{name} at {int(plan["step"]) // 1000}k on {plan["split"]}')})
-                    queue['entries'].append(entry)
-                    keys.add(entry_key(entry))
+                    queue['entries'].append(self.eval50_setting(entry))
                     added.append(f'{name}@{plan["step"]}/{plan["split"]}')
         return added
 
@@ -505,8 +690,17 @@ class Collector:
         rows, valid = [], {}
         for entry in queue['entries']:
             results, expected, summary = entry_results(self.inbox, entry)
+            wanted = setting_of_args(entry.get('server_args'))
+            wrong = sorted(e for e, r in results.items() if record_setting(r) not in (None, wanted))
+            if wrong:
+                self.escalations.append(
+                    f'`{entry["run"]}`@{entry.get("step")} {entry["split"]}{" [" + entry["tag"] + "]" if entry.get("tag") else ""}: '
+                    f'episodes {wrong} ran with server setting {sorted({record_setting(results[e]) for e in wrong})}, not '
+                    f'{wanted} as queued (server_args {entry.get("server_args") or []}); they are left out until re-run.')
+                results = {e: r for e, r in results.items() if e not in wrong}
             row, ok = summarize(results)
-            row.update(entry=entry, expected=expected, complete=row['done'] >= expected > 0 and summary is not None)
+            row.update(entry=entry, expected=expected, complete=row['done'] >= expected > 0 and summary is not None,
+                       episodes_done=sorted(results))
             rows.append(row)
             valid[entry_key(entry)] = ok
         replays = [r for r in rows if r['entry']['split'] == 'replay']
@@ -525,15 +719,92 @@ class Collector:
                 queue['paused'] = not passed
         for row in rows:
             entry = row['entry']
-            if entry['split'] == 'train' and row['complete'] and (row['success'] or 0) > 0:
-                target = dict(entry, split='eval50', episodes=None, note=f'{entry["run"]} at {entry["step"] // 1000}k: '
+            if entry['split'] == 'train' and row['valid'] and (row['success'] or 0) > 0:
+                setting = setting_of_args(entry.get('server_args'))
+                target = {k: v for k, v in entry.items() if k not in ('tag', 'server_args')}
+                target.update(split='eval50', episodes=None, note=f'{entry["run"]} at {entry["step"] // 1000}k: '
                               'succeeds on training instances, so eval50 (funnel step 3)')
-                if entry_key(target) not in {entry_key(e) for e in queue['entries']}:
-                    queue['entries'].append(target)
+                done = summarize(entry_results(self.inbox, target)[0])[0]
+                if planned(queue, entry['run'], entry['step'], 'eval50'):
+                    status = 'its eval50 evaluation is queued'
+                elif done['valid'] >= SPLIT_SIZES['eval50']:
+                    status = f'it already has a complete eval50 result ({done["success"]:.0%} success), so nothing is re-queued'
+                else:
+                    queue['entries'].append(self.eval50_setting(target))
+                    status = 'its eval50 evaluation is queued'
                 self.decide(f'trainsuccess:{entry["run"]}:{entry["step"]}', 'all', [
-                    f'`{entry["run"]}` at step {entry["step"]} succeeds on training instances ({row["success"]:.0%} of '
-                    f'{row["valid"]}); its eval50 evaluation is queued.'], f'{entry["run"]}@{entry["step"]} succeeds on training instances')
+                    f'`{entry["run"]}` at step {entry["step"]} succeeds on training instances '
+                    f'({round(row["success"] * row["valid"])} of {row["valid"]} episodes so far, execution setting {setting}); '
+                    f'{status}.'], f'{entry["run"]}@{entry["step"]} succeeds on training instances')
         return rows, valid
+
+    def exec_decision(self, queue, rows, manifests):
+        """Execution-setting test: the per-setting table for the report and, once every test result is in (queued
+        entries and the lab's own tests listed under the manifests' `exec_test.lab_runs`), the eval50 setting (decided
+        once, applied to the eval50 entries that have not started)."""
+        results, complete = exec_results(self.inbox)
+        table = exec_table(results)
+        queued = [r for r in rows if r['entry']['split'] == 'train' and r['entry'].get('tag')]
+        waiting = [f'`{r["entry"]["run"]}`@{r["entry"]["step"] // 1000}k {r["entry"]["tag"]} ({r["done"]}/{r["expected"]})'
+                   for r in queued if not r['complete']]
+        waiting += [f'{path} (no complete summary.json)' for path, done in complete.items() if not done]
+        for manifest in manifests:
+            for test in (manifest.get('exec_test') or {}).get('lab_runs', []):
+                have = results.get((test['run'], int(test['step'])), {})
+                waiting += [f'lab test `{test["run"]}`@{int(test["step"]) // 1000}k {s}' for s in test['settings'] if s not in have]
+        chosen = self.state.get('eval50_setting')
+        if chosen is None and not waiting and table:
+            setting, reason = choose_setting(table)
+            if setting is not None:
+                chosen = {'setting': setting, 'server_args': setting_args(setting),
+                          'tag': None if setting == DEFAULT_SETTING else f'{setting}-e50', 'decided_at': iso(utc_now()), 'reason': reason}
+                self.state['eval50_setting'] = chosen
+                kept = []
+                for row in rows:
+                    entry = row['entry']
+                    if entry['split'] != 'eval50' or entry.get('tag'):
+                        continue
+                    if row['done']:
+                        kept.append(f'`{entry["run"]}`@{entry["step"] // 1000}k ({row["done"]} episodes done)')
+                    else:
+                        self.eval50_setting(entry)
+                self.decide(f'eval50setting:{setting}', 'lab', [
+                    f'eval50 runs with execution setting **{setting}** (serve_b1k.py {" ".join(chosen["server_args"]) or "defaults"}): '
+                    f'{reason}.',
+                    (f'Every eval50 entry that has not started now carries `"tag": "{chosen["tag"]}"` and `"server_args": '
+                     f'{json.dumps(chosen["server_args"])}`; its results go to {EXEC_DIR}/{chosen["tag"]}/<run>/step_XXXXXXXX/. '
+                     if chosen['tag'] else 'eval50 entries are unchanged. ') +
+                    (f'Entries already started keep the default: {", ".join(kept)}.' if kept else '')],
+                    f'eval50 execution setting: {setting}')
+        return table, waiting, chosen
+
+    def lab_load(self, queue, rows, manifests, env):
+        """Lab episodes left in the queue and projected from the manifests' planned evaluations not queued yet, in hours."""
+        instances = (read_json(self.inbox / 'lab/instances-train.json') or {}).get('episodes') or {}
+        mapped = {int(e) for e, v in instances.items() if isinstance(v, dict) and v.get('verified')}
+        picks = read_json(CHECKOUT / 'splits/reloc-picks.json') or {}
+
+        def runnable(test_set, episodes, done=()):
+            """Episodes the lab can still run: every test-set episode is verified; training episodes only when mapped."""
+            if episodes is None:
+                return max(SPLIT_SIZES['eval50'] - len(done), 0)
+            todo = set(episodes) - set(done)
+            return len(todo) if test_set else len(todo & mapped)
+
+        queued = sum(runnable(row['entry']['split'] == 'eval50' or row['entry'].get('replay_split') == 'eval50',
+                              row['entry'].get('episodes'), row['episodes_done']) for row in rows)
+        projected = 0
+        for manifest in manifests:
+            for name, run in manifest['_runs'].items():
+                if run.get('stopped'):
+                    continue
+                for plan in run.get('tierB', []):
+                    if not planned(queue, name, int(plan['step']), plan['split']):
+                        episodes = plan.get('episodes')
+                        projected += runnable(plan['split'] == 'eval50', picks.get(episodes) if isinstance(episodes, str) else episodes)
+        minutes, source = episode_minutes(self.inbox, env, queue.get('horizon_steps'))
+        return {'queued': queued, 'projected': projected, 'hours_queued': queued * minutes / 60,
+                'hours_projected': projected * minutes / 60, 'minutes': minutes, 'source': source, 'mapped': len(mapped)}
 
     def comparisons(self, rows, valid):
         """Paired comparisons of complete entries on the same split and episodes, under the floor guard."""
@@ -541,13 +812,13 @@ class Collector:
         for row in rows:
             entry = row['entry']
             if row['complete'] and entry['split'] != 'replay':
-                groups.setdefault((entry['split'], tuple(entry.get('episodes') or ())), []).append(row)
-        for (split, _), members in groups.items():
+                groups.setdefault((entry['split'], tuple(entry.get('episodes') or ()), entry.get('tag')), []).append(row)
+        for (split, _, tag), members in groups.items():
             if len(members) < 2:
                 continue
             best = max((m['success'] or 0) for m in members)
             keys = ('success',) if best >= FLOOR else ('geodesic_distance_m', 'orientation_error_deg')
-            out.append(f'- {split}: ' + ('success-based (some candidate reaches 10 %).' if best >= FLOOR else
+            out.append(f'- {split}{" [" + tag + "]" if tag else ""}: ' + ('success-based (some candidate reaches 10 %).' if best >= FLOOR else
                        f'floor guard: every candidate is below 10 % success (best {best:.0%}), so success is not compared; '
                        'paired final geodesic distance and orientation error (lower is better) instead.'))
             for a, b in combinations(members, 2):
@@ -561,7 +832,8 @@ class Collector:
 
     # ------------------------------------------------------------------------------------------ report
 
-    def coord_section(self, now, m2, lab, health, calibration_text, kill_rows, trust, queue, rows, comparisons, copied):
+    def coord_section(self, now, m2, lab, health, calibration_text, kill_rows, trust, queue, rows, comparisons, copied,
+                      execution, load):
         trusted, horizon, covered, reasons = trust
         asks = []
         for name, status in (('M2', m2), ('lab', lab)):
@@ -576,13 +848,36 @@ class Collector:
                f'{queue.get("paused")}.', '', CORRECTION, '', '**Needs a decision / blocked:**', *(asks or ['- none']), '',
                '| Stage | Run | Step | Episodes | Success | Within tol. | Geodesic m | Position m | Orientation deg | Errors |',
                '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |']
-        for row in sorted(rows, key=lambda r: SPLIT_ORDER.get(r['entry']['split'], 9)):
+        for row in sorted(rows, key=lambda r: queue_rank(r['entry'])):
             entry = row['entry']
             stage = 'replay ' + entry.get('replay_split', '') if entry['split'] == 'replay' else entry['split']
+            if entry.get('tag'):
+                stage += f' [{entry["tag"]}: {" ".join(entry.get("server_args") or []) or "defaults"}]'
             out.append(f'| {stage} | `{entry["run"]}` | {entry.get("step") or "—"} | {row["done"]}/{row["expected"]}'
                        f'{"" if row["complete"] else " (running)"} | {fmt(row["success"], 2)} | {fmt(row["within_tolerance"], 2)} | '
                        f'{fmt(row["geodesic_distance_m"], 2)} | {fmt(row["position_error_m"], 2)} | '
                        f'{fmt(row["orientation_error_deg"], 1)} | {row["errors"]} |')
+        table, waiting, chosen = execution
+        out += ['', '**Execution-setting test** (training episodes; each setting against the default chunked 16 actions per '
+                'query on the same checkpoint and episodes; final error = max(position / 0.05 m, orientation / 0.1 rad), '
+                'geometric mean ratio to the default, below 1 is better):', '',
+                '| Setting | Paired episodes | Successes (setting / default) | Final error vs default | 95 % CI | Checkpoints |',
+                '| --- | ---: | ---: | ---: | --- | --- |']
+        for setting, t in sorted(table.items()):
+            ratio = '—' if t['mean'] is None else f'{math.exp(t["mean"]):.2f}x'
+            ci = '—' if not t['ci'] else f'[{math.exp(t["ci"][0]):.2f}, {math.exp(t["ci"][1]):.2f}]'
+            out.append(f'| {setting} | {t["n"]} | {t["success"]} / {t["base_success"]} | {ratio} | {ci} | {", ".join(t["checkpoints"])} |')
+        if not table:
+            out.append('| — | 0 | — | — | — | no results yet |')
+        out += ['', (f'eval50 execution setting: **{chosen["setting"]}** (decided {chosen["decided_at"]}): {chosen["reason"]}.'
+                     if chosen else 'eval50 execution setting: not decided; waiting for ' + ('; '.join(waiting) if waiting else
+                                                                                           'enough paired episodes') + '.')]
+        total = load['hours_queued'] + load['hours_projected']
+        out += ['', f'**Lab load:** {load["queued"]} episodes queued (≈ {load["hours_queued"]:.1f} h) plus {load["projected"]} '
+                f'planned for checkpoints not on the Hub yet (≈ {load["hours_projected"]:.1f} h): ≈ {total:.1f} h at '
+                f'{load["minutes"]:.1f} min per episode ({load["source"]}); training episodes count only when mapped '
+                f'({load["mapped"]} mapped). The lab\'s own tests outside the queue are not included.'
+                + (f' **Over {LAB_HOURS_WARN:.0f} h.**' if total > LAB_HOURS_WARN else '')]
         out += ['', '**Paired comparisons:**', *(comparisons or ['- none yet (needs two complete entries on the same episodes)'])]
         out += ['', f'**Helper health:** M2 — {health["M2"][0]}; lab — {health["lab"][0]}. Lab trust: '
                 f'{"trusted" if trusted else "not trusted: " + "; ".join(reasons)} (instances {covered}/200, action horizon {horizon}).']
@@ -630,6 +925,8 @@ class Collector:
         from huggingface_hub import CommitOperationAdd
         files = {'docs/plan.md': PLAN, 'docs/report.md': REPORT, 'm1/decisions.md': self.m1 / 'decisions.md',
                  'm1/tierB-queue.json': self.m1 / 'tierB-queue.json'}
+        if SPEC.exists():
+            files['docs/correction-data-spec.md'] = SPEC
         changed = {remote: local for remote, local in files.items() if digest(local) != self.state['uploaded'].get(remote)}
         if not changed:
             return []
@@ -659,12 +956,14 @@ class Collector:
         before = json.dumps(queue, sort_keys=True)
         added = self.extend_queue(manifests, queue)
         rows, valid = self.funnel(queue)
-        queue['entries'].sort(key=lambda e: SPLIT_ORDER.get(e['split'], 9))
+        execution = self.exec_decision(queue, rows, manifests)
+        queue['entries'].sort(key=queue_rank)
         if json.dumps(queue, sort_keys=True) != before:
             queue['updated_at'] = iso(now)
             queue_path.write_text(json.dumps(queue, indent=2) + '\n')
+        lab_hours = self.lab_load(queue, rows, manifests, read_json(self.inbox / 'lab/env.json'))
         self.render_report(self.coord_section(now, m2, lab, health, calibration_text, kill_rows, trust, queue, rows,
-                                              self.comparisons(rows, valid), copied), manifests)
+                                              self.comparisons(rows, valid), copied, execution, lab_hours), manifests)
         uploaded = self.upload()
         self.save()
         print(json.dumps({'event': 'cycle', 'at': iso(now), 'copied': len(copied), 'queued': added, 'decisions': self.decisions,

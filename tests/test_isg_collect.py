@@ -105,6 +105,92 @@ def test_funnel_floor_guard_kill_rule_and_copying(setup):
     assert (coord / 'm1/decisions.md').read_text() == log
 
 
+def run_episode(success, position, setting='ah16'):
+    meta = ({'execution_mode': 'temporal_aggregation', 'action_horizon': 1} if setting == 'ta'
+            else {'execution_mode': 'chunked', 'action_horizon': int(setting[2:])})
+    return {'success': success, 'error': None, 'split': 'train', 'wall_s': 300.0, 'server_metadata': meta,
+            'score': {'geodesic_distance_m': position, 'position_error_m': position, 'orientation_error_deg': 2.0,
+                      'within_tolerance': success}}
+
+
+def exec_setup(setup, monkeypatch, ah4_setting='ah4'):
+    collector, inbox, runs, report, coord = setup
+    monkeypatch.setattr(isg_collect, 'MIN_PAIRS', 3)
+    manifest = json.loads(Path(collector.manifest_paths[1]).read_text())
+    manifest['exec_test'] = {'lab_runs': [{'run': 'b', 'step': 50000, 'settings': ['ta']}]}
+    Path(collector.manifest_paths[1]).write_text(json.dumps(manifest))
+    queue = json.loads((coord / 'm1/tierB-queue.json').read_text())
+    queue['entries'] += [{'run': 'a', 'step': 50000, 'split': 'eval50', 'episodes': None},
+                         {'run': 'b', 'step': 50000, 'split': 'eval50', 'episodes': None},
+                         {'run': 'a', 'step': 50000, 'split': 'train', 'episodes': [8, 39, 43], 'tag': 'ta',
+                          'server_args': ['--temporal-agg']},
+                         {'run': 'a', 'step': 50000, 'split': 'train', 'episodes': [8, 39, 43], 'tag': 'ah4',
+                          'server_args': ['--action-horizon', '4']}]
+    write(coord / 'm1/tierB-queue.json', queue)
+    for split, eps in (('eval50', (2, 3)), ('train', (39,))):
+        for e in eps:
+            write(inbox / f'lab/diagnostics/replay/{split}/episode_{e:06d}.json', episode(True, 0.04))
+        write(inbox / f'lab/diagnostics/replay/{split}/summary.json', {'n': len(eps)})
+    for run in ('a', 'b'):  # default results, with summary.json in the task directory as the lab writes it
+        base = inbox / 'lab/tierB-train' / run / 'step_00050000' / R
+        for e in (8, 39, 43):
+            write(base / f'episode_{e:06d}.json', run_episode(False, 0.5))
+        write(base / 'summary.json', {'n': 3, 'complete': True})
+    for tag, run, setting, successes, position in (('ta', 'a', 'ta', (1, 1, 0), 0.06), ('ah4', 'a', ah4_setting, (0, 0, 0), 0.5),
+                                                   ('ta', 'b', 'ta', (1, 0, 0), 0.07)):
+        base = inbox / 'lab/diagnostics/exec' / tag / run / 'step_00050000' / R
+        for e, success in zip((8, 39, 43), successes):
+            write(base / f'episode_{e:06d}.json', run_episode(bool(success), 0.04 if success else position, setting))
+        write(base / 'summary.json', {'n': 3, 'complete': True})
+    write(inbox / 'lab/tierB/b/step_00050000' / R / 'episode_000000.json', run_episode(False, 3.0))
+    write(inbox / 'lab/env.json', {'action_horizon': 16, 'parallel_evaluators': 2,
+                                   'exec_tests': {'ah4': {'action_horizon': 4}, 'ta': {'action_horizon': 1}}})
+    return collector, inbox, report, coord
+
+
+def test_execution_settings_choose_the_eval50_setting(setup, monkeypatch):
+    collector, inbox, report, coord = exec_setup(setup, monkeypatch)
+    collector.cycle()
+    queue = json.loads((coord / 'm1/tierB-queue.json').read_text())
+    order = [(e['split'], e.get('tag')) for e in queue['entries']]
+    assert order[:4] == [('replay', None), ('replay', None), ('train', 'ta'), ('train', 'ah4')]
+    assert [s for s, _ in order[4:]] == ['train', 'train', 'eval50', 'eval50']
+    log = (coord / 'm1/decisions.md').read_text()
+    assert 'eval50 runs with execution setting **ta**' in log and 'Entries already started keep the default: `b`@50k' in log
+    evals = {e['run']: e for e in queue['entries'] if e['split'] == 'eval50'}
+    assert evals['a']['tag'] == 'ta-e50' and evals['a']['server_args'] == ['--temporal-agg'] and 'tag' not in evals['b']
+    assert '`a` at step 50000 succeeds on training instances (2 of 3 episodes so far, execution setting ta)' in log
+    text = report.read_text()
+    assert 'Execution-setting test' in text and '| ta | 6 | 3 / 0 |' in text and 'eval50 execution setting: **ta**' in text
+    assert 'Lab load:' in text and 'train [ta: --temporal-agg]' in text
+    assert collector.lab_trust(None, json.loads((inbox / 'lab/env.json').read_text()))[1] == 16
+    collector.cycle()  # decided once; no duplicate eval50 entries under the new tag
+    again = json.loads((coord / 'm1/tierB-queue.json').read_text())
+    assert sum(e['split'] == 'eval50' for e in again['entries']) == 2 and (coord / 'm1/decisions.md').read_text() == log
+
+
+def test_wrong_server_setting_is_flagged_and_left_out(setup, monkeypatch):
+    collector, inbox, report, coord = exec_setup(setup, monkeypatch, ah4_setting='ah16')
+    collector.cycle()
+    text = report.read_text()
+    assert "ran with server setting ['ah16'], not ah4 as queued" in text
+    assert 'eval50 execution setting: not decided; waiting for `a`@50k ah4 (0/3)' in text
+    assert 'eval50 runs with execution setting' not in (coord / 'm1/decisions.md').read_text()
+
+
+def test_training_success_with_a_complete_eval50_result_is_not_requeued(setup):
+    collector, inbox, runs, report, coord = setup
+    base = inbox / 'lab/tierB-train/a/step_00050000' / R
+    for e, success in zip((8, 39, 43), (1, 0, 0)):
+        write(base / f'episode_{e:06d}.json', run_episode(bool(success), 0.04 if success else 0.5))
+    for e in range(50):
+        write(inbox / 'lab/tierB/a/step_00050000' / R / f'episode_{e:06d}.json', run_episode(False, 2.0))
+    collector.cycle()
+    queue = json.loads((coord / 'm1/tierB-queue.json').read_text())
+    assert not any(e['split'] == 'eval50' for e in queue['entries'])
+    assert 'it already has a complete eval50 result (0% success), so nothing is re-queued' in (coord / 'm1/decisions.md').read_text()
+
+
 def test_failed_replay_pauses_the_queue(setup):
     collector, inbox, runs, report, coord = setup
     for split, eps in (('eval50', (2, 3)), ('train', (39,))):
