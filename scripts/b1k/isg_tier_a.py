@@ -18,7 +18,8 @@ Frame selection, the other-goal draw and the subsets are deterministic in the se
 A checkpoint trained with `--goal-mismatch-views` (the wrist-goal control) gets the same rule here: those views show
 the goal images of another episode of the same task and subset, drawn per frame from a separate stream of the seed
 (frames and the other-goal draw stay those of every other checkpoint), in both (a) and (b), so the gap measures the
-reliance on the remaining (head) goal.
+reliance on the remaining (head) goal. `--goal-mismatch-views` applies the same rule at evaluation only to a checkpoint
+trained on its own goals (a model trained on real wrist goals may also suffer from the distribution shift).
 
 `--heldout-dataset ROOT` takes the held-out episodes from a separate LeRobot root (the test set kmy17518/isg-init-eval,
 collected on instances no training demo uses), listed by its `isg_meta/eval_split.json` (or `--split`). Tasks are
@@ -80,7 +81,7 @@ def other_episodes(frames, episodes, rng):
 
 
 class Probe:
-    def __init__(self, checkpoint, device, batch_size):
+    def __init__(self, checkpoint, device, batch_size, mismatch_views=None):
         self.config, self.adapter = checkpoint['model_config'], checkpoint['adapter_config']
         self.goal = goal_config(self.config)
         if self.goal['goal_fusion'] == 'none':
@@ -93,7 +94,14 @@ class Probe:
         embeddings = language_embedding_table(self.config, self.task_map, checkpoint.get('language_cache'))
         self.embeddings = embeddings.to(self.device) if embeddings is not None else None
         self.cameras = [CAMERAS.index(view) for view in self.goal['goal_views']]
-        self.mismatch_views = list(self.adapter.get('goal_mismatch_views', []))
+        trained = list(self.adapter.get('goal_mismatch_views', []))
+        self.mismatch_evaluation_only = bool(mismatch_views) and not trained
+        if mismatch_views and trained and list(mismatch_views) != trained:
+            raise SystemExit(f'The checkpoint trained with --goal-mismatch-views {trained}; Tier A applies exactly those')
+        self.mismatch_views = list(mismatch_views or trained)
+        if not set(self.mismatch_views) <= set(self.goal['goal_views']) or len(self.mismatch_views) == len(self.goal['goal_views']):
+            raise SystemExit(f'--goal-mismatch-views {self.mismatch_views} must be some, not all, of the goal views '
+                             f'{self.goal["goal_views"]}')
 
     def predict(self, qpos, images, goal, task_id, goal_valid=None):
         kwargs = {}
@@ -211,7 +219,7 @@ def run(args):
     train_episodes = (checkpoint.get('episode_split') or {}).get('episodes')
     if not train_episodes:
         raise SystemExit('Checkpoint has no episode split; Tier A needs the training episodes')
-    probe = Probe(checkpoint, args.device, args.batch_size)
+    probe = Probe(checkpoint, args.device, args.batch_size, args.goal_mismatch_views)
     goal = probe.goal
 
     def dataset_for(task_names, episodes, subset_root=root, cache=frame_cache):
@@ -237,7 +245,9 @@ def run(args):
     if probe.mismatch_views:
         result['goal']['goal_mismatch_views'] = probe.mismatch_views
         result['probe']['goal_mismatch'] = ('mismatched views show another episode of the same task and subset in the '
-                                            'own- and other-goal conditions, drawn per frame with the seed')
+                                            'own- and other-goal conditions, drawn per frame with the seed'
+                                            + ('; evaluation only (the checkpoint trained on its own goals)'
+                                               if probe.mismatch_evaluation_only else ''))
     for subset in ('heldout', 'train'):
         if subset == 'heldout':
             lists = {task: held_out[task] for task in tasks if task in held_out}
@@ -284,6 +294,10 @@ def parser():
                    'decoded from video). Default: the checkpoint\'s dataset root')
     p.add_argument('--split', help='Default: <held-out root>/isg_meta/eval_split.json if present, else (without '
                    '--heldout-dataset) <root>/isg_meta/train_split.json')
+    p.add_argument('--goal-mismatch-views', nargs='+', choices=CAMERAS, metavar='CAMERA',
+                   help='Evaluation only: these goal views show another episode of the same task and subset (the other '
+                   'goal views keep their own), for a checkpoint trained on its own goals; write the result to a '
+                   'separate --output so the standard Tier A results stay untouched')
     p.add_argument('--frames-per-task', type=int, default=256)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')

@@ -286,6 +286,30 @@ def test_wrist_control_reading_and_section(setup):
     assert 'Wrist-goal control' not in (coord / 'm1/decisions.md').read_text()
 
 
+def test_wrist_detach_follow_up_reading(setup):
+    import isg_wristshuf as w
+    base = {'W': 0.066, 'C': 0.091, 'R': 0.088, 'H': 0.085}
+    assert w.detach_reading({0: dict(base, D=0.068), 1: dict(base, D=0.069)})[0] == 'wrist content'
+    assert w.detach_reading({0: dict(base, D=0.084), 1: dict(base, D=0.083)})[0] == 'filters trained on wrist content'
+    assert w.detach_reading({0: dict(base, D=0.075), 1: dict(base, D=0.069)})[0] == 'mixed'
+    collector, inbox, runs, report, coord = setup
+    collector.cycle()
+    assert 'Follow-up reading: pending' in report.read_text()
+    values = {0: dict(base, D=0.068), 1: dict(base, D=0.069)}
+    for seed, roles in w.DETACH_RUNS.items():
+        for key, run in roles.items():
+            for step in (10000, w.DETACH_STEP):
+                l1 = values[seed][key] + (0.01 if step == 10000 else 0.0)
+                write(runs / run / 'tierA-eval50' / f'step_{step:08d}.json', {'heldout': {'tasks': {w.RELOC: {'L1_own': l1, 'gap': 0.02}}}})
+    collector.cycle()
+    text, plan = report.read_text(), isg_collect.PLAN.read_text()
+    assert 'Follow-up reading (primary): wrist content' in text and '| s0 | W `r1-early-wrist-st0-s0` | 0.0760 |' in text
+    assert 'gain kept without filter training (H − D) / (H − W) = 89%' in text
+    assert plan.count('Wrist-goal follow-up (goal gradient stopped), final reading: wrist content') == 1
+    collector.cycle()
+    assert isg_collect.PLAN.read_text().count('Wrist-goal follow-up') == 1
+
+
 def test_decision_transfer_reading(setup):
     import isg_xfer as x
     assert x.classify({0: -0.02, 1: -0.01}, 0.0066) == 'chosen better'

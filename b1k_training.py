@@ -69,7 +69,12 @@ def goal_config(model_config):
         if late[key] not in choices:
             raise ValueError(f'Unsupported {key} {late[key]!r}')
     gain = model_config.get('goal_stem_gain')
-    return {'goal_fusion': fusion, 'goal_views': views, 'goal_encoder': encoder, **late,
+    detach = list(model_config.get('goal_detach_views', []))
+    goal_views_to_indices(detach)
+    if detach and (fusion != 'early' or int(model_config.get('goal_fusion_depth', 0)) or not set(detach) <= set(views)):
+        raise ValueError(f'goal_detach_views {detach} must be goal views {views} of early fusion through the paired stem '
+                         '(goal_fusion_depth 0)')
+    return {'goal_fusion': fusion, 'goal_views': views, 'goal_encoder': encoder, **late, 'goal_detach_views': detach,
             'goal_stem_gain': None if gain is None else float(gain),
             'goal_stem_diff': bool(model_config.get('goal_stem_diff', False)),
             'goal_fusion_depth': int(model_config.get('goal_fusion_depth', 0)),
@@ -138,6 +143,7 @@ def make_policy(model_config, device, restoring=False, fused_optimizer=False, sk
                   language_dim=language_dim(model_config))  # derived from the encoder, not saved
     config.update(goal_config(model_config))
     config['goal_camera_indices'] = goal_views_to_indices(config['goal_views'])  # derived, not saved
+    config['goal_detach_camera_indices'] = goal_views_to_indices(config['goal_detach_views'])
     if restoring:
         config['pretrained_backbone'] = False
     policy_type = ACTPolicy if policy_class(config) == 'ACT' else CNNMLPPolicy
@@ -565,6 +571,8 @@ def conditioning_record(model_config, adapter, dataset, root, episode_split=None
     if adapter.get('goal_mismatch_views'):
         record['goal'].update(mismatch_views=list(adapter['goal_mismatch_views']),
                               mismatch_policy='other_episode_same_task_uniform_per_sample')
+    if goal['goal_detach_views']:
+        record['goal']['detach_views'] = list(goal['goal_detach_views'])
     return record
 
 
@@ -632,6 +640,20 @@ def validate_goal_mismatch(args):
         raise ValueError('--goal-mismatch-views must leave at least one goal view with its own episode\'s goal')
     if args.goal_source != 'episode_last':
         raise ValueError('--goal-mismatch-views needs --goal-source episode_last')
+
+
+def validate_goal_detach(args):
+    """--goal-detach-views (fresh runs): distinct goal views of early fusion through the paired stem, one backbone pass
+    per camera."""
+    views = list(args.goal_detach_views or [])
+    if not views:
+        return
+    if args.goal_fusion != 'early' or args.goal_fusion_depth:
+        raise ValueError('--goal-detach-views needs --goal-fusion early through the paired stem (--goal-fusion-depth 0)')
+    if args.camera_batch:
+        raise ValueError('--goal-detach-views needs one backbone pass per camera: drop --backbone-camera-batch')
+    if len(set(views)) != len(views) or not set(views) <= set(args.goal_views or []):
+        raise ValueError(f'--goal-detach-views {views} must be distinct views of --goal-views {args.goal_views}')
 
 
 def validate_goal_mechanism(args):
@@ -767,6 +789,11 @@ def parser():
                         'needs --goal-tokens pooled --no-goal-role-embedding)')
     p.add_argument('--goal-stem-gain', type=float, default=None, action=LanguageOption, metavar='START',
                    help='Early fusion: learned per-filter gain on the goal half of the paired stem, starting at START')
+    p.add_argument('--goal-detach-views', nargs='+', choices=CAMERAS, default=None, action=LanguageOption,
+                   metavar='CAMERA', help='Early fusion: the paired-stem passes of these goal views (a subset of '
+                   '--goal-views) do not train the goal half of the stem (goal_weight, and the gain and difference '
+                   'weights when enabled); the forward pass, the observation half and every later layer are unchanged. '
+                   'Paired stem with one backbone pass per camera only; saved in the model config')
     p.add_argument('--goal-fusion-depth', type=int, choices=[0, 1, 2, 3], default=0, action=LanguageOption,
                    help='Early fusion: where the goal joins the head camera, 0 = the paired stem (default), K = 1-3 = '
                         'after ResNet stage K through a goal-only 1x1 convolution started by --goal-stem-init '
@@ -892,7 +919,8 @@ def _train(args, output, root, resources):
                              ('language_on_goal_encoder', False), ('goal_tag_init', 'zero'),
                              ('goal_stem_init', 'zero'), ('goal_tokens', 'grid'), ('lr_goal', None),
                              ('goal_pos', 'sine'), ('goal_content', 'goal'), ('goal_entry', 'encoder'),
-                             ('goal_stem_gain', None), ('goal_stem_diff', False), ('goal_fusion_depth', 0)]:
+                             ('goal_stem_gain', None), ('goal_stem_diff', False), ('goal_fusion_depth', 0),
+                             ('goal_detach_views', [])]:
             saved_value = model_config.get(key, default)
             if getattr(args, f'_{key}_explicit', False) and getattr(args, key) != saved_value:
                 raise ValueError(f'--{key.replace("_", "-")} differs from checkpoint')
@@ -928,6 +956,7 @@ def _train(args, output, root, resources):
     else:
         resolve_regime(args)
         validate_goal_mismatch(args)
+        validate_goal_detach(args)
         image_size = args.image_size or ([240, 240] if args.policy_class == 'ACT' else [480, 640])
         if args.policy_class == 'CNNMLP' and (args.pre_norm or args.position_embedding != 'sine'):
             raise ValueError('Position embeddings and pre-norm are ACT architecture options; CNNMLP does not use them')
@@ -978,6 +1007,7 @@ def _train(args, output, root, resources):
                         'goal_pos': args.goal_pos, 'goal_content': args.goal_content, 'goal_entry': args.goal_entry,
                         'goal_stem_gain': args.goal_stem_gain, 'goal_stem_diff': bool(args.goal_stem_diff),
                         'goal_fusion_depth': int(args.goal_fusion_depth),
+                        **({'goal_detach_views': list(args.goal_detach_views)} if args.goal_detach_views else {}),
                         'dilation': False, 'masks': False, 'action_dim': 23}
         if args.language_conditioning != 'none':
             model_config['film_init'] = args.film_init
@@ -994,6 +1024,9 @@ def _train(args, output, root, resources):
     configure_cpu_threads(torch_threads=args.torch_threads or torch.get_num_threads(),
                           arrow_threads=args.arrow_threads, opencv_threads=args.opencv_threads)
     goal = goal_config(model_config)
+    if goal['goal_detach_views'] and args.compile not in ('none', 'backbone', 'regions', 'regions-autotune'):
+        raise ValueError('--goal-detach-views sets the stem\'s per-camera flag in the uncompiled camera loop; use --compile '
+                         'none, backbone, regions or regions-autotune')
     task_onehot = adapter.get('task_conditioning', 'onehot') == 'onehot'
     if episode_split:
         LOGGER.info('Episode split %s', describe_episode_split(episode_split))
@@ -1129,6 +1162,9 @@ def _train(args, output, root, resources):
                     goal['goal_tokens'], goal['goal_pos'],
                     goal['goal_content'], goal['goal_entry'], goal['lr_goal'],
                     sum(p.numel() for g in optimizer.param_groups[2:] for p in g['params']))
+        if goal['goal_detach_views']:
+            LOGGER.info('Goal detach: the paired-stem passes of %s do not train the goal half of the stem',
+                        goal['goal_detach_views'])
     begin = time.monotonic()
     previous_end = begin
     batches = optimizer_batches(loader, args.batch_size, args.loader_batch_size, device=device, stream=copy_stream)

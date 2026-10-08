@@ -104,6 +104,9 @@ class PairedConv2d(nn.Conv2d):
     A 3-channel input (other cameras, goal-free passes) runs the plain convolution. State-dict keys stay
     `weight`/`bias`; `goal_weight` (and `goal_gain`, `goal_diff_weight` when enabled) are the only additions. These
     initializations are our controlled engineering choices, not claims about BridgeData's unpublished details.
+    `detach_goal` (set per pass by DETRVAE for `goal_detach_views`) stops the gradient of a paired pass at the goal
+    half's parameters: the forward pass is unchanged, the observation half and every later layer still learn from
+    it, and the goal filters learn from the other passes only.
     """
     def __init__(self, conv, init='zero', gain=None, diff=False):
         super().__init__(conv.in_channels, conv.out_channels, conv.kernel_size, conv.stride, conv.padding,
@@ -121,6 +124,7 @@ class PairedConv2d(nn.Conv2d):
                 self.goal_weight.copy_(float(init[5:]) * conv.weight)
         self.goal_gain = None if gain is None else nn.Parameter(torch.full((conv.out_channels, 1, 1, 1), float(gain)))
         self.goal_diff_weight = nn.Parameter(torch.zeros_like(self.weight)) if diff else None
+        self.detach_goal = False
 
     @property
     def paired_channels(self):
@@ -128,13 +132,18 @@ class PairedConv2d(nn.Conv2d):
         return (3 if self.goal_diff_weight is not None else 2) * self.in_channels
 
     def paired_weight(self):
-        """The (out, paired_channels, kh, kw) weight of the paired convolution."""
-        goal = self.goal_weight.to(self.weight.dtype)
-        if self.goal_gain is not None:
-            goal = self.goal_gain.to(self.weight.dtype) * goal
+        """The (out, paired_channels, kh, kw) weight of the paired convolution (goal half detached with `detach_goal`)."""
+        goal_weight, goal_gain, goal_diff = self.goal_weight, self.goal_gain, self.goal_diff_weight
+        if self.detach_goal:
+            goal_weight = goal_weight.detach()
+            goal_gain = None if goal_gain is None else goal_gain.detach()
+            goal_diff = None if goal_diff is None else goal_diff.detach()
+        goal = goal_weight.to(self.weight.dtype)
+        if goal_gain is not None:
+            goal = goal_gain.to(self.weight.dtype) * goal
         parts = [self.weight, goal]
-        if self.goal_diff_weight is not None:
-            parts.append(self.goal_diff_weight.to(self.weight.dtype))
+        if goal_diff is not None:
+            parts.append(goal_diff.to(self.weight.dtype))
         return torch.cat(parts, dim=1)
 
     def forward(self, x):

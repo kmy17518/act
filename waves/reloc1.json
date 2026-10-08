@@ -708,6 +708,104 @@
     "left_realsense_link",
     "right_realsense_link"
    ]
+  },
+  {
+   "name": "r1-early-wristdet-st0-s0",
+   "machine": "M1",
+   "gpu": 0,
+   "cores": "0-23",
+   "seed": 0,
+   "role": "wrist-goal follow-up (D): flags of r1-early-wrist-st0-s0 plus --goal-detach-views on both wrists (their paired passes do not train the goal half of the stem; forward, later layers, frames, batches, initialization and parameter count as r1-early-wrist-st0-s0); offline only (no tierB)",
+   "flags": [
+    "--goal-fusion",
+    "early",
+    "--goal-stem-init",
+    "copy:0.5",
+    "--lr-goal",
+    "1e-3",
+    "--goal-views",
+    "zed_link",
+    "left_realsense_link",
+    "right_realsense_link",
+    "--goal-detach-views",
+    "left_realsense_link",
+    "right_realsense_link"
+   ]
+  },
+  {
+   "name": "r1-early-wristdet-st0-s1",
+   "machine": "M1",
+   "gpu": 1,
+   "cores": "24-47",
+   "seed": 1,
+   "role": "wrist-goal follow-up (D): flags of r1-early-wrist-st0-s1 plus --goal-detach-views on both wrists (their paired passes do not train the goal half of the stem; forward, later layers, frames, batches, initialization and parameter count as r1-early-wrist-st0-s1); offline only (no tierB)",
+   "flags": [
+    "--goal-fusion",
+    "early",
+    "--goal-stem-init",
+    "copy:0.5",
+    "--lr-goal",
+    "1e-3",
+    "--goal-views",
+    "zed_link",
+    "left_realsense_link",
+    "right_realsense_link",
+    "--goal-detach-views",
+    "left_realsense_link",
+    "right_realsense_link"
+   ]
+  },
+  {
+   "name": "r1-early-wristshufdet-st0-s0",
+   "machine": "M1",
+   "gpu": 2,
+   "cores": "48-71",
+   "seed": 0,
+   "role": "wrist-goal follow-up (R): flags of r1-early-wristshuf-st0-s0 plus --goal-detach-views on both wrists (their paired passes do not train the goal half of the stem; forward, later layers, frames, batches, initialization and parameter count as r1-early-wristshuf-st0-s0); offline only (no tierB)",
+   "flags": [
+    "--goal-fusion",
+    "early",
+    "--goal-stem-init",
+    "copy:0.5",
+    "--lr-goal",
+    "1e-3",
+    "--goal-views",
+    "zed_link",
+    "left_realsense_link",
+    "right_realsense_link",
+    "--goal-mismatch-views",
+    "left_realsense_link",
+    "right_realsense_link",
+    "--goal-detach-views",
+    "left_realsense_link",
+    "right_realsense_link"
+   ]
+  },
+  {
+   "name": "r1-early-wristshufdet-st0-s1",
+   "machine": "M1",
+   "gpu": 3,
+   "cores": "72-95",
+   "seed": 1,
+   "role": "wrist-goal follow-up (R): flags of r1-early-wristshuf-st0-s1 plus --goal-detach-views on both wrists (their paired passes do not train the goal half of the stem; forward, later layers, frames, batches, initialization and parameter count as r1-early-wristshuf-st0-s1); offline only (no tierB)",
+   "flags": [
+    "--goal-fusion",
+    "early",
+    "--goal-stem-init",
+    "copy:0.5",
+    "--lr-goal",
+    "1e-3",
+    "--goal-views",
+    "zed_link",
+    "left_realsense_link",
+    "right_realsense_link",
+    "--goal-mismatch-views",
+    "left_realsense_link",
+    "right_realsense_link",
+    "--goal-detach-views",
+    "left_realsense_link",
+    "right_realsense_link"
+   ]
   }
  ],
  "exec_test": {

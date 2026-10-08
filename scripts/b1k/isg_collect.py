@@ -53,7 +53,7 @@ COORD = Path('/tmp/dev/coord')
 PLAN = Path('/tmp/dev/docs/isg-goal-conditioning-plan.md')
 REPORT = Path('/tmp/dev/report.md')
 SPEC = Path('/tmp/dev/docs/isg-correction-data-spec.md')
-CUSTOM_SECTIONS = (  # module with render(runs_root) -> (markdown, final reading or None); report marker; plan log fields
+CUSTOM_SECTIONS = (  # render(runs_root) -> (markdown, final reading, or {name: reading}; None while pending); marker; plan
     ('isg_wristshuf', 'wrist-control', 'wrist-goal control', 'held-out Tier A at the final steps; docs/report.md "Wrist-goal control"',
      'relocalization L1_own δ = 0.0066'),
     ('isg_xfer', 'xfer', 'decision transfer', 'held-out Tier A at 100k; docs/report.md "Decision transfer"',
@@ -1052,8 +1052,9 @@ class Collector:
                 body, final = importlib.import_module(module).render(manifests[0]['runs_root'])
             except Exception as exc:  # keep the cycle alive; show the failure in the report
                 body, final = f'_{area} section failed: {type(exc).__name__}: {exc}_', None
-            if final:
-                self.custom_finals[marker] = (area, final, evidence, floor)
+            for name, reading in (final if isinstance(final, dict) else {'final': final}).items():
+                if reading:
+                    self.custom_finals[f'{marker}:{name}'] = (area, reading, evidence, floor)
             sections.append((f'{begin}\n{body}\n{end}', begin, end, 'after-coord'))
         for manifest, path in zip(manifests, self.manifest_paths):
             if manifest.get('custom_report'):
@@ -1135,8 +1136,8 @@ class Collector:
         lab_hours = self.lab_load(queue, rows, manifests, read_json(self.inbox / 'lab/env.json'))
         self.render_report(self.coord_section(now, m2, lab, health, calibration_text, kill_rows, trust, queue, rows,
                                               self.comparisons(rows, valid), copied, execution, lab_hours, push_line), manifests)
-        for marker, (area, final, evidence, floor) in self.custom_finals.items():
-            self.log_plan(f'{marker}:final', area, final, evidence, floor)
+        for key, (area, final, evidence, floor) in self.custom_finals.items():
+            self.log_plan(key, area, final, evidence, floor)
         uploaded = self.upload()
         self.save()
         print(json.dumps({'event': 'cycle', 'at': iso(now), 'copied': len(copied), 'queued': added, 'decisions': self.decisions,

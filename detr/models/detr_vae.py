@@ -75,7 +75,8 @@ class DETRVAE(nn.Module):
                  mt_act_language_dim=None, camera_batch=False, goal_fusion='none', goal_views=(),
                  goal_role_embedding=True, goal_encoder='shared_base', language_on_goal_encoder=False,
                  goal_tag_init='zero', goal_stem_init='zero', goal_tokens='grid', goal_pos='sine', goal_content='goal',
-                 goal_entry='encoder', goal_stem_gain=None, goal_stem_diff=False, goal_fusion_depth=0):
+                 goal_entry='encoder', goal_stem_gain=None, goal_stem_diff=False, goal_fusion_depth=0,
+                 goal_detach_views=()):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -125,6 +126,9 @@ class DETRVAE(nn.Module):
             goal_fusion_depth: early fusion's merge point: 0 pairs the goal with its camera in the stem (PairedConv2d);
                 K = 1-3 merges the goal's stage-K features into the current ones through a goal-only 1x1 convolution
                 whose start follows `goal_stem_init` (see backbone.BackboneBase.enable_goal_merge).
+            goal_detach_views: goal views (camera indices) whose paired-stem passes do not train the goal half of the
+                stem (backbone.PairedConv2d.detach_goal); the forward pass is unchanged. Early fusion through the
+                paired stem with one backbone pass per camera only.
         """
         super().__init__()
         self.num_queries = num_queries
@@ -162,6 +166,14 @@ class DETRVAE(nn.Module):
                              "goal_tokens='pooled' and no goal role embedding")
         self.goal_fusion = goal_fusion
         self.goal_views = tuple(int(view) for view in goal_views) if goal_fusion != 'none' else ()
+        self.goal_detach_views = tuple(int(view) for view in goal_detach_views)
+        if self.goal_detach_views:
+            if goal_fusion != 'early' or goal_fusion_depth or camera_batch:
+                raise ValueError('goal_detach_views need early fusion through the paired stem (goal_fusion_depth 0) '
+                                 'with one backbone pass per camera (no camera_batch)')
+            if len(set(self.goal_detach_views)) != len(self.goal_detach_views) or \
+                    not set(self.goal_detach_views) <= set(self.goal_views):
+                raise ValueError(f'goal_detach_views {goal_detach_views} must be distinct goal views {self.goal_views}')
         self.goal_encoder = goal_encoder
         self.goal_tokens = goal_tokens
         self.goal_pos, self.goal_content, self.goal_entry = goal_pos, goal_content, goal_entry
@@ -385,11 +397,15 @@ class DETRVAE(nn.Module):
                             if getattr(self.backbones[0][0].body.conv1, 'goal_diff_weight', None) is not None:
                                 parts.append(self.goal_difference(cam_image, goal[:, view], goal_present, view))
                             cam_image = torch.cat(parts, dim=1)
+                            if self.goal_detach_views:
+                                self.backbones[0][0].body.conv1.detach_goal = cam_id in self.goal_detach_views
                     features, pos = self.backbones[0](cam_image, lang_emb=lang_emb, camera=cam_id, **goal_kwargs) # HARDCODED
                     features = features[0] # take the last layer feature
                     pos = pos[0]
                     all_cam_features.append(self.input_proj(features))
                     all_cam_pos.append(pos)
+                if self.goal_detach_views:
+                    self.backbones[0][0].body.conv1.detach_goal = False
                 projected = all_cam_features
                 # fold camera dimension into width dimension
                 src = torch.cat(all_cam_features, axis=3)
@@ -622,6 +638,7 @@ def build(args):
         goal_stem_gain=getattr(args, 'goal_stem_gain', None),
         goal_stem_diff=bool(getattr(args, 'goal_stem_diff', False)),
         goal_fusion_depth=int(getattr(args, 'goal_fusion_depth', 0)),
+        goal_detach_views=getattr(args, 'goal_detach_camera_indices', ()),
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)

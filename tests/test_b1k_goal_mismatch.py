@@ -213,6 +213,26 @@ def test_option_is_saved_resumed_and_applied_by_tier_a(mismatch_root, tmp_path, 
         assert all(len({owner(own[i, view].numpy())[0] for view in range(3)}) == 1 for i in range(len(own)))
 
 
+def test_tier_a_evaluation_only_mismatch(mismatch_root, tmp_path, monkeypatch):
+    torch.set_num_threads(1)
+    plain_path = train(parser().parse_args(common(mismatch_root, tmp_path / 'plain') + ['--max-steps', '1']))
+    captured = []
+    real = isg_tier_a.prepare_goals
+    monkeypatch.setattr(isg_tier_a, 'prepare_goals', lambda goal, *a, **k: captured.append(goal.clone()) or real(goal, *a, **k))
+    result = isg_tier_a.run(isg_tier_a.parser().parse_args([str(plain_path), '--frames-per-task', '4', '--device', 'cpu',
+                                                            '--batch-size', '8', '--threads', '1', '--goal-mismatch-views', *WRISTS]))
+    assert result['goal']['goal_mismatch_views'] == WRISTS and 'evaluation only' in result['probe']['goal_mismatch']
+    for own in captured[0::2]:
+        for i in range(len(own)):
+            (head, _), (left, _), (right, _) = (owner(own[i, view].numpy()) for view in range(3))
+            assert left == right != head and EPISODE_TASK[left] == EPISODE_TASK[head]
+    monkeypatch.setattr(isg_tier_a, 'prepare_goals', real)
+    control = train(parser().parse_args(common(mismatch_root, tmp_path / 'control') + ['--goal-mismatch-views', *WRISTS,
+                                                                                      '--max-steps', '1']))
+    with pytest.raises(SystemExit, match='applies exactly those'):
+        isg_tier_a.run(isg_tier_a.parser().parse_args([str(control), '--device', 'cpu', '--goal-mismatch-views', WRISTS[0]]))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='needs CUDA')
 def test_three_step_cuda_smoke(mismatch_root, tmp_path):
     output = tmp_path / 'cuda'
