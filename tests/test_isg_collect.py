@@ -286,6 +286,35 @@ def test_wrist_control_reading_and_section(setup):
     assert 'Wrist-goal control' not in (coord / 'm1/decisions.md').read_text()
 
 
+def test_decision_transfer_reading(setup):
+    import isg_xfer as x
+    assert x.classify({0: -0.02, 1: -0.01}, 0.0066) == 'chosen better'
+    assert x.classify({0: 0.003, 1: -0.002}, 0.0066) == 'no difference'
+    assert x.classify({0: -0.02, 1: 0.001}, 0.0066) == 'mixed'
+    collector, inbox, runs, report, coord = setup
+    collector.cycle()
+    assert '<!-- xfer:begin -->' in report.read_text() and 'Decision transfer' in report.read_text()
+    l1 = {'early-wrist': 0.06, 'early-copy05': 0.08, 'early-zero': 0.081, 'late-tagzero': 0.085}
+    for short, (task, pattern) in x.TASKS.items():
+        for seed in x.SEEDS:
+            for config, value in l1.items():
+                value += 0.004 * seed  # seed noise: delta 0.004 on object scaling
+                if short == 'mental rotation' and config == 'late-tagzero':
+                    value = 0.09 if seed == 0 else 0.074  # seed spread 0.016 sets mental rotation's delta
+                write(runs / pattern.format(config=config, seed=seed) / 'tierA-eval50' / f'step_{x.STEP:08d}.json',
+                      {'heldout': {'tasks': {task: {'L1_own': value, 'gap': 0.02}}}})
+    collector.cycle()
+    text, plan = report.read_text(), isg_collect.PLAN.read_text()
+    assert ('wrist goal views (A0 vs A1): relocalization chosen better; mental rotation chosen better; object scaling chosen '
+            'better (transfers to mental rotation, object scaling)') in plan
+    assert 'copy:0.5 vs zero stem init (A1 vs A2): relocalization no difference; mental rotation no difference' in plan
+    assert ('early vs late fusion (A1 vs A3): relocalization no difference; mental rotation no difference; object scaling '
+            'chosen better (transfers to mental rotation)') in plan
+    assert '| wrist goal views (A0 vs A1) |' in text and 'object scaling (delta 0.0040)' in text
+    collector.cycle()
+    assert isg_collect.PLAN.read_text().count('Decision transfer, final reading') == 1
+
+
 def test_failed_replay_pauses_the_queue(setup):
     collector, inbox, runs, report, coord = setup
     for split, eps in (('eval50', (2, 3)), ('train', (39,))):

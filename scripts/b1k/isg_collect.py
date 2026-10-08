@@ -53,7 +53,12 @@ COORD = Path('/tmp/dev/coord')
 PLAN = Path('/tmp/dev/docs/isg-goal-conditioning-plan.md')
 REPORT = Path('/tmp/dev/report.md')
 SPEC = Path('/tmp/dev/docs/isg-correction-data-spec.md')
-WRIST_BEGIN, WRIST_END = '<!-- wrist-control:begin -->', '<!-- wrist-control:end -->'
+CUSTOM_SECTIONS = (  # module with render(runs_root) -> (markdown, final reading or None); report marker; plan log fields
+    ('isg_wristshuf', 'wrist-control', 'wrist-goal control', 'held-out Tier A at the final steps; docs/report.md "Wrist-goal control"',
+     'relocalization L1_own δ = 0.0066'),
+    ('isg_xfer', 'xfer', 'decision transfer', 'held-out Tier A at 100k; docs/report.md "Decision transfer"',
+     'relocalization δ = 0.0066; other tasks: largest seed-pair difference'),
+)
 CALIBRATION_REFERENCE, CALIBRATION_TOLERANCE = 0.12560, 0.003
 STALE = timedelta(hours=1)
 # lab/instances.json: a mapping counts as verified when its first head frame matches the test episode's first frame to
@@ -343,7 +348,7 @@ def record_setting(record):
 
 GITHUB_URL, GITHUB_BRANCH = 'https://github.com/kmy17518/act.git', 'isg-wave2-dev'  # what machine 2 and the lab pull
 GITHUB_REF = 'refs/remotes/github/isg-wave2-dev'  # last fetched copy; this checkout's `origin` is a local clone
-RUN_NAME = re.compile(r'`((?:w1|w2|r1)-[a-z0-9.-]+-s\d+)`')
+RUN_NAME = re.compile(r'`([a-z][a-z0-9]*-[a-z0-9.-]+-s\d+)`')
 COMMIT_LIKE = re.compile(r'\b[0-9a-f]{7,40}\b')
 PUSH_COMMAND = ('git -C /tmp/dev/baselines/act-isg-w2 push origin isg-wave2-dev && '
                 'git -C /tmp/dev/baselines/act push origin isg-wave2-dev')
@@ -634,7 +639,7 @@ class Collector:
         self.state = read_json(self.state_path) or {'recorded': [], 'uploaded': {}, 'lab_trusted': False}
         self.decisions, self.escalations, self.first_frame_diffs = [], [], []
         self.github, self.local_runs = {}, set()
-        self.wrist_control_final = None
+        self.custom_finals = {}
 
     def log_plan(self, key, area, decision, evidence, floor):
         """Append one row to the plan's decision log only (no m1/decisions.md entry), once per key."""
@@ -1036,16 +1041,23 @@ class Collector:
         return '\n'.join(out)
 
     def render_report(self, coord_text, manifests):
+        import importlib
         from isg_report import BEGIN, END, render
-        from isg_wristshuf import render as wrist_control
         text = REPORT.read_text()
         sections = [(coord_text, '<!-- coord:begin -->', '<!-- coord:end -->', 'top')]
-        try:
-            body, self.wrist_control_final = wrist_control(manifests[0]['runs_root'])
-        except Exception as exc:  # keep the cycle alive; show the failure in the report
-            body, self.wrist_control_final = f'_Wrist-goal control section failed: {type(exc).__name__}: {exc}_', None
-        sections.append((f'{WRIST_BEGIN}\n{body}\n{WRIST_END}', WRIST_BEGIN, WRIST_END, 'after-coord'))
+        self.custom_finals = {}
+        for module, marker, area, evidence, floor in CUSTOM_SECTIONS:
+            begin, end = f'<!-- {marker}:begin -->', f'<!-- {marker}:end -->'
+            try:
+                body, final = importlib.import_module(module).render(manifests[0]['runs_root'])
+            except Exception as exc:  # keep the cycle alive; show the failure in the report
+                body, final = f'_{area} section failed: {type(exc).__name__}: {exc}_', None
+            if final:
+                self.custom_finals[marker] = (area, final, evidence, floor)
+            sections.append((f'{begin}\n{body}\n{end}', begin, end, 'after-coord'))
         for manifest, path in zip(manifests, self.manifest_paths):
+            if manifest.get('custom_report'):
+                continue
             begin, end = (BEGIN, END) if path.stem == 'wave1' else (f'<!-- isg-runs-{path.stem}:begin -->', f'<!-- isg-runs-{path.stem}:end -->')
             try:
                 body = render(manifest).replace(BEGIN, begin).replace(END, end)
@@ -1123,9 +1135,8 @@ class Collector:
         lab_hours = self.lab_load(queue, rows, manifests, read_json(self.inbox / 'lab/env.json'))
         self.render_report(self.coord_section(now, m2, lab, health, calibration_text, kill_rows, trust, queue, rows,
                                               self.comparisons(rows, valid), copied, execution, lab_hours, push_line), manifests)
-        if self.wrist_control_final:
-            self.log_plan('wrist-control:final', 'wrist-goal control', self.wrist_control_final,
-                          'held-out Tier A at the final steps; docs/report.md "Wrist-goal control"', 'relocalization L1_own δ = 0.0066')
+        for marker, (area, final, evidence, floor) in self.custom_finals.items():
+            self.log_plan(f'{marker}:final', area, final, evidence, floor)
         uploaded = self.upload()
         self.save()
         print(json.dumps({'event': 'cycle', 'at': iso(now), 'copied': len(copied), 'queued': added, 'decisions': self.decisions,
@@ -1149,7 +1160,7 @@ def main():
     parser.add_argument('--log', help='Plan decision-log text of the --decide decision (default: its first bullet)')
     args = parser.parse_args()
     from huggingface_hub import HfApi
-    manifests = args.manifest or [CHECKOUT / f'waves/{n}.json' for n in ('wave1', 'wave2', 'reloc1')]
+    manifests = args.manifest or [CHECKOUT / f'waves/{n}.json' for n in ('wave1', 'wave2', 'reloc1', 'xfer1')]
     collector = Collector(HfApi(token=os.environ.get('HF_TOKEN')), manifests)
     if args.decide:
         if not args.line:
