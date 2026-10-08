@@ -301,8 +301,11 @@ def test_wrist_detach_follow_up_reading(setup):
             for step in (10000, w.DETACH_STEP):
                 l1 = values[seed][key] + (0.01 if step == 10000 else 0.0)
                 write(runs / run / 'tierA-eval50' / f'step_{step:08d}.json', {'heldout': {'tasks': {w.RELOC: {'L1_own': l1, 'gap': 0.02}}}})
+    write(runs / w.DETACH_RUNS[0]['W'] / w.EVAL_ONLY_DIR / f'step_{w.DETACH_STEP:08d}.json',
+          {'heldout': {'tasks': {w.RELOC: {'L1_own': 0.071}}}})
     collector.cycle()
     text, plan = report.read_text(), isg_collect.PLAN.read_text()
+    assert 'with mismatched ones (+0.0050); H 0.0850' in text
     assert 'Follow-up reading (primary): wrist content' in text and '| s0 | W `r1-early-wrist-st0-s0` | 0.0760 |' in text
     assert 'gain kept without filter training (H − D) / (H − W) = 89%' in text
     assert plan.count('Wrist-goal follow-up (goal gradient stopped), final reading: wrist content') == 1

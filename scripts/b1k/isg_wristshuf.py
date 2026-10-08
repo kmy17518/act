@@ -38,6 +38,7 @@ DETACH_STEP = 100000
 DETACH_RUNS = {s: {'W': f'r1-early-wrist-st0-s{s}', 'D': f'r1-early-wristdet-st0-s{s}', 'C': f'r1-early-wristshuf-st0-s{s}',
                    'R': f'r1-early-wristshufdet-st0-s{s}', 'H': f'r1-early-copy05-st0-s{s}'} for s in (0, 1)}
 DETACH_ORDER = ('W', 'D', 'C', 'R', 'H')
+EVAL_ONLY_DIR = 'tierA-eval50-wristmismatch'  # isg_tier_a.py --goal-mismatch-views on the W checkpoints, apart from tierA-eval50
 DETACH_LABELS = {'W': 'W wrist', 'D': 'D wrist, goal gradient stopped', 'C': 'C random wrist',
                  'R': 'R random wrist, goal gradient stopped', 'H': 'H head-only'}
 
@@ -110,6 +111,24 @@ def detach_reading(values, delta=DELTA):
     return label, f'{text} {per_seed}. Secondary, the cost of random wrist inputs: {secondary}.'
 
 
+def evaluation_only_look(runs_root):
+    """The W checkpoints probed with mismatched wrist goals at evaluation only (isg_tier_a.py --goal-mismatch-views)."""
+    parts = []
+    for seed, runs in DETACH_RUNS.items():
+        path = Path(runs_root) / runs['W'] / EVAL_ONLY_DIR / f'step_{DETACH_STEP:08d}.json'
+        mismatched = metric(json.loads(path.read_text()), RELOC, 'L1_own') if path.exists() else None
+        own, head = (metric(tier_a(runs_root, runs[k], DETACH_STEP), RELOC, 'L1_own') for k in ('W', 'H'))
+        if mismatched is not None and own is not None and head is not None:
+            parts.append(f's{seed}: W {own:.4f} with its own wrist goals, {mismatched:.4f} with mismatched ones '
+                         f'({mismatched - own:+.4f}); H {head:.4f}')
+    if not parts:
+        return 'Evaluation-only first look (W probed with mismatched wrist goals): not run yet.'
+    return ('Evaluation-only first look (W checkpoints probed with wrist goals from another held-out episode, head goal '
+            'kept; held-out relocalization L1_own at 100k): ' + '; '.join(parts) + '. Caveat: a model trained on real wrist '
+            'goals may also suffer from mismatched ones as a distribution shift, so only a small rise is clean evidence '
+            'against wrist content.')
+
+
 def detach_section(runs_root):
     """The 2x2 follow-up (lines, final plan-log text or None while a final result is missing)."""
     lines = ['### Follow-up: wrist goals kept real, goal-filter training removed (from 2026-10-08)', '',
@@ -132,6 +151,7 @@ def detach_section(runs_root):
             row = [metric(tier_a(runs_root, runs[k], s), RELOC, 'L1_own') for s in steps]
             lines.append(f'| s{seed} | {k} `{runs[k]}` | ' + ' | '.join('—' if v is None else f'{v:.4f}' for v in row) + ' |')
     lines.append('')
+    lines += [evaluation_only_look(runs_root), '']
     if any(v is None for finals in values.values() for v in finals.values()):
         lines.append('Follow-up reading: pending (every final result is needed).')
         return lines, None
