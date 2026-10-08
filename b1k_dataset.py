@@ -35,6 +35,7 @@ OBS_KEYS = [f'robot_r1::robot_r1:{camera}:Camera:0::rgb' for camera in CAMERAS]
 #   goal_key     -- a dedicated goal video stream shipped by the dataset (`observation.goal_rgb.<camera>_camera_0`,
 #                   static per episode, as in the radio skill-segment datasets).
 GOAL_SOURCES = ('episode_last', 'goal_key')
+GOAL_MISMATCH_STREAM = 0x6D69736D  # last SeedSequence word of goal-mismatch draws: their own stream, apart from sampling
 GOAL_VIDEO_KEYS = {camera: f'observation.goal_rgb.{camera}_camera_0' for camera in CAMERAS}
 # Wire keys of goal images in serving requests: `goal::` + the camera's observation key.
 GOAL_OBS_KEYS = {camera: f'goal::{key}' for camera, key in zip(CAMERAS, OBS_KEYS)}
@@ -292,17 +293,28 @@ class B1KDataset(torch.utils.data.Dataset):
     cover the kept frames only, while `episode_last` goals stay the last recorded frame.
 
     `gripper_state` (see GRIPPER_STATES) selects the proprioception layout of `qpos` and of the statistics.
+
+    `goal_mismatch_views` (a subset of `goal_views`; the wrist-goal control) makes those views show the goal images
+    of another episode of the same task, drawn uniformly for every sample (`mismatch_partner`, keyed on
+    `goal_mismatch_seed` and the sample's (step, slot) from `StepBatchSampler(tag=True)`); the other views keep the
+    sample's own goals. Samples are then indexed `(index, step, slot)`.
     """
     def __init__(self, dataset_path, task_names=None, chunk_size=100, image_size=(240, 240),
                  cache_row_groups=2, video_cache_size=3, timestamp_tolerance=0.008, profile_reads=False,
                  frame_cache=None, goal_views=(), goal_source='episode_last', task_onehot=True, episodes=None,
-                 settle_steps='all', gripper_state='sum'):
+                 settle_steps='all', gripper_state='sum', goal_mismatch_views=(), goal_mismatch_seed=0):
         if gripper_state not in GRIPPER_STATES:
             raise ValueError(f'Unknown gripper_state {gripper_state!r}; expected one of {GRIPPER_STATES}')
         self.gripper_state = gripper_state
         self.root = Path(dataset_path).resolve()
         self.goal_views = list(goal_views or [])
         self.goal_camera_indices = goal_views_to_indices(self.goal_views)
+        self.goal_mismatch_views = list(goal_mismatch_views or [])
+        if len(set(self.goal_mismatch_views)) != len(self.goal_mismatch_views) or \
+                not set(self.goal_mismatch_views) <= set(self.goal_views):
+            raise ValueError(f'goal_mismatch_views {self.goal_mismatch_views} must be distinct goal views of {self.goal_views}')
+        self.goal_mismatch_slots = [self.goal_views.index(view) for view in self.goal_mismatch_views]
+        self.goal_mismatch_seed = int(goal_mismatch_seed)
         if goal_source not in GOAL_SOURCES:
             raise ValueError(f'goal_source must be one of {GOAL_SOURCES}, got {goal_source!r}')
         self.goal_source = goal_source
@@ -436,6 +448,13 @@ class B1KDataset(torch.utils.data.Dataset):
                         self.frame_cache.cache_root, len(self), len(VIDEO_KEYS), list(self.image_size), len(self))
         if self.goal_views:
             self._build_goal_table()
+        self.task_positions = {}
+        if self.goal_mismatch_slots:
+            for position, ep in enumerate(self.episodes):
+                self.task_positions.setdefault(int(ep['task_index']), []).append(position)
+            alone = sorted(self.task_map[t] for t, positions in self.task_positions.items() if len(positions) < 2)
+            if alone:
+                raise ValueError(f'goal_mismatch_views need two or more episodes per task; {alone} have one')
 
     def _goal_frame(self, ep, camera_index):
         """Decode one goal image for an episode/view: uint8 (H, W, 3) at the training image size.
@@ -482,11 +501,31 @@ class B1KDataset(torch.utils.data.Dataset):
         LOGGER.info('Goal table (%s): %d episodes x %d views at %s in %.1fs', self.goal_source, len(self.episodes),
                     len(self.goal_views), list(self.image_size), time.perf_counter() - started)
 
-    def goal_for(self, position):
-        """uint8 tensor (views, H, W, 3) of the goal images of the episode at `position` (empty without goal views)."""
+    def goal_for(self, position, draw=None):
+        """uint8 tensor (views, H, W, 3) of the goal images of the episode at `position` (empty without goal views).
+
+        With `goal_mismatch_views` and a `draw` key (training: the sample's (step, slot)), those views show the goals
+        of `mismatch_partner(position, *draw)`."""
         if self.goal_table is None:
             return torch.empty((0, *self.image_size, 3), dtype=torch.uint8)
-        return torch.from_numpy(self.goal_table[position])
+        if draw is None or not self.goal_mismatch_slots:
+            return torch.from_numpy(self.goal_table[position])
+        return self.goal_with_partner(position, self.mismatch_partner(position, *draw))
+
+    def goal_with_partner(self, position, partner):
+        """The goals of the episode at `position`, with its `goal_mismatch_views` taken from the episode at `partner`."""
+        goals = self.goal_table[position].copy()
+        goals[self.goal_mismatch_slots] = self.goal_table[partner][self.goal_mismatch_slots]
+        return torch.from_numpy(goals)
+
+    def mismatch_partner(self, position, *key):
+        """Position of an episode of the same task other than `position`, uniform over them, from the random stream
+        SeedSequence([goal_mismatch_seed, *key, GOAL_MISMATCH_STREAM]), which no other draw uses."""
+        candidates = self.task_positions[int(self.episodes[position]['task_index'])]
+        rng = np.random.default_rng(np.random.SeedSequence([self.goal_mismatch_seed, *map(int, key), GOAL_MISMATCH_STREAM]))
+        choice = int(rng.integers(len(candidates) - 1))
+        own = candidates.index(position)
+        return candidates[choice + (choice >= own)]
 
     def data_path(self, ep):
         return self.root / self.info['data_path'].format(chunk_index=ep['data/chunk_index'],
@@ -677,7 +716,7 @@ class B1KDataset(torch.utils.data.Dataset):
             self._frame_rows = rows
         return self._table
 
-    def _cached_sample(self, position, frame):
+    def _cached_sample(self, position, frame, draw=None):
         ep = self.episodes[position]
         table = self._ensure_table()
         begin = time.perf_counter() if self.profile_reads else 0
@@ -697,30 +736,36 @@ class B1KDataset(torch.utils.data.Dataset):
             self._read_timings = {'data/parquet_s': middle - begin, 'data/video_decode_s': 0.0,
                                   'data/frame_cache_s': time.perf_counter() - middle}
         return (torch.from_numpy(images), qpos, torch.from_numpy(actions.astype(np.float32)), torch.from_numpy(is_pad),
-                self.goal_for(position), torch.tensor(int(ep['task_index']), dtype=torch.int64))
+                self.goal_for(position, draw), torch.tensor(int(ep['task_index']), dtype=torch.int64))
 
-    def sample_at(self, episode_id, frame):
+    def sample_at(self, episode_id, frame, draw=None):
+        """Normalized sample of one frame; `draw` is the goal-mismatch key (see `goal_for`), None for own goals."""
         if self.stats is None:
             raise RuntimeError('Set dataset.stats before requesting normalized samples')
         if self.frame_cache is not None:
             ep = self.by_id[episode_id]
             if not 0 <= frame < ep['length']:
                 raise IndexError(f'Frame {frame} outside episode {episode_id}')
-            return self._cached_sample(self.positions[int(episode_id)], frame)
+            return self._cached_sample(self.positions[int(episode_id)], frame, draw)
         images, state, actions, is_pad, task_id = self.raw_sample(episode_id, frame)
         image = torch.stack([preprocess_image(x, self.image_size) for x in images])
         qpos = preprocess_state(state, task_id, self.stats, self.task_map, self.task_onehot,
                                 gripper_state=self.gripper_state)
         actions = (actions - np.asarray(self.stats['action_mean'])) / np.asarray(self.stats['action_std'])
         return (image, qpos, torch.from_numpy(actions.astype(np.float32)), torch.from_numpy(is_pad),
-                self.goal_for(self.positions[int(episode_id)]), torch.tensor(int(task_id), dtype=torch.int64))
+                self.goal_for(self.positions[int(episode_id)], draw), torch.tensor(int(task_id), dtype=torch.int64))
 
     def __getitem__(self, index):
+        draw = None
+        if isinstance(index, tuple):  # (index, step, slot) from StepBatchSampler(tag=True)
+            index, draw = index[0], index[1:]
+        elif self.goal_mismatch_slots:
+            raise ValueError('goal_mismatch_views need (index, step, slot) samples: use StepBatchSampler(tag=True)')
         if index < 0 or index >= len(self):
             raise IndexError(index)
         begin = time.perf_counter() if self.profile_reads else 0
         pos = int(np.searchsorted(self.ends, index, side='right'))
-        sample = self.sample_at(self.episodes[pos]['episode_index'], int(index - self.starts[pos]))
+        sample = self.sample_at(self.episodes[pos]['episode_index'], int(index - self.starts[pos]), draw)
         if self.profile_reads:
             return (*sample, {**self._read_timings, 'data/sample_s': time.perf_counter() - begin})
         return sample
@@ -807,17 +852,20 @@ class SplitBatchSampler:
 
 
 class StepBatchSampler:
-    """Episode-uniform ACT sampling without a full-frame permutation or worker RNG."""
-    def __init__(self, dataset, batch_size, start_step, max_steps, seed):
+    """Episode-uniform ACT sampling without a full-frame permutation or worker RNG.
+
+    `tag=True` yields (index, step, slot) instead of index (the same indices), the key of goal-mismatch draws."""
+    def __init__(self, dataset, batch_size, start_step, max_steps, seed, tag=False):
         self.dataset, self.batch_size = dataset, batch_size
-        self.start_step, self.max_steps, self.seed = start_step, max_steps, seed
+        self.start_step, self.max_steps, self.seed, self.tag = start_step, max_steps, seed, tag
 
     def __iter__(self):
         for step in range(self.start_step, self.max_steps):
             rng = np.random.default_rng(np.random.SeedSequence([self.seed, step]))
             episodes = rng.integers(len(self.dataset.episodes), size=self.batch_size)
             frames = [int(rng.integers(self.dataset.lengths[ep])) for ep in episodes]
-            yield [int(self.dataset.starts[ep]) + frame for ep, frame in zip(episodes, frames)]
+            indices = [int(self.dataset.starts[ep]) + frame for ep, frame in zip(episodes, frames)]
+            yield [(index, step, slot) for slot, index in enumerate(indices)] if self.tag else indices
 
     def __len__(self):
         return self.max_steps - self.start_step

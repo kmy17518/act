@@ -53,6 +53,7 @@ COORD = Path('/tmp/dev/coord')
 PLAN = Path('/tmp/dev/docs/isg-goal-conditioning-plan.md')
 REPORT = Path('/tmp/dev/report.md')
 SPEC = Path('/tmp/dev/docs/isg-correction-data-spec.md')
+WRIST_BEGIN, WRIST_END = '<!-- wrist-control:begin -->', '<!-- wrist-control:end -->'
 CALIBRATION_REFERENCE, CALIBRATION_TOLERANCE = 0.12560, 0.003
 STALE = timedelta(hours=1)
 # lab/instances.json: a mapping counts as verified when its first head frame matches the test episode's first frame to
@@ -633,6 +634,18 @@ class Collector:
         self.state = read_json(self.state_path) or {'recorded': [], 'uploaded': {}, 'lab_trusted': False}
         self.decisions, self.escalations, self.first_frame_diffs = [], [], []
         self.github, self.local_runs = {}, set()
+        self.wrist_control_final = None
+
+    def log_plan(self, key, area, decision, evidence, floor):
+        """Append one row to the plan's decision log only (no m1/decisions.md entry), once per key."""
+        if key in self.state['recorded']:
+            return False
+        plan = PLAN.read_text()
+        with PLAN.open('a') as stream:
+            stream.write(('' if plan.endswith('\n') else '\n') + f'| {iso(utc_now())[:10]} | {area} | {decision} | {evidence} | {floor} |\n')
+        self.state['recorded'].append(key)
+        self.decisions.append(f'plan log: {decision[:80]}')
+        return True
 
     def decide(self, key, audience, lines, log_line):
         """Append a decision once (keyed) to m1/decisions.md and the plan's decision log, unless it names commits or runs
@@ -1024,8 +1037,14 @@ class Collector:
 
     def render_report(self, coord_text, manifests):
         from isg_report import BEGIN, END, render
+        from isg_wristshuf import render as wrist_control
         text = REPORT.read_text()
         sections = [(coord_text, '<!-- coord:begin -->', '<!-- coord:end -->', 'top')]
+        try:
+            body, self.wrist_control_final = wrist_control(manifests[0]['runs_root'])
+        except Exception as exc:  # keep the cycle alive; show the failure in the report
+            body, self.wrist_control_final = f'_Wrist-goal control section failed: {type(exc).__name__}: {exc}_', None
+        sections.append((f'{WRIST_BEGIN}\n{body}\n{WRIST_END}', WRIST_BEGIN, WRIST_END, 'after-coord'))
         for manifest, path in zip(manifests, self.manifest_paths):
             begin, end = (BEGIN, END) if path.stem == 'wave1' else (f'<!-- isg-runs-{path.stem}:begin -->', f'<!-- isg-runs-{path.stem}:end -->')
             try:
@@ -1038,6 +1057,9 @@ class Collector:
         for body, begin, end, place in sections:
             if begin in text and end in text:
                 text = text[:text.index(begin)] + body + text[text.index(end) + len(end):]
+            elif place == 'after-coord' and '<!-- coord:end -->' in text:
+                at = text.index('<!-- coord:end -->') + len('<!-- coord:end -->')
+                text = text[:at] + '\n\n' + body + text[at:]
             elif place == 'top':
                 first, _, rest = text.partition('\n')
                 text = first + '\n\n' + body + '\n\n' + rest
@@ -1101,6 +1123,9 @@ class Collector:
         lab_hours = self.lab_load(queue, rows, manifests, read_json(self.inbox / 'lab/env.json'))
         self.render_report(self.coord_section(now, m2, lab, health, calibration_text, kill_rows, trust, queue, rows,
                                               self.comparisons(rows, valid), copied, execution, lab_hours, push_line), manifests)
+        if self.wrist_control_final:
+            self.log_plan('wrist-control:final', 'wrist-goal control', self.wrist_control_final,
+                          'held-out Tier A at the final steps; docs/report.md "Wrist-goal control"', 'relocalization L1_own δ = 0.0066')
         uploaded = self.upload()
         self.save()
         print(json.dumps({'event': 'cycle', 'at': iso(now), 'copied': len(copied), 'queued': added, 'decisions': self.decisions,

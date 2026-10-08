@@ -343,6 +343,73 @@
         "--goal-fusion-depth",
         "3"
       ]
+    },
+    {
+      "name": "w2-early-wristshuf-lrg1e-3-s0",
+      "machine": "M1",
+      "gpu": 2,
+      "cores": "48-71",
+      "seed": 0,
+      "role": "wrist-goal control: flags of w2-early-wrist-lrg1e-3-s0 plus --goal-mismatch-views on both wrists (their goals come from another training episode of the same task, drawn per sample); head goal, frames, batches and initialization as w2-early-wrist-lrg1e-3-s0; offline only (no tierB), four tasks, 50k",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--goal-views",
+        "zed_link",
+        "left_realsense_link",
+        "right_realsense_link",
+        "--goal-mismatch-views",
+        "left_realsense_link",
+        "right_realsense_link"
+      ]
+    },
+    {
+      "name": "w2-early-wristshuf-lrg1e-3-s1",
+      "machine": "M1",
+      "gpu": 2,
+      "cores": "48-71",
+      "seed": 1,
+      "role": "wrist-goal control: flags of w2-early-wrist-lrg1e-3-s1 plus --goal-mismatch-views on both wrists (their goals come from another training episode of the same task, drawn per sample); head goal, frames, batches and initialization as w2-early-wrist-lrg1e-3-s1; offline only (no tierB), four tasks, 50k",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--goal-views",
+        "zed_link",
+        "left_realsense_link",
+        "right_realsense_link",
+        "--goal-mismatch-views",
+        "left_realsense_link",
+        "right_realsense_link"
+      ],
+      "after": "w2-early-wristshuf-lrg1e-3-s0"
+    },
+    {
+      "name": "w2-early-wrist-lrg1e-3-s1",
+      "machine": "M1",
+      "gpu": 3,
+      "cores": "72-95",
+      "seed": 1,
+      "role": "head + wrist pairing, seed 1: the second four-task wrist seed (machine 1); offline only (no tierB)",
+      "flags": [
+        "--goal-fusion",
+        "early",
+        "--goal-stem-init",
+        "copy:0.5",
+        "--lr-goal",
+        "1e-3",
+        "--goal-views",
+        "zed_link",
+        "left_realsense_link",
+        "right_realsense_link"
+      ]
     }
   ]
 }

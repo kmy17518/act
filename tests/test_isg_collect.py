@@ -258,6 +258,34 @@ def test_decisions_naming_unpushed_runs_are_held(setup, monkeypatch):
     assert 'contains machine 1\'s HEAD' in report.read_text()
 
 
+def test_wrist_control_reading_and_section(setup):
+    import isg_wristshuf as w
+    d = w.DELTA
+    assert w.reading({0: (0.085, 0.066, 0.068), 1: (0.088, 0.076, 0.079)})[0] == 'not wrist content'
+    assert w.reading({0: (0.085, 0.066, 0.083), 1: (0.088, 0.076, 0.090)})[0] == 'wrist content'
+    assert w.reading({0: (0.085, 0.066, 0.085 + d + 0.001), 1: (0.088, 0.076, 0.079)})[0] == 'inconclusive'
+    assert w.reading({0: (0.085, 0.066, 0.068), 1: (0.088, 0.076, 0.086)})[0] == 'mixed'
+    collector, inbox, runs, report, coord = setup
+    collector.cycle()
+    text = report.read_text()
+    assert '<!-- wrist-control:begin -->' in text and 'Reading: pending' in text
+    assert text.index('<!-- coord:end -->') < text.index('<!-- wrist-control:begin -->') < text.index('body')
+    values = {'single-task': {0: (0.085, 0.066, 0.068), 1: (0.088, 0.076, 0.078)}}
+    for study, spec in w.STUDIES.items():
+        for seed, roles in spec['runs'].items():
+            for role, run in roles.items():
+                l1 = values.get(study, {}).get(seed, (0.09, 0.08, 0.081))[w.ROLES.index(role)]
+                tasks = {task: {'L1_own': l1, 'gap': 0.02 + 0.01 * w.ROLES.index(role)} for task in w.TASKS}
+                write(runs / run / 'tierA-eval50' / f'step_{spec["step"]:08d}.json', {'heldout': {'tasks': tasks}})
+    collector.cycle()
+    text, plan = report.read_text(), isg_collect.PLAN.read_text()
+    assert text.count('<!-- wrist-control:begin -->') == 1 and 'Reading (single-task, primary): not wrist content' in text
+    assert 'Wrist-goal control, final reading (single-task, primary): not wrist content' in plan
+    collector.cycle()
+    assert isg_collect.PLAN.read_text().count('final reading') == 1
+    assert 'Wrist-goal control' not in (coord / 'm1/decisions.md').read_text()
+
+
 def test_failed_replay_pauses_the_queue(setup):
     collector, inbox, runs, report, coord = setup
     for split, eps in (('eval50', (2, 3)), ('train', (39,))):

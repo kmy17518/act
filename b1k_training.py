@@ -101,6 +101,8 @@ def load_checkpoint(path):
     goal = goal_config(checkpoint['model_config'])
     if adapter.get('goal_views', []) != goal['goal_views'] or adapter.get('goal_source', 'episode_last') not in GOAL_SOURCES:
         raise ValueError('Checkpoint goal views/source do not match its model configuration')
+    if not set(adapter.get('goal_mismatch_views', [])) <= set(goal['goal_views']):
+        raise ValueError('Checkpoint goal mismatch views are not goal views')
     language_embedding_table(checkpoint['model_config'], checkpoint['task_map'], checkpoint.get('language_cache'))
     return checkpoint
 
@@ -531,7 +533,7 @@ def conditioning_record(model_config, adapter, dataset, root, episode_split=None
     goal = goal_config(model_config)
     language = language_mode(model_config)
     regime = model_config.get('regime')
-    return {
+    record = {
         'regime': regime, 'source_commit': source_commit(), 'dataset_root': str(root),
         'task_map': dataset.task_map, 'episodes': len(dataset.episodes), 'frames': len(dataset),
         'data_split': episode_split['subset'] if episode_split else 'all',
@@ -560,6 +562,10 @@ def conditioning_record(model_config, adapter, dataset, root, episode_split=None
         'pretrained_encoder': 'torchvision_resnet18_IMAGENET1K_V1' if model_config.get('pretrained_backbone', True) else None,
         'auxiliary_pose_weight': 0.0, 'guidance_scale': 1.0,
     }
+    if adapter.get('goal_mismatch_views'):
+        record['goal'].update(mismatch_views=list(adapter['goal_mismatch_views']),
+                              mismatch_policy='other_episode_same_task_uniform_per_sample')
+    return record
 
 
 def resolve_regime(args):
@@ -613,6 +619,19 @@ def resolve_regime(args):
         LOGGER.warning('--task-onehot with --regime %s: the task id enters the state; this is a task-ID experiment, '
                        'not the plain %s condition', args.regime, args.regime)
     validate_goal_mechanism(args)
+
+
+def validate_goal_mismatch(args):
+    """--goal-mismatch-views (fresh runs): distinct goal views of an episode-last goal run, never all of them."""
+    views = list(args.goal_mismatch_views or [])
+    if not views:
+        return
+    if len(set(views)) != len(views) or not set(views) <= set(args.goal_views or []):
+        raise ValueError(f'--goal-mismatch-views {views} must be distinct views of --goal-views {args.goal_views}')
+    if set(views) == set(args.goal_views):
+        raise ValueError('--goal-mismatch-views must leave at least one goal view with its own episode\'s goal')
+    if args.goal_source != 'episode_last':
+        raise ValueError('--goal-mismatch-views needs --goal-source episode_last')
 
 
 def validate_goal_mechanism(args):
@@ -714,6 +733,11 @@ def parser():
                         'spatial tokens appended to the transformer encoder memory with a learned goal identity)')
     p.add_argument('--goal-views', nargs='+', choices=CAMERAS, default=None, action=LanguageOption,
                    help='Cameras whose goal image is supplied (default: zed_link, the head camera, with --goal-fusion)')
+    p.add_argument('--goal-mismatch-views', nargs='+', choices=CAMERAS, default=None, action=LanguageOption,
+                   metavar='CAMERA', help='Control: these goal views (a subset of --goal-views) show the last frames of '
+                   'another training episode of the same task, drawn uniformly for every sample from a separate random '
+                   'stream keyed on (seed, step, slot); sampling, batch order and initialization stay those of the run '
+                   'without it. Episode-last goals only; saved in the adapter config and applied by Tier A')
     p.add_argument('--goal-source', choices=list(GOAL_SOURCES), default='episode_last', action=LanguageOption,
                    help='episode_last: last frame of the episode\'s own camera stream (any LeRobot v3 root); goal_key: '
                         'the dataset\'s observation.goal_rgb.<camera>_camera_0 stream (saved in the adapter config)')
@@ -877,6 +901,10 @@ def _train(args, output, root, resources):
         if getattr(args, '_goal_source_explicit', False) and args.goal_source != saved_source:
             raise ValueError('--goal-source differs from checkpoint')
         args.goal_source = saved_source
+        saved_mismatch = list(adapter.get('goal_mismatch_views', []))
+        if getattr(args, '_goal_mismatch_views_explicit', False) and list(args.goal_mismatch_views or []) != saved_mismatch:
+            raise ValueError('--goal-mismatch-views differs from checkpoint')
+        args.goal_mismatch_views = saved_mismatch
         saved_tasks = list(checkpoint['task_map'].values())
         if task_names and set(task_names) != set(saved_tasks):
             raise ValueError(f'--task-names {args.task_names} select {task_names}, but the checkpoint trained on '
@@ -899,6 +927,7 @@ def _train(args, output, root, resources):
         args.gripper_state = saved_gripper
     else:
         resolve_regime(args)
+        validate_goal_mismatch(args)
         image_size = args.image_size or ([240, 240] if args.policy_class == 'ACT' else [480, 640])
         if args.policy_class == 'CNNMLP' and (args.pre_norm or args.position_embedding != 'sine'):
             raise ValueError('Position embeddings and pre-norm are ACT architecture options; CNNMLP does not use them')
@@ -925,6 +954,8 @@ def _train(args, output, root, resources):
                                        for view in args.goal_views],
                    'goal_observation_keys': [GOAL_OBS_KEYS[view] for view in args.goal_views],
                    'goal_image_normalization': 'same_as_cameras' if args.goal_views else None}
+        if args.goal_mismatch_views:
+            adapter['goal_mismatch_views'] = list(args.goal_mismatch_views)
         episode_split = resolve_episode_split(root, args.episode_split, task_names)
         task_names = episode_split['tasks'] if episode_split else task_names
         model_config = {'policy_class': args.policy_class,
@@ -972,7 +1003,8 @@ def _train(args, output, root, resources):
                          frame_cache=args.frame_cache.resolve() if args.frame_cache else None,
                          goal_views=goal['goal_views'], goal_source=adapter.get('goal_source', 'episode_last'),
                          task_onehot=task_onehot, episodes=episode_split['episodes'] if episode_split else None,
-                         settle_steps=args.settle_steps, gripper_state=adapter.get('gripper_state', 'fingers'))
+                         settle_steps=args.settle_steps, gripper_state=adapter.get('gripper_state', 'fingers'),
+                         goal_mismatch_views=adapter.get('goal_mismatch_views', []), goal_mismatch_seed=args.seed)
     resources.callback(dataset.close)
     if checkpoint and dataset.task_map != checkpoint['task_map']:
         raise ValueError('Resume task map differs from checkpoint')
@@ -1040,6 +1072,8 @@ def _train(args, output, root, resources):
     if args.max_steps <= start:
         raise ValueError(f'--max-steps must exceed resumed step {start}')
     train_config = {key: value for key, value in vars(args).items() if not key.startswith('_')}
+    if not train_config.get('goal_mismatch_views'):
+        train_config.pop('goal_mismatch_views', None)  # runs without the control keep their earlier train config
     train_config['resume'] = str(args.resume) if args.resume else None
     train_config['frame_cache'] = str(args.frame_cache) if args.frame_cache else None
     run = {'model_config': model_config, 'adapter_config': adapter, 'train_config': train_config,
@@ -1051,7 +1085,11 @@ def _train(args, output, root, resources):
     atomic_json(run, output / ('resume_run.json' if checkpoint else 'run.json'))
     if tracked:
         tracked.config.update(run, allow_val_change=True)
-    sampler = StepBatchSampler(dataset, args.batch_size, start, args.max_steps, args.seed)
+    sampler = StepBatchSampler(dataset, args.batch_size, start, args.max_steps, args.seed,
+                               tag=bool(dataset.goal_mismatch_slots))
+    if dataset.goal_mismatch_slots:
+        LOGGER.info('Goal mismatch control: views %s show another episode of the same task, drawn per sample '
+                    '(seed %d, step, slot)', dataset.goal_mismatch_views, args.seed)
     loader_kwargs = {'num_workers': args.num_workers, 'pin_memory': device.type == 'cuda',
                      'generator': torch.Generator().manual_seed(args.seed)}
     if args.num_workers:

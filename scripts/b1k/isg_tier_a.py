@@ -15,6 +15,11 @@ and reports, in normalized action units:
   swap       mean over frames of the largest |(d) - (a)| over the valid chunk (does it know which image is the goal)
 Frame selection, the other-goal draw and the subsets are deterministic in the seed, so checkpoints compare paired.
 
+A checkpoint trained with `--goal-mismatch-views` (the wrist-goal control) gets the same rule here: those views show
+the goal images of another episode of the same task and subset, drawn per frame from a separate stream of the seed
+(frames and the other-goal draw stay those of every other checkpoint), in both (a) and (b), so the gap measures the
+reliance on the remaining (head) goal.
+
 `--heldout-dataset ROOT` takes the held-out episodes from a separate LeRobot root (the test set kmy17518/isg-init-eval,
 collected on instances no training demo uses), listed by its `isg_meta/eval_split.json` (or `--split`). Tasks are
 matched by name (the root has its own task indices), its frames are decoded from video and rounded to uint8 exactly
@@ -35,7 +40,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from b1k_dataset import CAMERAS, B1KDataset, quantize_image  # noqa: E402
+from b1k_dataset import CAMERAS, GOAL_MISMATCH_STREAM, B1KDataset, quantize_image  # noqa: E402
 from b1k_language import language_embedding_table, language_for_tasks  # noqa: E402
 from b1k_training import goal_config, load_checkpoint, make_policy, prepare_goals, prepare_images  # noqa: E402
 
@@ -88,6 +93,7 @@ class Probe:
         embeddings = language_embedding_table(self.config, self.task_map, checkpoint.get('language_cache'))
         self.embeddings = embeddings.to(self.device) if embeddings is not None else None
         self.cameras = [CAMERAS.index(view) for view in self.goal['goal_views']]
+        self.mismatch_views = list(self.adapter.get('goal_mismatch_views', []))
 
     def predict(self, qpos, images, goal, task_id, goal_valid=None):
         kwargs = {}
@@ -108,14 +114,22 @@ class Probe:
         return torch.from_numpy(np.stack([quantize_image(image) for image in images]))
 
     @torch.no_grad()
-    def evaluate(self, dataset, frames, others):
+    def evaluate(self, dataset, frames, others, partners=None):
+        """Per-frame metrics; `partners` (goal-mismatch checkpoints) supply the mismatched views' goals for (a) and (b)."""
         rows = []
         task_ids = self.checkpoint_task_ids(dataset)
+        positions = dataset.positions
         for start in range(0, len(frames), self.batch_size):
             chunk = list(zip(frames[start:start + self.batch_size], others[start:start + self.batch_size]))
             samples = [dataset.sample_at(episode, frame) for (episode, frame), _ in chunk]
-            other_goals = [dataset.goal_for(dataset.positions[other if other is not None else episode])
+            other_goals = [dataset.goal_for(positions[other if other is not None else episode])
                            for (episode, _), other in chunk]
+            if partners is not None:
+                mates = [positions[partner] for partner in partners[start:start + self.batch_size]]
+                own_goals = [dataset.goal_with_partner(positions[episode], mate) for ((episode, _), _), mate in zip(chunk, mates)]
+                other_goals = [dataset.goal_with_partner(positions[other if other is not None else episode], mate)
+                               for ((episode, _), other), mate in zip(chunk, mates)]
+                samples = [(*s[:4], goal, s[5]) for s, goal in zip(samples, own_goals)]
             images = prepare_images(torch.stack([self.frames_uint8(s[0]) for s in samples]).to(self.device))
             qpos = torch.stack([torch.as_tensor(s[1]) for s in samples]).float().to(self.device)
             actions = torch.stack([s[2] for s in samples]).to(self.device)[:, :self.policy.model.num_queries]
@@ -205,7 +219,8 @@ def run(args):
                              frame_cache=Path(cache).resolve() if cache else None,
                              goal_views=goal['goal_views'], goal_source=adapter.get('goal_source', 'episode_last'),
                              task_onehot=adapter.get('task_conditioning', 'onehot') == 'onehot', episodes=episodes,
-                             settle_steps=settle, gripper_state=adapter.get('gripper_state', 'fingers'))
+                             settle_steps=settle, gripper_state=adapter.get('gripper_state', 'fingers'),
+                             goal_mismatch_views=probe.mismatch_views)
         dataset.stats = checkpoint['normalization']
         return dataset
 
@@ -219,6 +234,10 @@ def run(args):
                         'split_sha256': hashlib.sha256(split_path.read_bytes()).hexdigest(),
                         'heldout_dataset': str(heldout_root), 'settle_steps': settle, 'device': str(args.device),
                         'probe_commit': None}}
+    if probe.mismatch_views:
+        result['goal']['goal_mismatch_views'] = probe.mismatch_views
+        result['probe']['goal_mismatch'] = ('mismatched views show another episode of the same task and subset in the '
+                                            'own- and other-goal conditions, drawn per frame with the seed')
     for subset in ('heldout', 'train'):
         if subset == 'heldout':
             lists = {task: held_out[task] for task in tasks if task in held_out}
@@ -242,10 +261,14 @@ def run(args):
         for index, task in enumerate(tasks):
             if task not in lists:
                 continue
-            rng = np.random.default_rng(np.random.SeedSequence([args.seed, index, 0 if subset == 'heldout' else 1]))
+            key = [args.seed, index, 0 if subset == 'heldout' else 1]
+            rng = np.random.default_rng(np.random.SeedSequence(key))
             frames = stratified_frames(dataset, sorted(lists[task]), args.frames_per_task, rng)
             others = other_episodes(frames, sorted(lists[task]), rng)
-            per_task[task] = dict(summarize(probe.evaluate(dataset, frames, others)), episodes=len(lists[task]))
+            partners = (other_episodes(frames, sorted(lists[task]),
+                                       np.random.default_rng(np.random.SeedSequence([*key, GOAL_MISMATCH_STREAM])))
+                        if probe.mismatch_views else None)
+            per_task[task] = dict(summarize(probe.evaluate(dataset, frames, others, partners)), episodes=len(lists[task]))
         dataset.close()
         result[subset] = {'tasks': per_task, 'mean': task_mean(per_task)}
     result['probe']['seconds'] = round(time.monotonic() - started, 1)
