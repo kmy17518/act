@@ -510,6 +510,11 @@ def evaluate_validation(policy, val_dataset, val_batches, val_batch_size, langua
     inf_error = 0.0
     inf_valid = 0
     n_batches = 0
+    # Multi-family runs also report val/l1/<family> and val/inference_l1/<family> (family = task name before the
+    # first '-'), each the mean over that family's valid action elements.
+    family_of = {int(task): str(name).split('-')[0] for task, name in task_map.items()}
+    per_family = hasattr(policy, 'l1_normalization') and len(set(family_of.values())) > 1
+    families = {}
     try:
         policy.eval()
         torch.manual_seed(seed)
@@ -525,7 +530,10 @@ def evaluate_validation(policy, val_dataset, val_batches, val_batch_size, langua
                 if goal is not None:
                     kwargs['goal'] = goal
                 with autocast():
-                    losses = policy(qpos, images, actions, is_pad, **kwargs)
+                    if per_family:
+                        losses, terms = policy(qpos, images, actions, is_pad, l1_terms=True, **kwargs)
+                    else:
+                        losses = policy(qpos, images, actions, is_pad, **kwargs)
                     prediction = policy(qpos, images, **kwargs)
                 for key, value in losses.items():
                     val = float(value.detach())
@@ -537,8 +545,16 @@ def evaluate_validation(policy, val_dataset, val_batches, val_batch_size, langua
                     target = actions[:, :queries]
                     valid = ~is_pad[:, :queries]
                     mask = valid.unsqueeze(-1).float()
-                    inf_error += float(((prediction.float() - target.float()).abs() * mask).sum())
+                    inf_per_sample = ((prediction.float() - target.float()).abs() * mask).sum((1, 2))
+                    inf_error += float(inf_per_sample.sum())
                     inf_valid += int(valid.sum()) * target.shape[-1]
+                    if per_family:
+                        for task, l1_sum, inf_sum, count in zip(task_id.tolist(), terms['l1_sum'].tolist(),
+                                                                inf_per_sample.tolist(), terms['l1_count'].tolist()):
+                            family = families.setdefault(family_of[int(task)], [0.0, 0.0, 0])
+                            family[0] += l1_sum
+                            family[1] += inf_sum
+                            family[2] += count
                 else:
                     target = actions[:, 0]
                     inf_error += float((prediction.float() - target.float()).abs().sum())
@@ -555,6 +571,9 @@ def evaluate_validation(policy, val_dataset, val_batches, val_batch_size, langua
     if 'val/l1' not in metrics and 'val/mse' in metrics:
         metrics['val/l1'] = inf_error / max(1, inf_valid)
     metrics['val/inference_l1'] = inf_error / max(1, inf_valid)
+    for family, (l1_sum, inf_sum, count) in sorted(families.items()):
+        metrics[f'val/l1/{family}'] = l1_sum / max(1, count)
+        metrics[f'val/inference_l1/{family}'] = inf_sum / max(1, count)
     metrics['timing/val_s'] = time.monotonic() - started
     return metrics
 
@@ -1186,6 +1205,8 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                         'goal_fusion_depth': int(args.goal_fusion_depth),
                         **({'goal_detach_views': list(args.goal_detach_views)} if args.goal_detach_views else {}),
                         'dilation': False, 'masks': False, 'action_dim': 23}
+        if args.policy_class == 'ACT':
+            model_config['l1_normalization'] = 'valid'  # resumed and older checkpoints keep their own ('all' if absent)
         if args.language_conditioning != 'none':
             model_config['film_init'] = args.film_init
             args.language_encoder = args.language_encoder or ('minilm' if args.language_conditioning == 'mt_act' else 'clip')

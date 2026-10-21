@@ -253,6 +253,99 @@ def test_ddp_ignores_the_padding_head_and_skipped_decoder_layers(tmp_path):
     assert all(grad is not None for name, grad in grads.items() if name not in ignored)
 
 
+def test_valid_l1_normalization_averages_over_unpadded_steps_only():
+    torch.set_num_threads(1)
+    qpos, images = torch.randn(2, 27), torch.rand(2, 3, 3, 32, 32)
+    actions = torch.randn(2, 4, 23)
+    pad = torch.tensor([[False, False, True, True], [False, False, False, True]])  # 5 of 8 chunk steps valid
+    mean = torch.tensor([.485, .456, .406])[None, None, :, None, None]
+    std = torch.tensor([.229, .224, .225])[None, None, :, None, None]
+    l1 = {}
+    for mode in ('all', 'valid'):
+        torch.manual_seed(10)
+        policy = make_policy(dict(small_model_config(), l1_normalization=mode), 'cpu')
+        rng = torch.get_rng_state()
+        l1[mode] = policy(qpos, images, actions, pad)['l1']
+        torch.set_rng_state(rng)
+        prediction, _, _ = policy.model(qpos, (images - mean) / std, None, actions, pad)
+        errors = (prediction - actions).abs()
+        expected = errors[~pad].mean() if mode == 'valid' else (errors * ~pad[..., None]).mean()
+        torch.testing.assert_close(l1[mode], expected)
+    torch.testing.assert_close(l1['valid'], l1['all'] * 8 / 5)  # same weights: only the denominator differs
+    assert make_policy(small_model_config(), 'cpu').l1_normalization == 'all'  # checkpoints without the key
+    torch.manual_seed(10)
+    padded = make_policy(dict(small_model_config(), l1_normalization='valid'), 'cpu')
+    assert padded(qpos, images, actions, torch.ones_like(pad))['l1'] == 0  # all padded: no division by zero
+    with pytest.raises(ValueError, match='l1_normalization'):
+        make_policy(dict(small_model_config(), l1_normalization='other'), 'cpu')
+
+
+def test_validation_reports_per_family_l1_only_for_multi_family_runs(tiny_root):
+    from contextlib import nullcontext
+    from b1k_training import evaluate_validation
+    torch.set_num_threads(1)
+    for tasks in (['first', 'second'], ['first']):
+        dataset = B1KDataset(tiny_root, tasks, chunk_size=4, image_size=(32, 32))
+        dataset.stats = dataset.compute_stats()
+        torch.manual_seed(14)
+        config = dict(small_model_config(), state_dim=len(dataset[0][1]), l1_normalization='valid')
+        policy = make_policy(config, 'cpu')
+        metrics = evaluate_validation(policy, dataset, 2, 4, None, dataset.task_map, torch.device('cpu'), nullcontext,
+                                      False, 0)
+        family_keys = {key for key in metrics if key.count('/') == 2}
+        dataset.close()
+        if len(tasks) == 1:
+            assert not family_keys
+            continue
+        assert family_keys == {'val/l1/first', 'val/l1/second', 'val/inference_l1/first', 'val/inference_l1/second'}
+        assert all(np.isfinite(metrics[key]) and metrics[key] > 0 for key in family_keys)
+        # the two families partition the pooled zero-latent L1 (the same valid elements)
+        low, high = sorted([metrics['val/inference_l1/first'], metrics['val/inference_l1/second']])
+        assert low <= metrics['val/inference_l1'] <= high
+
+
+def test_gripper_snap_clamps_and_opens_on_every_session_path():
+    from b1k_server import GRIPPER_ACTION_DIMS, snap_grippers
+    assert GRIPPER_ACTION_DIMS == [14, 22]
+    raw = np.zeros((2, 23), dtype=np.float32)
+    raw[:, 14] = [0.85, 0.95]
+    raw[:, 22] = [-1.3, 1.4]
+    raw[:, 3] = 5.0
+    snapped = snap_grippers(raw, 0.9)
+    np.testing.assert_array_equal(snapped[:, 14], np.float32([0.85, 1.0]))
+    np.testing.assert_array_equal(snapped[:, 22], np.float32([-1.0, 1.0]))
+    assert (snapped[:, 3] == 5.0).all() and raw[1, 14] == np.float32(0.95)  # other dims and the input untouched
+    assert snap_grippers(raw, None) is raw
+
+    def chunks(qpos, images, *_, opening=(0.95, 0.5)):
+        out = np.zeros((len(qpos), 4, 23), dtype=np.float32)
+        out[..., 14], out[..., 22] = opening
+        return out
+
+    chunked = Session(chunks, checkpoint_stub(), 2, gripper_snap=0.9)
+    for _ in range(3):  # fresh plan, cached step, next plan
+        action = chunked.act(observation())
+        assert action[0, 14] == 1.0 and action[0, 22] == 0.5
+    assert Session(chunks, checkpoint_stub(), 2).act(observation())[0, 14] == np.float32(0.95)  # raw by default
+    # temporal aggregation averages a +1 with a 0.9 below 1; the snap restores the full opening
+    aggregated = Session(lambda *a: chunks(*a, opening=(1.0, 0.5)), checkpoint_stub(), temporal_agg=True,
+                         gripper_snap=0.9)
+    aggregated.act(observation())
+    aggregated.predictor = lambda *a: chunks(*a, opening=(0.9, 0.5))
+    action = aggregated.act(observation())
+    assert action[0, 14] == 1.0 and action[0, 22] == pytest.approx(0.5)
+    cnn = checkpoint_stub()
+    cnn['model_config'] = {'policy_class': 'CNNMLP', 'num_queries': 1}
+    single = Session(lambda qpos, *_: np.full((len(qpos), 23), 1.5, dtype=np.float32), cnn, gripper_snap=0.9)
+    action = single.act(observation())
+    assert action[0, 14] == action[0, 22] == 1.0 and action[0, 0] == 1.5
+    server = B1KServer(checkpoint_stub(), chunks)
+    assert server.metadata['gripper_snap_threshold'] == 0.9 and server.gripper_snap == 0.9
+    assert server.metadata['gripper_action_dims'] == [14, 22] and server.metadata['gripper_clamp'] == [-1.0, 1.0]
+    raw_server = B1KServer(checkpoint_stub(), chunks, gripper_snap=None)
+    assert raw_server.metadata['gripper_snap_threshold'] is None and raw_server.metadata['gripper_clamp'] is None
+
+
 def test_real_act_numerical_loss_backward_and_padding():
     torch.set_num_threads(1)
     torch.manual_seed(10)
@@ -1043,15 +1136,19 @@ def test_gripper_state_is_recorded_and_legacy_checkpoints_resume_and_serve(tiny_
                                                                  '--max-steps', '1'])))
     assert summed['adapter_config']['gripper_state'] == 'sum' and summed['train_config']['gripper_state'] == 'sum'
     assert summed['model_config']['state_dim'] == 23 + 2 and len(summed['normalization']['qpos_mean']) == 23
+    assert summed['model_config']['l1_normalization'] == 'valid'  # new runs average L1 over valid chunk steps
     fingers = load_checkpoint(train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'fingers'),
                                                                   '--max-steps', '1', '--gripper-state', 'fingers'])))
     assert fingers['adapter_config']['gripper_state'] == 'fingers' and fingers['model_config']['state_dim'] == 25 + 2
     # A checkpoint from before the option (no recorded layout) resumes and serves with both finger positions.
-    legacy = dict(fingers, adapter_config={k: v for k, v in fingers['adapter_config'].items() if k != 'gripper_state'})
+    legacy = dict(fingers, adapter_config={k: v for k, v in fingers['adapter_config'].items() if k != 'gripper_state'},
+                  model_config={k: v for k, v in fingers['model_config'].items() if k != 'l1_normalization'})
     torch.save(legacy, tmp_path / 'legacy.pt')
     resumed = load_checkpoint(train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'legacy'),
                                                                   '--max-steps', '2', '--resume', str(tmp_path / 'legacy.pt')])))
     assert 'gripper_state' not in resumed['adapter_config'] and resumed['model_config']['state_dim'] == 25 + 2
+    assert 'l1_normalization' not in resumed['model_config']  # an older checkpoint keeps upstream's 'all' L1
+    assert make_policy(resumed['model_config'], 'cpu', restoring=True).l1_normalization == 'all'
     with pytest.raises(ValueError, match=r'--gripper-state sum differs from checkpoint \(fingers\)'):
         train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'refused'), '--max-steps', '2',
                                             '--resume', str(tmp_path / 'legacy.pt'), '--gripper-state', 'sum']))
@@ -1645,7 +1742,7 @@ def test_msgpack_round_trip_rejects_objects():
 def test_network_handshake_health_reset_batch_and_connection_isolation():
     async def run():
         predictor = CountingPredictor()
-        server = B1KServer(checkpoint_stub(), predictor, action_horizon=2)
+        server = B1KServer(checkpoint_stub(), predictor, action_horizon=2, gripper_snap=None)
         async with websockets.asyncio.server.serve(server.handler, '127.0.0.1', 0,
                                                    process_request=server.health) as running:
             port = running.sockets[0].getsockname()[1]

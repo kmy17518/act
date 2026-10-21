@@ -18,7 +18,7 @@ from torchvision import transforms
 from b1k_language import (CLIP_MODEL, CLIP_REVISION, ENCODERS, MINILM_MODEL, MINILM_REVISION, build_language_cache,
                           encode_prompt, encode_prompt_minilm, language_embedding_table, language_for_qpos,
                           task_prompts)
-from b1k_server import B1KServer, PolicyPredictor, Session, packb, unpackb
+from b1k_server import DEFAULT_GRIPPER_SNAP, B1KServer, PolicyPredictor, Session, packb, snap_grippers, unpackb
 from b1k_training import load_checkpoint, make_policy, parser, save_eval_checkpoint, train
 from detr.models.backbone import Backbone, FiLMLayer, ResidualFiLMBody
 from test_b1k import observation, small_model_config, tiny_root
@@ -426,17 +426,19 @@ def test_conditioned_train_resume_eval_and_network_without_clip_or_sidecar(tiny_
 
         async def network():
             server = B1KServer(exported, predictor, action_horizon=2)
+            served = snap_grippers(reference, DEFAULT_GRIPPER_SNAP)
             async with websockets.asyncio.server.serve(server.handler, '127.0.0.1', 0) as running:
                 port = running.sockets[0].getsockname()[1]
                 async with websockets.asyncio.client.connect(f'ws://127.0.0.1:{port}') as client:
                     metadata = unpackb(await client.recv())
                     assert metadata['language_conditioning'] == 'clip_film'
                     assert metadata['prompt_source'] == source
+                    assert metadata['gripper_snap_threshold'] == DEFAULT_GRIPPER_SNAP
                     await client.send(packb(obs))
-                    np.testing.assert_array_equal(unpackb(await client.recv())['action'], reference)
+                    np.testing.assert_array_equal(unpackb(await client.recv())['action'], served)
                     await client.send(packb({'reset': True}))
                     await client.send(packb(obs))
-                    np.testing.assert_array_equal(unpackb(await client.recv())['action'], reference)
+                    np.testing.assert_array_equal(unpackb(await client.recv())['action'], served)
         asyncio.run(network())
     assert len(loaded) == 4 and len(encoder.calls) == 4
 

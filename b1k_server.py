@@ -98,11 +98,31 @@ class PolicyPredictor:
 # Compatibility for clients importing the original B1K predictor name.
 ACTPredictor = PolicyPredictor
 
+GRIPPER_ACTION_DIMS = [14, 22]  # left and right gripper commands, in [-1, 1] (+1 = fully open)
+DEFAULT_GRIPPER_SNAP = 0.9
+
+
+def snap_grippers(actions, threshold):
+    """Gripper commands clamped to [-1, 1], with those above `threshold` set to exactly +1 (None: untouched).
+
+    OmniGibson releases an assisted grasp only when the finger target reaches the open limit, i.e. at a command of
+    exactly +1, while a regressed (or temporally averaged) opening ramp tends to end just below it. In the training
+    tasks no gripper hold sits at or above 0.80, so commands above 0.9 belong to opening ramps.
+    """
+    if threshold is None:
+        return actions
+    actions = actions.copy()
+    grippers = np.clip(actions[..., GRIPPER_ACTION_DIMS], -1.0, 1.0)
+    grippers[grippers > threshold] = 1.0
+    actions[..., GRIPPER_ACTION_DIMS] = grippers
+    return actions
+
 
 class Session:
     def __init__(self, predictor, checkpoint, action_horizon=None, task_name=None, temporal_agg=False,
-                 fixed_goals=None):
+                 fixed_goals=None, gripper_snap=None):
         self.predictor = predictor
+        self.gripper_snap = gripper_snap  # applied to every returned action (`snap_grippers`); B1KServer sets 0.9
         self.task_map = checkpoint['task_map']
         self.stats = checkpoint['normalization']
         adapter = checkpoint['adapter_config']
@@ -183,9 +203,10 @@ class Session:
             predictions = self.predictor(qpos, images, task_ids)
             self.validate_predictions(predictions, (batch_size, 23))
             self.task_ids = task_ids
-            return predictions.astype(np.float32)
+            return snap_grippers(predictions.astype(np.float32), self.gripper_snap)
         if self.temporal_agg:
-            return self.aggregate(qpos, images, task_ids, goal)
+            # the weighted average of overlapping chunks can bring a +1 opening below 1, so snap after it
+            return snap_grippers(self.aggregate(qpos, images, task_ids, goal), self.gripper_snap)
         if self.plans is None or len(self.plans) != batch_size:
             plans = np.zeros((batch_size, self.action_horizon, 23), dtype=np.float32)
             positions = np.full(batch_size, self.action_horizon, dtype=np.int64)
@@ -203,7 +224,7 @@ class Session:
             positions[needs_plan] = 0
         action = plans[np.arange(batch_size), positions].copy()
         self.plans, self.positions, self.task_ids = plans, positions + 1, task_ids
-        return action.astype(np.float32)
+        return snap_grippers(action.astype(np.float32), self.gripper_snap)
 
     def batch_images(self, observation, keys, batch_size):
         """uint8 (B,H,W,3|4) arrays under `keys` to one float (B, len(keys), 3, H, W) tensor at the training size."""
@@ -247,11 +268,13 @@ class Session:
 
 class B1KServer:
     def __init__(self, checkpoint, predictor, host='0.0.0.0', port=8000, action_horizon=None,
-                 task_name=None, temporal_agg=False, fixed_goals=None):
+                 task_name=None, temporal_agg=False, fixed_goals=None, gripper_snap=DEFAULT_GRIPPER_SNAP):
         self.checkpoint, self.predictor = checkpoint, predictor
         self.host, self.port = host, port
         self.fixed_goals = fixed_goals or {}
-        session = Session(predictor, checkpoint, action_horizon, task_name, temporal_agg, self.fixed_goals)
+        self.gripper_snap = gripper_snap
+        session = Session(predictor, checkpoint, action_horizon, task_name, temporal_agg, self.fixed_goals,
+                          gripper_snap)
         self.action_horizon, self.task_name = session.action_horizon, task_name
         self.temporal_agg = temporal_agg
         mode = 'single_action' if session.policy_class == 'CNNMLP' else ('temporal_aggregation' if temporal_agg else 'chunked')
@@ -272,11 +295,14 @@ class B1KServer:
                          'goal_fusion': goal['goal_fusion'], 'goal_views': goal['goal_views'],
                          'goal_observation_keys': [GOAL_OBS_KEYS[view] for view in goal['goal_views']],
                          'goal_source': checkpoint['adapter_config'].get('goal_source') if goal['goal_views'] else None,
-                         'fixed_goal_views': sorted(self.fixed_goals)}
+                         'fixed_goal_views': sorted(self.fixed_goals),
+                         'gripper_action_dims': GRIPPER_ACTION_DIMS,
+                         'gripper_clamp': [-1.0, 1.0] if gripper_snap is not None else None,
+                         'gripper_snap_threshold': gripper_snap}
 
     async def handler(self, websocket):
         session = Session(self.predictor, self.checkpoint, self.action_horizon, self.task_name, self.temporal_agg,
-                          self.fixed_goals)
+                          self.fixed_goals, self.gripper_snap)
         await websocket.send(packb(self.metadata))
         try:
             async for message in websocket:
@@ -325,9 +351,15 @@ def main():
     p.add_argument('--goal-image', action='append', metavar='CAMERA=PATH',
                    help='Goal-conditioned checkpoints: fixed goal image (PNG/JPEG, RGB) for a camera view, used when a '
                         'request carries no goal::<camera key> image; repeat per view')
+    p.add_argument('--gripper-snap-threshold', type=lambda v: None if v.lower() == 'none' else float(v),
+                   default=DEFAULT_GRIPPER_SNAP, metavar='T',
+                   help='Clamp the gripper commands (action dims 14, 22) to [-1, 1] and send those above T fully open '
+                        '(+1), the only command at which OmniGibson releases an assisted grasp (default 0.9); "none" '
+                        'returns them as predicted')
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     checkpoint = load_checkpoint(args.model_path)
     server = B1KServer(checkpoint, PolicyPredictor(checkpoint, args.device), args.host, args.port,
-                       args.action_horizon, args.task_name, args.temporal_agg, load_goal_images(args.goal_image))
+                       args.action_horizon, args.task_name, args.temporal_agg, load_goal_images(args.goal_image),
+                       args.gripper_snap_threshold)
     asyncio.run(server.run())

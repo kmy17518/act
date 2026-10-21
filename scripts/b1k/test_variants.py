@@ -104,7 +104,8 @@ async def exercise_websocket(checkpoint, predictor, observations, temporal_agg, 
     reference = [predict(obs) for obs in observations[:2]]
     is_cnn = checkpoint['model_config']['policy_class'] == 'CNNMLP'
     mode = 'single_action' if is_cnn else ('temporal_aggregation' if temporal_agg else 'chunked')
-    server = B1KServer(checkpoint, predictor, action_horizon=horizon, temporal_agg=temporal_agg)
+    # raw outputs: these checks compare the execution modes against the predictor's own chunks
+    server = B1KServer(checkpoint, predictor, action_horizon=horizon, temporal_agg=temporal_agg, gripper_snap=None)
     checks, responses = [], []
     async with websockets.asyncio.server.serve(server.handler, '127.0.0.1', 0, process_request=server.health,
                                                max_size=64 * 1024 * 1024, compression=None) as running:
