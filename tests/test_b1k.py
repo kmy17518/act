@@ -223,6 +223,36 @@ def small_model_config():
                 weight_decay=1e-4, pretrained_backbone=False, camera_names=VIDEO_KEYS, dropout=0.0)
 
 
+def test_ddp_ignores_the_padding_head_and_skipped_decoder_layers(tmp_path):
+    """ACT's is_pad_head output is not part of the loss, so its parameters never get a gradient; DDP must ignore them
+    (with the skipped decoder layers) or its reducer fails at the second step."""
+    import torch.distributed as dist
+    from b1k_training import ddp_ignored_parameter_names, unused_gradients
+    torch.set_num_threads(1)
+    torch.manual_seed(12)
+    policy = make_policy(dict(small_model_config(), dec_layers=2), 'cpu')
+    zero_gradients = unused_gradients(policy)
+    ignored = ddp_ignored_parameter_names(policy, zero_gradients)
+    assert {'model.is_pad_head.weight', 'model.is_pad_head.bias'} <= set(ignored)
+    assert all(name.startswith(('model.is_pad_head.', 'model.transformer.decoder.layers.1.')) for name in ignored)
+    qpos, images = torch.randn(2, 27), torch.rand(2, 3, 3, 32, 32)
+    actions, pad = torch.randn(2, 4, 23), torch.zeros(2, 4, dtype=torch.bool)
+    dist.init_process_group('gloo', init_method=f'file://{tmp_path / "store"}', rank=0, world_size=1)
+    try:
+        torch.nn.parallel.DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(policy, ignored)
+        model = torch.nn.parallel.DistributedDataParallel(policy, broadcast_buffers=False)
+        for _ in range(2):
+            policy.zero_grad(set_to_none=True)
+            model(qpos, images, actions, pad)['loss'].backward()
+            for parameter, zeros in zero_gradients:
+                parameter.grad = zeros
+    finally:
+        dist.destroy_process_group()
+    grads = {name: parameter.grad for name, parameter in policy.named_parameters()}
+    assert grads['model.is_pad_head.weight'] is None and grads['model.is_pad_head.bias'] is None
+    assert all(grad is not None for name, grad in grads.items() if name not in ignored)
+
+
 def test_real_act_numerical_loss_backward_and_padding():
     torch.set_num_threads(1)
     torch.manual_seed(10)

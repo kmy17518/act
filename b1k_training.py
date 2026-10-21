@@ -184,6 +184,20 @@ def unused_gradients(policy):
     return [(parameter, torch.zeros_like(parameter)) for parameter in parameters]
 
 
+def ddp_ignored_parameter_names(policy, zero_gradients):
+    """Parameters DistributedDataParallel must not wait for, as names.
+
+    The skipped decoder layers (`unused_gradients`; zeros are assigned after each backward) and ACT's padding head:
+    its prediction is not part of the loss, so its gradient stays None and AdamW leaves it untouched, as on one GPU.
+    DDP's reducer would otherwise wait for those gradients and fail at the next step.
+    """
+    ids = {id(parameter) for parameter, _ in zero_gradients}
+    is_pad_head = getattr(getattr(policy, 'model', None), 'is_pad_head', None)
+    if is_pad_head is not None:
+        ids |= {id(parameter) for parameter in is_pad_head.parameters()}
+    return [name for name, parameter in policy.named_parameters() if id(parameter) in ids]
+
+
 def _sync_directory(path):
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -1344,8 +1358,7 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
     policy.train()
     forward_policy = policy
     if distributed:
-        unused_ids = {id(p) for p, _ in zero_gradients}
-        ignore_names = [name for name, p in policy.named_parameters() if id(p) in unused_ids]
+        ignore_names = ddp_ignored_parameter_names(policy, zero_gradients)
         torch.nn.parallel.DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(policy, ignore_names)
         forward_policy = torch.nn.parallel.DistributedDataParallel(
             policy,
