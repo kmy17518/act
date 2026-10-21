@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager, ExitStack, nullcontext
 import fcntl
 from functools import partial
+import hashlib
 import json
 import logging
 import os
@@ -439,6 +440,111 @@ def consume_batch(batch, stream=None, channels_last=True):
             timings)
 
 
+def resolve_val_split(dataset_path, task_names, episode_split, val_fraction, seed):
+    """Per-task train/val episode split (isg-val-split/v1) when `val_fraction > 0`, or None when disabled.
+
+    Each task's candidate episodes (from `episode_split` when given, else every complete local episode of the task)
+    are partitioned deterministically with SeedSequence([seed, sha256(task_name)]) into `round(N * val_fraction)`
+    validation episodes (at least 1 and at most N - 1) and the remaining training episodes.
+    """
+    if not val_fraction:
+        return None
+    if not 0.0 < val_fraction < 1.0:
+        raise ValueError(f'--val-fraction must be in [0, 1); got {val_fraction}')
+    catalog = B1KDataset(dataset_path, task_names, episodes=episode_split['episodes'] if episode_split else None)
+    try:
+        by_task = {}
+        for task_id, task_name in sorted(catalog.task_map.items()):
+            episodes = sorted(int(ep['episode_index']) for ep in catalog.episodes if int(ep['task_index']) == task_id)
+            if len(episodes) < 2:
+                raise ValueError(f'Task {task_name!r} has {len(episodes)} episode(s); at least 2 are required for '
+                                 f'--val-fraction {val_fraction}')
+            n_val = min(len(episodes) - 1, max(1, round(len(episodes) * val_fraction)))
+            task_seed = int.from_bytes(hashlib.sha256(task_name.encode()).digest()[:8], 'little')
+            rng = np.random.default_rng(np.random.SeedSequence([int(seed), task_seed]))
+            perm = [episodes[i] for i in rng.permutation(len(episodes))]
+            by_task[task_name] = {'train': sorted(perm[n_val:]), 'val': sorted(perm[:n_val])}
+    finally:
+        catalog.close()
+    train_episodes = sorted(ep for entry in by_task.values() for ep in entry['train'])
+    val_episodes = sorted(ep for entry in by_task.values() for ep in entry['val'])
+    return {'format': 'isg-val-split/v1', 'val_fraction': float(val_fraction), 'seed': int(seed),
+            'tasks': by_task, 'train_episodes': train_episodes, 'val_episodes': val_episodes}
+
+
+def describe_val_split(val_split):
+    """One line for logs: fraction, seed, train/val episode counts and task count."""
+    if val_split is None:
+        return 'no validation split'
+    return (f'val_fraction={val_split["val_fraction"]} (seed {val_split["seed"]}): '
+            f'{len(val_split["train_episodes"])} train / {len(val_split["val_episodes"])} val episodes '
+            f'across {len(val_split["tasks"])} tasks')
+
+
+def evaluate_validation(policy, val_dataset, val_batches, val_batch_size, language_embeddings, task_map,
+                        device, autocast, channels_last, seed):
+    """Held-out validation losses (teacher-forced CVAE and zero-latent inference L1) without mutating RNG or mode."""
+    started = time.monotonic()
+    cuda = device.type == 'cuda'
+    cpu_rng = torch.get_rng_state().clone()
+    cuda_rng = torch.cuda.get_rng_state(device).clone() if cuda else None
+    was_training = policy.training
+    sampler = StepBatchSampler(val_dataset, val_batch_size, 0, val_batches, seed,
+                               tag=bool(val_dataset.goal_mismatch_slots))
+    loader = DataLoader(val_dataset, batch_sampler=sampler, num_workers=0, pin_memory=cuda)
+    totals = {}
+    inf_error = 0.0
+    inf_valid = 0
+    n_batches = 0
+    try:
+        policy.eval()
+        torch.manual_seed(seed)
+        if cuda:
+            torch.cuda.manual_seed(seed)
+        with torch.no_grad():
+            for batch in loader:
+                images, qpos, actions, is_pad, goal, task_id, _ = consume_batch(
+                    tuple(t.to(device, non_blocking=True) if torch.is_tensor(t) else t for t in batch),
+                    None, channels_last)
+                lang_emb = language_for_tasks(task_id, language_embeddings, task_map)
+                kwargs = {'lang_emb': lang_emb} if lang_emb is not None else {}
+                if goal is not None:
+                    kwargs['goal'] = goal
+                with autocast():
+                    losses = policy(qpos, images, actions, is_pad, **kwargs)
+                    prediction = policy(qpos, images, **kwargs)
+                for key, value in losses.items():
+                    val = float(value.detach())
+                    if not np.isfinite(val):
+                        raise FloatingPointError(f'Non-finite validation {key}')
+                    totals[key] = totals.get(key, 0.0) + val
+                if prediction.dim() == 3:
+                    queries = prediction.shape[1]
+                    target = actions[:, :queries]
+                    valid = ~is_pad[:, :queries]
+                    mask = valid.unsqueeze(-1).float()
+                    inf_error += float(((prediction.float() - target.float()).abs() * mask).sum())
+                    inf_valid += int(valid.sum()) * target.shape[-1]
+                else:
+                    target = actions[:, 0]
+                    inf_error += float((prediction.float() - target.float()).abs().sum())
+                    inf_valid += int(target.numel())
+                n_batches += 1
+    finally:
+        policy.train(was_training)
+        torch.set_rng_state(cpu_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state(cuda_rng, device)
+    if cuda:
+        torch.cuda.synchronize(device)
+    metrics = {f'val/{key}': value / n_batches for key, value in totals.items()}
+    if 'val/l1' not in metrics and 'val/mse' in metrics:
+        metrics['val/l1'] = inf_error / max(1, inf_valid)
+    metrics['val/inference_l1'] = inf_error / max(1, inf_valid)
+    metrics['timing/val_s'] = time.monotonic() - started
+    return metrics
+
+
 def configure_cpu_threads(worker_id=None, torch_threads=1, arrow_threads=1, opencv_threads=1):
     import pyarrow as pa
     torch.set_num_threads(torch_threads)
@@ -827,6 +933,19 @@ def parser():
     p.add_argument('--save-first-step', action='store_true', help='Also save and queue a full checkpoint at step 1')
     p.add_argument('--save-total-limit', type=int, default=0, help='Retain newest N local full checkpoints; 0 keeps all')
     p.add_argument('--export-every', type=int, default=0, help='Queue eval-only checkpoints every N steps; 0 disables queues')
+    p.add_argument('--val-fraction', type=float, default=0.0, action=ExplicitOption, metavar='FRAC',
+                   help='Hold out FRAC (e.g. 0.1 for 10%%) of each selected task\'s episodes for validation, drawn '
+                        'deterministically from (seed, task_name); normalization statistics are computed over the '
+                        'remaining training episodes only. 0 (default) disables the validation split unless '
+                        '--val-every > 0 is given (which defaults --val-fraction to 0.1). Resume reuses the '
+                        'checkpoint\'s train/val split')
+    p.add_argument('--val-every', type=int, default=0, metavar='STEPS',
+                   help='Evaluate validation loss and L1 every STEPS optimizer steps and at the final step; '
+                        'default 0 uses --save-every when --val-fraction > 0')
+    p.add_argument('--val-batches', type=int, default=16, metavar='N',
+                   help='Number of fixed validation batches evaluated at each validation check')
+    p.add_argument('--val-batch-size', type=int, default=None, metavar='N',
+                   help='Validation batch size; default min(64, --batch-size)')
     p.add_argument('--wandb-project')
     p.add_argument('--wandb-entity')
     p.add_argument('--wandb-name')
@@ -870,45 +989,83 @@ def parser():
     return p
 
 
+@contextmanager
+def distributed_context(device_spec, world_size, local_rank):
+    if world_size == 1:
+        yield
+        return
+    import torch.distributed as dist
+    cuda = torch.device(device_spec).type == 'cuda'
+    if cuda:
+        torch.cuda.set_device(local_rank)
+    owned = not dist.is_initialized()
+    if owned:
+        dist.init_process_group(backend='nccl' if cuda else 'gloo')
+    try:
+        yield
+    finally:
+        if owned and dist.is_initialized():
+            dist.destroy_process_group()
+
+
 def train(args):
+    world_size = int(os.environ.get('WORLD_SIZE', '1'))
+    rank = int(os.environ.get('RANK', '0'))
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    if world_size < 1 or not 0 <= rank < world_size:
+        raise ValueError(f'Invalid RANK={rank} / WORLD_SIZE={world_size}')
     if min(args.max_steps, args.batch_size, args.save_every) < 1 or args.num_workers < 0:
         raise ValueError('Steps, batch size and save interval must be positive; workers must be nonnegative')
+    if args.batch_size % world_size != 0:
+        raise ValueError(f'--batch-size ({args.batch_size}) must be divisible by WORLD_SIZE ({world_size})')
     if args.loader_batch_size is not None and args.loader_batch_size < 1:
         raise ValueError('--loader-batch-size must be positive')
     if min(args.prefetch_factor, args.worker_threads, args.arrow_threads, args.opencv_threads) < 1:
         raise ValueError('Prefetch factor and CPU thread caps must be positive')
     if args.torch_threads is not None and args.torch_threads < 1:
         raise ValueError('--torch-threads must be positive')
-    if min(args.save_total_limit, args.export_every) < 0:
-        raise ValueError('Retention limit and export interval must be nonnegative')
+    if min(args.save_total_limit, args.export_every, args.val_every) < 0:
+        raise ValueError('Retention limit, export interval and val interval must be nonnegative')
+    if args.val_every > 0 and not getattr(args, '_val_fraction_explicit', False) and args.val_fraction == 0.0:
+        args.val_fraction = 0.1
+    if not 0.0 <= args.val_fraction < 1.0:
+        raise ValueError('--val-fraction must be in [0, 1)')
+    if args.val_batches < 1:
+        raise ValueError('--val-batches must be positive')
+    if args.val_batch_size is not None and args.val_batch_size < 1:
+        raise ValueError('--val-batch-size must be positive')
     if args.stats_max_frames is not None and args.stats_max_frames < 2:
         raise ValueError('--stats-max-frames must be at least 2')
     output = Path(args.output_dir).resolve()
     root = Path(args.dataset_path).resolve()
     if output == root or root in output.parents:
         raise ValueError('--output-dir cannot be inside the read-only dataset')
-    with run_lock(output), ExitStack() as resources:
-        return _train(args, output, root, resources)
+    with distributed_context(args.device, world_size, local_rank), \
+            (run_lock(output) if rank == 0 else nullcontext()), ExitStack() as resources:
+        return _train(args, output, root, resources, rank=rank, local_rank=local_rank, world_size=world_size)
 
 
-def _train(args, output, root, resources):
-    if not args.resume and ((output / 'run.json').exists() or any(output.glob('step_*.pt'))):
+def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
+    distributed = world_size > 1
+    is_main = rank == 0
+    if is_main and not args.resume and ((output / 'run.json').exists() or any(output.glob('step_*.pt'))):
         raise FileExistsError(f'{output} already contains a run; use --resume or another output directory')
     checkpoint = load_checkpoint(args.resume) if args.resume else None
     if checkpoint and (checkpoint.get('checkpoint_type') == 'eval' or 'optimizer' not in checkpoint):
         raise ValueError('Cannot resume training from an eval-only checkpoint; use a full step checkpoint or latest.pt')
     task_names = expand_task_groups(root, args.task_names)
-    if task_names != args.task_names:
+    if is_main and task_names != args.task_names:
         LOGGER.info('--task-names %s select the tasks %s', args.task_names, task_names)
     args.settle_steps = parse_settle_steps(args.settle_steps)
     if checkpoint:
         if args.max_steps <= checkpoint['step']:
             raise ValueError(f'--max-steps must exceed resumed step {checkpoint["step"]}')
-        conflicts = [p for p in committed_checkpoints(output) if checkpoint['step'] < int(p.stem[5:])]
-        if conflicts:
-            raise FileExistsError(f'Resume would overwrite existing snapshots: {conflicts}; choose another output directory')
-        LOGGER.info('Resuming %s at optimizer step %d; saved architecture/preprocessing/seed are authoritative',
-                    args.resume, checkpoint['step'])
+        if is_main:
+            conflicts = [p for p in committed_checkpoints(output) if checkpoint['step'] < int(p.stem[5:])]
+            if conflicts:
+                raise FileExistsError(f'Resume would overwrite existing snapshots: {conflicts}; choose another output directory')
+            LOGGER.info('Resuming %s at optimizer step %d; saved architecture/preprocessing/seed are authoritative',
+                        args.resume, checkpoint['step'])
         adapter = checkpoint['adapter_config']
         model_config = dict(checkpoint['model_config'])
         model_config.setdefault('policy_class', 'ACT')
@@ -953,6 +1110,11 @@ def _train(args, output, root, resources):
         if getattr(args, '_gripper_state_explicit', False) and args.gripper_state != saved_gripper:
             raise ValueError(f'--gripper-state {args.gripper_state} differs from checkpoint ({saved_gripper})')
         args.gripper_state = saved_gripper
+        val_split = checkpoint.get('val_split')
+        saved_val_fraction = val_split['val_fraction'] if val_split else 0.0
+        if getattr(args, '_val_fraction_explicit', False) and float(args.val_fraction) != saved_val_fraction:
+            raise ValueError(f'--val-fraction {args.val_fraction} differs from checkpoint ({saved_val_fraction})')
+        args.val_fraction = saved_val_fraction
     else:
         resolve_regime(args)
         validate_goal_mismatch(args)
@@ -987,6 +1149,7 @@ def _train(args, output, root, resources):
             adapter['goal_mismatch_views'] = list(args.goal_mismatch_views)
         episode_split = resolve_episode_split(root, args.episode_split, task_names)
         task_names = episode_split['tasks'] if episode_split else task_names
+        val_split = resolve_val_split(root, task_names, episode_split, args.val_fraction, args.seed)
         model_config = {'policy_class': args.policy_class,
                         'num_queries': args.chunk_size if args.policy_class == 'ACT' else 1,
                         'hidden_dim': args.hidden_dim,
@@ -1020,7 +1183,11 @@ def _train(args, output, root, resources):
     if policy_class(model_config) == 'ACT':
         if model_config['hidden_dim'] % 4 or model_config['hidden_dim'] % model_config['nheads']:
             raise ValueError('hidden-dim must be divisible by four and nheads')
-    tracked, wandb_identity = resources.enter_context(wandb_run(args, output, checkpoint))
+    if distributed:
+        import torch.distributed as dist
+        dist.barrier()
+    tracked, wandb_identity = (resources.enter_context(wandb_run(args, output, checkpoint))
+                               if is_main else (None, None))
     configure_cpu_threads(torch_threads=args.torch_threads or torch.get_num_threads(),
                           arrow_threads=args.arrow_threads, opencv_threads=args.opencv_threads)
     goal = goal_config(model_config)
@@ -1028,17 +1195,32 @@ def _train(args, output, root, resources):
         raise ValueError('--goal-detach-views sets the stem\'s per-camera flag in the uncompiled camera loop; use --compile '
                          'none, backbone, regions or regions-autotune')
     task_onehot = adapter.get('task_conditioning', 'onehot') == 'onehot'
-    if episode_split:
+    if is_main and episode_split:
         LOGGER.info('Episode split %s', describe_episode_split(episode_split))
+    if is_main and val_split:
+        LOGGER.info('Validation split %s', describe_val_split(val_split))
+    selected_episodes = (val_split['train_episodes'] if val_split
+                         else (episode_split['episodes'] if episode_split else None))
     dataset = B1KDataset(root, task_names, model_config['num_queries'], adapter['image_size'],
                          cache_row_groups=args.cache_row_groups, profile_reads=True,
                          timestamp_tolerance=adapter['timestamp_tolerance'],
                          frame_cache=args.frame_cache.resolve() if args.frame_cache else None,
                          goal_views=goal['goal_views'], goal_source=adapter.get('goal_source', 'episode_last'),
-                         task_onehot=task_onehot, episodes=episode_split['episodes'] if episode_split else None,
+                         task_onehot=task_onehot, episodes=selected_episodes,
                          settle_steps=args.settle_steps, gripper_state=adapter.get('gripper_state', 'fingers'),
                          goal_mismatch_views=adapter.get('goal_mismatch_views', []), goal_mismatch_seed=args.seed)
     resources.callback(dataset.close)
+    val_dataset = None
+    if val_split and is_main:
+        val_dataset = B1KDataset(root, task_names, model_config['num_queries'], adapter['image_size'],
+                                 cache_row_groups=args.cache_row_groups, profile_reads=False,
+                                 timestamp_tolerance=adapter['timestamp_tolerance'],
+                                 frame_cache=args.frame_cache.resolve() if args.frame_cache else None,
+                                 goal_views=goal['goal_views'], goal_source=adapter.get('goal_source', 'episode_last'),
+                                 task_onehot=task_onehot, episodes=val_split['val_episodes'],
+                                 settle_steps=args.settle_steps, gripper_state=adapter.get('gripper_state', 'fingers'),
+                                 goal_mismatch_views=adapter.get('goal_mismatch_views', []), goal_mismatch_seed=args.seed)
+        resources.callback(val_dataset.close)
     if checkpoint and dataset.task_map != checkpoint['task_map']:
         raise ValueError('Resume task map differs from checkpoint')
     # With the one-hot task input the adapter appends the task category to qpos; MT-ACT never feeds it to the
@@ -1054,29 +1236,37 @@ def _train(args, output, root, resources):
                                               language_encoder(model_config))
     language_embeddings = language_embedding_table(model_config, dataset.task_map, language_cache)
     fingerprint = dataset.fingerprint()
-    output.mkdir(parents=True, exist_ok=True)
+    if is_main:
+        output.mkdir(parents=True, exist_ok=True)
     if checkpoint:
         stats = dict(checkpoint['normalization'])
         if stats['fingerprint'] != fingerprint:
-            verify_resynced_dataset(dataset, stats, fingerprint)
+            if is_main:
+                verify_resynced_dataset(dataset, stats, fingerprint)
+            if distributed:
+                dist.barrier()
             stats['fingerprint'] = fingerprint
     else:
         stats_path = output / f'stats_{fingerprint[:16]}_{args.stats_max_frames or "all"}.json'
-        if stats_path.exists():
-            stats = json.loads(stats_path.read_text())
-        else:
+        if is_main and not stats_path.exists():
             stats = dataset.compute_stats(args.stats_max_frames)
             atomic_json(stats, stats_path)
+        if distributed:
+            dist.barrier()
+        stats = json.loads(stats_path.read_text())
     if args.stats_max_frames is None and (stats['approximate'] or stats['count'] != len(dataset)):
         raise ValueError('Full-task statistics required; approximate checkpoint statistics need explicit '
                          '--stats-max-frames for smoke runs only')
-    if stats['approximate']:
+    if is_main and stats['approximate']:
         LOGGER.warning('SMOKE statistics only: %d/%d frames; not full-dataset normalization', stats['count'], len(dataset))
     dataset.stats = stats
+    if val_dataset is not None:
+        val_dataset.stats = stats
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    device = torch.device(args.device)
+    device = (torch.device(f'cuda:{local_rank}')
+              if distributed and torch.device(args.device).type == 'cuda' else torch.device(args.device))
     cuda = device.type == 'cuda'
     torch.set_float32_matmul_precision(args.matmul_precision)
     if cuda:
@@ -1102,29 +1292,46 @@ def _train(args, output, root, resources):
         torch.set_rng_state(checkpoint['torch_rng'])
         if device.type == 'cuda' and checkpoint['cuda_rng'] is not None:
             torch.cuda.set_rng_state(checkpoint['cuda_rng'], device)
+    if distributed and rank > 0:
+        torch.manual_seed(args.seed + rank * 1000003 + start)
+        if cuda:
+            torch.cuda.manual_seed(args.seed + rank * 1000003 + start)
     if args.max_steps <= start:
         raise ValueError(f'--max-steps must exceed resumed step {start}')
     train_config = {key: value for key, value in vars(args).items() if not key.startswith('_')}
     if not train_config.get('goal_mismatch_views'):
         train_config.pop('goal_mismatch_views', None)  # runs without the control keep their earlier train config
+    if not val_split:
+        for key in ('val_fraction', 'val_every', 'val_batches', 'val_batch_size'):
+            train_config.pop(key, None)
+    if distributed:
+        train_config['world_size'] = world_size
+        train_config['per_rank_batch_size'] = args.batch_size // world_size
     train_config['resume'] = str(args.resume) if args.resume else None
     train_config['frame_cache'] = str(args.frame_cache) if args.frame_cache else None
     run = {'model_config': model_config, 'adapter_config': adapter, 'train_config': train_config,
            'task_map': dataset.task_map, 'episode_split': episode_split, 'settle_steps': dataset.settle,
            'normalization': stats, 'wandb': wandb_identity,
            'conditioning': conditioning_record(model_config, adapter, dataset, root, episode_split)}
+    if val_split is not None:
+        run['val_split'] = val_split
+        run['conditioning']['val_episodes'] = len(val_split['val_episodes'])
+        if val_dataset is not None:
+            run['conditioning']['val_frames'] = len(val_dataset)
     if language_cache is not None:
         run['language_cache'] = language_cache
-    atomic_json(run, output / ('resume_run.json' if checkpoint else 'run.json'))
-    if tracked:
-        tracked.config.update(run, allow_val_change=True)
+    if is_main:
+        atomic_json(run, output / ('resume_run.json' if checkpoint else 'run.json'))
+        if tracked:
+            tracked.config.update(run, allow_val_change=True)
+    per_rank_batch_size = args.batch_size // world_size
     sampler = StepBatchSampler(dataset, args.batch_size, start, args.max_steps, args.seed,
-                               tag=bool(dataset.goal_mismatch_slots))
-    if dataset.goal_mismatch_slots:
+                               tag=bool(dataset.goal_mismatch_slots), rank=rank, world_size=world_size)
+    if is_main and dataset.goal_mismatch_slots:
         LOGGER.info('Goal mismatch control: views %s show another episode of the same task, drawn per sample '
                     '(seed %d, step, slot)', dataset.goal_mismatch_views, args.seed)
     loader_kwargs = {'num_workers': args.num_workers, 'pin_memory': device.type == 'cuda',
-                     'generator': torch.Generator().manual_seed(args.seed)}
+                     'generator': torch.Generator().manual_seed(args.seed + rank)}
     if args.num_workers:
         loader_kwargs.update(multiprocessing_context='spawn', prefetch_factor=args.prefetch_factor,
                              worker_init_fn=partial(configure_cpu_threads, torch_threads=args.worker_threads,
@@ -1135,44 +1342,62 @@ def _train(args, output, root, resources):
     if args.compile != 'none' and cuda:
         compile_policy(policy, args.compile)
     policy.train()
+    forward_policy = policy
+    if distributed:
+        unused_ids = {id(p) for p, _ in zero_gradients}
+        ignore_names = [name for name, p in policy.named_parameters() if id(p) in unused_ids]
+        torch.nn.parallel.DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(policy, ignore_names)
+        forward_policy = torch.nn.parallel.DistributedDataParallel(
+            policy,
+            device_ids=[local_rank] if cuda else None,
+            output_device=local_rank if cuda else None,
+            broadcast_buffers=False,
+            gradient_as_bucket_view=True,
+        )
     autocast = ((lambda: torch.autocast('cuda', dtype=torch.bfloat16)) if args.autocast == 'bf16' and cuda
                 else nullcontext)
     copy_stream = torch.cuda.Stream(device) if cuda else None
-    LOGGER.info('Training %d -> %d steps on %s with real upstream %s (matmul %s, autocast %s, attention %s, '
-                'channels_last %s, fused optimizer %s, fast maxpool %s, fast stem %s, compile %s, frame cache %s, '
-                'skipped unused decoder parameters %d, language %s/%s/%s, film init %s, film recompute %s, '
-                'backbone norm %s, pretrained backbone %s, camera batch %s, regime %s, task onehot %s, goal %s %s '
-                'source %s encoder %s role %s language_on_goal %s, %d parameters)',
-                start, args.max_steps, device, policy_class(model_config), args.matmul_precision, args.autocast,
-                args.attention, args.channels_last, args.fused_optimizer and cuda, args.fast_maxpool and cuda,
-                args.fast_stem and cuda, args.compile, bool(args.frame_cache),
-                sum(parameter.numel() for parameter, _ in zero_gradients),
-                language_mode(model_config), language_encoder(model_config) if language_embeddings is not None else None,
-                model_config.get('prompt_source', 'task_name'), model_config.get('film_init'),
-                args.film_recompute and language_mode(model_config) == 'clip_film',
-                model_config.get('backbone_norm', 'frozen'), model_config.get('pretrained_backbone', True),
-                model_config.get('camera_batch', False), model_config.get('regime'), task_onehot, goal['goal_fusion'],
-                goal['goal_views'], adapter.get('goal_source', 'episode_last'), goal['goal_encoder'],
-                goal['goal_role_embedding'], goal['language_on_goal_encoder'],
-                sum(parameter.numel() for parameter in policy.parameters()))
-    if goal['goal_fusion'] != 'none':
-        LOGGER.info('Goal mechanism: tag init %s, stem init %s (gain %s, diff %s, fusion depth %s), tokens %s, positions '
-                    '%s, content %s, entry %s, goal LR %s (%d goal-group parameters)', goal['goal_tag_init'],
-                    goal['goal_stem_init'], goal['goal_stem_gain'], goal['goal_stem_diff'], goal['goal_fusion_depth'],
-                    goal['goal_tokens'], goal['goal_pos'],
-                    goal['goal_content'], goal['goal_entry'], goal['lr_goal'],
-                    sum(p.numel() for g in optimizer.param_groups[2:] for p in g['params']))
-        if goal['goal_detach_views']:
-            LOGGER.info('Goal detach: the paired-stem passes of %s do not train the goal half of the stem',
-                        goal['goal_detach_views'])
+    if is_main:
+        LOGGER.info('Training %d -> %d steps on %s (world_size=%d, global_batch=%d, per_rank_batch=%d) with real '
+                    'upstream %s (matmul %s, autocast %s, attention %s, channels_last %s, fused optimizer %s, '
+                    'fast maxpool %s, fast stem %s, compile %s, frame cache %s, skipped unused decoder parameters %d, '
+                    'language %s/%s/%s, film init %s, film recompute %s, backbone norm %s, pretrained backbone %s, '
+                    'camera batch %s, regime %s, task onehot %s, goal %s %s source %s encoder %s role %s '
+                    'language_on_goal %s, %d parameters)',
+                    start, args.max_steps, device, world_size, args.batch_size, per_rank_batch_size,
+                    policy_class(model_config), args.matmul_precision, args.autocast, args.attention,
+                    args.channels_last, args.fused_optimizer and cuda, args.fast_maxpool and cuda,
+                    args.fast_stem and cuda, args.compile, bool(args.frame_cache),
+                    sum(parameter.numel() for parameter, _ in zero_gradients),
+                    language_mode(model_config), language_encoder(model_config) if language_embeddings is not None else None,
+                    model_config.get('prompt_source', 'task_name'), model_config.get('film_init'),
+                    args.film_recompute and language_mode(model_config) == 'clip_film',
+                    model_config.get('backbone_norm', 'frozen'), model_config.get('pretrained_backbone', True),
+                    model_config.get('camera_batch', False), model_config.get('regime'), task_onehot, goal['goal_fusion'],
+                    goal['goal_views'], adapter.get('goal_source', 'episode_last'), goal['goal_encoder'],
+                    goal['goal_role_embedding'], goal['language_on_goal_encoder'],
+                    sum(parameter.numel() for parameter in policy.parameters()))
+        if goal['goal_fusion'] != 'none':
+            LOGGER.info('Goal mechanism: tag init %s, stem init %s (gain %s, diff %s, fusion depth %s), tokens %s, '
+                        'positions %s, content %s, entry %s, goal LR %s (%d goal-group parameters)',
+                        goal['goal_tag_init'], goal['goal_stem_init'], goal['goal_stem_gain'], goal['goal_stem_diff'],
+                        goal['goal_fusion_depth'], goal['goal_tokens'], goal['goal_pos'], goal['goal_content'],
+                        goal['goal_entry'], goal['lr_goal'],
+                        sum(p.numel() for g in optimizer.param_groups[2:] for p in g['params']))
+            if goal['goal_detach_views']:
+                LOGGER.info('Goal detach: the paired-stem passes of %s do not train the goal half of the stem',
+                            goal['goal_detach_views'])
     begin = time.monotonic()
     previous_end = begin
-    batches = optimizer_batches(loader, args.batch_size, args.loader_batch_size, device=device, stream=copy_stream)
+    val_every = (args.val_every or args.save_every) if val_dataset is not None else 0
+    val_batch_size = args.val_batch_size or min(64, args.batch_size)
+    batches = optimizer_batches(loader, per_rank_batch_size, args.loader_batch_size, device=device, stream=copy_stream)
     fetch_start = time.monotonic()
     upcoming = next(batches, None)
     upcoming_wait = time.monotonic() - fetch_start
     step = start
-    with (output / 'metrics.jsonl').open('a') as metrics:
+    path = output / f'step_{args.max_steps:08d}.pt'
+    with ((output / 'metrics.jsonl').open('a') if is_main else nullcontext()) as metrics:
         while upcoming is not None:
             step += 1
             batch, data_wait = upcoming, upcoming_wait
@@ -1186,7 +1411,7 @@ def _train(args, output, root, resources):
             if goal is not None:
                 kwargs['goal'] = goal
             with autocast():
-                losses = policy(qpos, images, actions, is_pad, **kwargs)
+                losses = forward_policy(qpos, images, actions, is_pad, **kwargs)
             losses['loss'].backward()
             for parameter, zeros in zero_gradients:
                 parameter.grad = zeros
@@ -1194,47 +1419,61 @@ def _train(args, output, root, resources):
             fetch_start = time.monotonic()
             upcoming = next(batches, None)
             upcoming_wait = time.monotonic() - fetch_start
-            if not torch.isfinite(losses['loss']):
+            loss_keys = sorted(losses)
+            loss_values = torch.stack([losses[k].detach().float() for k in loss_keys])
+            if distributed:
+                dist.all_reduce(loss_values, op=dist.ReduceOp.AVG)
+            if not torch.isfinite(loss_values).all():
                 raise FloatingPointError(f'Non-finite loss at step {step}')
             grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), float('inf'), error_if_nonfinite=True)
             optimizer.step()
-            record = {'step': step, **{k: float(v.detach()) for k, v in losses.items()},
-                      'grad_norm': float(grad_norm), 'lr': optimizer.param_groups[0]['lr'],
-                      **{key: float(value.mean()) for key, value in timings.items()}}
             if cuda:
                 torch.cuda.synchronize(device)
-                record.update({'gpu/allocated_bytes': torch.cuda.memory_allocated(device),
-                               'gpu/reserved_bytes': torch.cuda.memory_reserved(device),
-                               'gpu/peak_allocated_bytes': torch.cuda.max_memory_allocated(device),
-                               'gpu/peak_reserved_bytes': torch.cuda.max_memory_reserved(device)})
-            else:
-                record.update({f'gpu/{key}_bytes': 0 for key in
-                               ('allocated', 'reserved', 'peak_allocated', 'peak_reserved')})
             trained = time.monotonic()
-            if args.export_every and step % args.export_every == 0:
-                exported = save_eval_checkpoint(run, policy, step, output)
-                LOGGER.info('Queued eval-only checkpoint %s', exported)
-            if step % args.save_every == 0 or step == args.max_steps or (args.save_first_step and step == 1):
-                saved = {'format': 'act-b1k', 'version': CHECKPOINT_VERSION, 'checkpoint_type': 'full',
-                         'step': step, **run, 'model': policy.state_dict(), 'optimizer': optimizer.state_dict(),
-                         'torch_rng': torch.get_rng_state(),
-                         'cuda_rng': torch.cuda.get_rng_state(device) if device.type == 'cuda' else None}
-                path = save_full_checkpoint(saved, output, args.save_total_limit, bool(args.export_every))
-                LOGGER.info('Saved standalone checkpoint %s', path)
-            finished = time.monotonic()
-            # data_wait_s: host time blocked fetching this step's batch (overlapped with the previous
-            # step's compute after step 1); train_s covers this step's launch, compute and that overlap.
-            record.update({'elapsed_s': finished - begin, 'timing/data_wait_s': data_wait,
-                           'timing/train_s': trained - batch_ready, 'timing/checkpoint_s': finished - trained,
-                           'timing/step_s': finished - previous_end,
-                           'samples_per_s': args.batch_size / (finished - previous_end)})
-            metrics.write(json.dumps(record) + '\n')
-            metrics.flush()
-            LOGGER.info('%s', json.dumps(record))
-            if tracked:
-                tracked.log(record, step=step)
-            del images, qpos, actions, is_pad, goal, task_id, losses, grad_norm, batch, timings, lang_emb, kwargs
+            if is_main:
+                record = {'step': step, **{k: float(v) for k, v in zip(loss_keys, loss_values)},
+                          'grad_norm': float(grad_norm), 'lr': optimizer.param_groups[0]['lr'],
+                          **{key: float(value.mean()) for key, value in timings.items()}}
+                if cuda:
+                    record.update({'gpu/allocated_bytes': torch.cuda.memory_allocated(device),
+                                   'gpu/reserved_bytes': torch.cuda.memory_reserved(device),
+                                   'gpu/peak_allocated_bytes': torch.cuda.max_memory_allocated(device),
+                                   'gpu/peak_reserved_bytes': torch.cuda.max_memory_reserved(device)})
+                else:
+                    record.update({f'gpu/{key}_bytes': 0 for key in
+                                   ('allocated', 'reserved', 'peak_allocated', 'peak_reserved')})
+                if val_dataset is not None and (step % val_every == 0 or step == args.max_steps
+                                                or (args.save_first_step and step == 1)):
+                    record.update(evaluate_validation(policy, val_dataset, args.val_batches, val_batch_size,
+                                                      language_embeddings, dataset.task_map, device, autocast,
+                                                      args.channels_last, args.seed))
+                checkpoint_start = time.monotonic()
+                if args.export_every and step % args.export_every == 0:
+                    exported = save_eval_checkpoint(run, policy, step, output)
+                    LOGGER.info('Queued eval-only checkpoint %s', exported)
+                if step % args.save_every == 0 or step == args.max_steps or (args.save_first_step and step == 1):
+                    saved = {'format': 'act-b1k', 'version': CHECKPOINT_VERSION, 'checkpoint_type': 'full',
+                             'step': step, **run, 'model': policy.state_dict(), 'optimizer': optimizer.state_dict(),
+                             'torch_rng': torch.get_rng_state(),
+                             'cuda_rng': torch.cuda.get_rng_state(device) if device.type == 'cuda' else None}
+                    path = save_full_checkpoint(saved, output, args.save_total_limit, bool(args.export_every))
+                    LOGGER.info('Saved standalone checkpoint %s', path)
+                finished = time.monotonic()
+                # data_wait_s: host time blocked fetching this step's batch (overlapped with the previous
+                # step's compute after step 1); train_s covers this step's launch, compute and that overlap.
+                record.update({'elapsed_s': finished - begin, 'timing/data_wait_s': data_wait,
+                               'timing/train_s': trained - batch_ready, 'timing/checkpoint_s': finished - checkpoint_start,
+                               'timing/step_s': finished - previous_end,
+                               'samples_per_s': args.batch_size / (finished - previous_end)})
+                metrics.write(json.dumps(record) + '\n')
+                metrics.flush()
+                LOGGER.info('%s', json.dumps(record))
+                if tracked:
+                    tracked.log(record, step=step)
+            del images, qpos, actions, is_pad, goal, task_id, losses, loss_values, grad_norm, batch, timings, lang_emb, kwargs
             previous_end = time.monotonic()
+    if distributed:
+        dist.barrier()
     return path
 
 

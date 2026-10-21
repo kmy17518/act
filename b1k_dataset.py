@@ -854,18 +854,28 @@ class SplitBatchSampler:
 class StepBatchSampler:
     """Episode-uniform ACT sampling without a full-frame permutation or worker RNG.
 
-    `tag=True` yields (index, step, slot) instead of index (the same indices), the key of goal-mismatch draws."""
-    def __init__(self, dataset, batch_size, start_step, max_steps, seed, tag=False):
-        self.dataset, self.batch_size = dataset, batch_size
+    `tag=True` yields (index, step, slot) instead of index (the same indices), the key of goal-mismatch draws.
+    When `world_size > 1`, each step draws `batch_size` (global) samples and yields rank `rank`'s contiguous slice."""
+    def __init__(self, dataset, batch_size, start_step, max_steps, seed, tag=False, rank=0, world_size=1):
+        if world_size < 1 or not 0 <= rank < world_size:
+            raise ValueError(f'Invalid rank {rank} / world_size {world_size}')
+        if batch_size % world_size != 0:
+            raise ValueError(f'Batch size {batch_size} must be divisible by world_size {world_size}')
+        self.dataset = dataset
+        self.global_batch_size = batch_size
+        self.batch_size = batch_size // world_size
+        self.rank, self.world_size = rank, world_size
         self.start_step, self.max_steps, self.seed, self.tag = start_step, max_steps, seed, tag
 
     def __iter__(self):
+        lo = self.rank * self.batch_size
+        hi = lo + self.batch_size
         for step in range(self.start_step, self.max_steps):
             rng = np.random.default_rng(np.random.SeedSequence([self.seed, step]))
-            episodes = rng.integers(len(self.dataset.episodes), size=self.batch_size)
+            episodes = rng.integers(len(self.dataset.episodes), size=self.global_batch_size)
             frames = [int(rng.integers(self.dataset.lengths[ep])) for ep in episodes]
             indices = [int(self.dataset.starts[ep]) + frame for ep, frame in zip(episodes, frames)]
-            yield [(index, step, slot) for slot, index in enumerate(indices)] if self.tag else indices
+            yield [(indices[slot], step, slot) for slot in range(lo, hi)] if self.tag else indices[lo:hi]
 
     def __len__(self):
         return self.max_steps - self.start_step

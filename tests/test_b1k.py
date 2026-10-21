@@ -27,7 +27,8 @@ from b1k_frame_cache import (FrameCacheReader, build_frame_cache, dequantize_ima
 from b1k_server import B1KServer, Session, packb, unpackb
 from b1k_training import (atomic_save, committed_checkpoints, configure_cpu_threads, consume_batch, load_checkpoint,
                           make_policy, match_optimizer_state_layout, optimizer_batches, parser, prepare_images,
-                          prune_checkpoints, run_lock, save_eval_checkpoint, save_full_checkpoint, train, wandb_run)
+                          prune_checkpoints, resolve_val_split, run_lock, save_eval_checkpoint, save_full_checkpoint,
+                          train, wandb_run)
 from detr.main import get_args_parser
 from detr.models.detr_vae import CNNMLP, DETRVAE
 from policy import CNNMLPPolicy
@@ -1646,3 +1647,87 @@ def test_network_handshake_health_reset_batch_and_connection_isolation():
                 with pytest.raises(websockets.exceptions.ConnectionClosedError):
                     await a.recv()
     asyncio.run(run())
+
+
+def test_val_split_logs_val_metrics_isolates_rng_and_resumes_exactly(tiny_root, tmp_path):
+    torch.set_num_threads(1)
+    # 1 episode per task is rejected when --val-fraction > 0.
+    with pytest.raises(ValueError, match='at least 2 are required for --val-fraction'):
+        resolve_val_split(tiny_root, ['first'], None, 0.1, seed=0)
+    for bad in (-0.1, 1.0, 1.5):
+        with pytest.raises(ValueError, match='--val-fraction must be in'):
+            resolve_val_split(tiny_root, ['first'], None, bad, seed=0)
+    # Add 9 more episodes of task `first` (total 10 episodes: 42, 50..58) so 10% holds out 1 episode and trains on 9.
+    for i, ep_id in enumerate(range(50, 59), start=1):
+        path = tiny_root / 'meta/episodes/chunk-042/file-000.parquet'
+        episodes = pq.read_table(path).to_pylist()
+        begin = 200 + i * 10
+        episode = {**episodes[0], 'episode_index': ep_id, 'data/file_index': i,
+                   'dataset_from_index': begin, 'dataset_to_index': begin + 5}
+        pq.write_table(pa.Table.from_pylist(episodes + [episode]), path)
+        rows = [{**row, 'episode_index': ep_id, 'index': begin + row['frame_index'],
+                 'action': [x + i for x in row['action']]}
+                for row in pq.read_table(tiny_root / 'data/chunk-042/file-000.parquet').to_pylist()
+                if row['episode_index'] == 42]
+        pq.write_table(pa.Table.from_pylist(rows), tiny_root / f'data/chunk-042/file-{i:03d}.parquet')
+    split = resolve_val_split(tiny_root, ['first'], None, 0.1, seed=0)
+    assert split['format'] == 'isg-val-split/v1' and split['val_fraction'] == 0.1 and split['seed'] == 0
+    assert len(split['train_episodes']) == 9 and len(split['val_episodes']) == 1
+    assert set(split['train_episodes']).isdisjoint(split['val_episodes'])
+    assert sorted(split['train_episodes'] + split['val_episodes']) == [42, *range(50, 59)]
+
+    common = ['--dataset-path', str(tiny_root), '--task-names', 'first', '--batch-size', '2', '--num-workers', '0',
+              '--device', 'cpu', '--chunk-size', '4', '--image-size', '32', '32', '--hidden-dim', '32',
+              '--dim-feedforward', '64', '--enc-layers', '1', '--dec-layers', '1', '--nheads', '4',
+              '--no-pretrained-backbone', '--save-every', '1', '--val-batches', '2', '--val-batch-size', '2']
+    # Running validation at every step (--val-every 1, which defaults --val-fraction to 0.1) vs only at step 3
+    # (--val-fraction 0.1 --val-every 3) must leave the training trajectory and weights bitwise identical.
+    every_1 = tmp_path / 'every1'
+    every_3 = tmp_path / 'every3'
+    resumed_dir = tmp_path / 'resumed'
+    train(parser().parse_args(common + ['--output-dir', str(every_1), '--max-steps', '3', '--val-every', '1']))
+    train(parser().parse_args(common + ['--output-dir', str(every_3), '--max-steps', '3',
+                                        '--val-fraction', '0.1', '--val-every', '3']))
+    train(parser().parse_args(common + ['--output-dir', str(resumed_dir), '--max-steps', '2', '--val-every', '1']))
+    resumed_path = train(parser().parse_args(common + ['--output-dir', str(resumed_dir), '--max-steps', '3',
+                                                       '--val-every', '1', '--resume',
+                                                       str(resumed_dir / 'step_00000002.pt')]))
+    ckpt_1 = load_checkpoint(every_1 / 'step_00000003.pt')
+    ckpt_3 = load_checkpoint(every_3 / 'step_00000003.pt')
+    ckpt_resumed = load_checkpoint(resumed_path)
+    for key in ckpt_1['model']:
+        torch.testing.assert_close(ckpt_1['model'][key], ckpt_3['model'][key], atol=0, rtol=0)
+        torch.testing.assert_close(ckpt_1['model'][key], ckpt_resumed['model'][key], atol=0, rtol=0)
+    # Normalization statistics are computed exclusively over the 9 training episodes (45 frames, not 50).
+    train_only_stats = B1KDataset(tiny_root, ['first'], episodes=split['train_episodes']).compute_stats()
+    assert ckpt_1['normalization'] == train_only_stats and train_only_stats['count'] == 45
+    assert ckpt_1['val_split'] == ckpt_resumed['val_split'] == split
+    run_meta = json.loads((every_1 / 'run.json').read_text())
+    assert run_meta['conditioning']['episodes'] == 9 and run_meta['conditioning']['val_episodes'] == 1
+    assert run_meta['conditioning']['frames'] == 45 and run_meta['conditioning']['val_frames'] == 5
+    records_1 = [json.loads(line) for line in (every_1 / 'metrics.jsonl').read_text().splitlines()]
+    records_3 = [json.loads(line) for line in (every_3 / 'metrics.jsonl').read_text().splitlines()]
+    assert len(records_1) == len(records_3) == 3
+    for r1, r3 in zip(records_1, records_3):
+        assert r1['loss'] == r3['loss'] and r1['l1'] == r3['l1'] and r1['kl'] == r3['kl']
+        for key in ('val/loss', 'val/l1', 'val/kl', 'val/inference_l1', 'timing/val_s'):
+            assert key in r1 and np.isfinite(r1[key])
+    assert 'val/loss' not in records_3[0] and 'val/loss' not in records_3[1] and 'val/loss' in records_3[2]
+    assert records_1[2]['val/loss'] == pytest.approx(records_3[2]['val/loss'], rel=0, abs=0)
+    assert records_1[2]['val/l1'] == pytest.approx(records_3[2]['val/l1'], rel=0, abs=0)
+    assert records_1[2]['val/inference_l1'] == pytest.approx(records_3[2]['val/inference_l1'], rel=0, abs=0)
+    # Conflicting --val-fraction on resume is refused.
+    with pytest.raises(ValueError, match=r'--val-fraction 0\.2 differs from checkpoint \(0\.1\)'):
+        train(parser().parse_args(common + ['--output-dir', str(resumed_dir), '--max-steps', '4',
+                                            '--resume', str(resumed_path), '--val-fraction', '0.2']))
+    # StepBatchSampler distributed slicing partitions the global batch across ranks.
+    dataset = B1KDataset(tiny_root, ['first'])
+    global_batches = list(StepBatchSampler(dataset, 6, 0, 3, 7))
+    rank_batches = [list(StepBatchSampler(dataset, 6, 0, 3, 7, rank=r, world_size=2)) for r in (0, 1)]
+    for step_idx in range(3):
+        assert rank_batches[0][step_idx] + rank_batches[1][step_idx] == global_batches[step_idx]
+    with pytest.raises(ValueError, match='divisible by world_size'):
+        StepBatchSampler(dataset, 5, 0, 1, 7, rank=0, world_size=2)
+    dataset.close()
+
+

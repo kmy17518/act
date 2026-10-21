@@ -15,7 +15,7 @@ class ACTPolicy(nn.Module):
         self.kl_weight = args_override['kl_weight']
         print(f'KL Weight {self.kl_weight}')
 
-    def __call__(self, qpos, image, actions=None, is_pad=None, lang_emb=None, goal=None, goal_valid=None):
+    def forward(self, qpos, image, actions=None, is_pad=None, lang_emb=None, goal=None, goal_valid=None):
         env_state = None
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
@@ -54,7 +54,7 @@ class CNNMLPPolicy(nn.Module):
         self.model = model # decoder
         self.optimizer = optimizer
 
-    def __call__(self, qpos, image, actions=None, is_pad=None):
+    def forward(self, qpos, image, actions=None, is_pad=None):
         env_state = None # TODO
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
