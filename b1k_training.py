@@ -2,6 +2,7 @@
 
 import argparse
 from contextlib import contextmanager, ExitStack, nullcontext
+from datetime import timedelta
 import fcntl
 from functools import partial
 import hashlib
@@ -37,6 +38,9 @@ from b1k_language import (ENCODERS, build_language_cache, language_dim, language
 
 LOGGER = logging.getLogger(__name__)
 CHECKPOINT_VERSION = 1
+# Rank 0 alone validates and saves (and under --compile first compiles the validation shapes) while the other ranks
+# wait in their next collective; NCCL's default watchdog (10 min) would abort them on a slow first validation.
+DISTRIBUTED_TIMEOUT = timedelta(minutes=30)
 # Conditioning regimes (b1k.md "Goal-image conditioning"): which task-specifying modalities the policy receives.
 #   none           N  observation/proprioception only (no task id, no language, no goal)
 #   language       L  task-dependent language (mt_act or clip_film), no goal
@@ -1046,6 +1050,11 @@ def parser():
     p.add_argument('--save-first-step', action='store_true', help='Also save and queue a full checkpoint at step 1')
     p.add_argument('--save-total-limit', type=int, default=0, help='Retain newest N local full checkpoints; 0 keeps all')
     p.add_argument('--export-every', type=int, default=0, help='Queue eval-only checkpoints every N steps; 0 disables queues')
+    p.add_argument('--stop-file', type=Path, metavar='PATH',
+                   help='Checked before the first step and after every step: once PATH exists (on any rank; the ranks '
+                        'agree through an all-reduce), every rank stops after the same step, a full checkpoint of it '
+                        'is saved and, with --export-every, queued for the uploader as the newest resumable '
+                        'checkpoint (also off the --save-every grid), and training exits 0. --resume continues from it')
     p.add_argument('--val-fraction', type=float, default=0.0, action=ExplicitOption, metavar='FRAC',
                    help='Hold out FRAC (e.g. 0.1 for 10%%) of each selected task\'s episodes for validation, drawn '
                         'deterministically from (seed, task_name); normalization statistics are computed over the '
@@ -1113,12 +1122,23 @@ def distributed_context(device_spec, world_size, local_rank):
         torch.cuda.set_device(local_rank)
     owned = not dist.is_initialized()
     if owned:
-        dist.init_process_group(backend='nccl' if cuda else 'gloo')
+        dist.init_process_group(backend='nccl' if cuda else 'gloo', timeout=DISTRIBUTED_TIMEOUT)
     try:
         yield
     finally:
         if owned and dist.is_initialized():
             dist.destroy_process_group()
+
+
+def stop_requested(stop_file, device, distributed):
+    """Whether `stop_file` exists on any rank; under DDP every rank gets the same answer (one all-reduce)."""
+    if stop_file is None:
+        return False
+    flag = torch.tensor(float(stop_file.exists()), device=device)
+    if distributed:
+        import torch.distributed as dist
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    return bool(flag.item())
 
 
 def train(args):
@@ -1424,6 +1444,10 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
         train_config['per_rank_batch_size'] = args.batch_size // world_size
     train_config['resume'] = str(args.resume) if args.resume else None
     train_config['frame_cache'] = str(args.frame_cache) if args.frame_cache else None
+    if args.stop_file is not None:
+        train_config['stop_file'] = str(args.stop_file)
+    else:
+        train_config.pop('stop_file', None)  # runs without it keep their earlier train config
     run = {'model_config': model_config, 'adapter_config': adapter, 'train_config': train_config,
            'task_map': dataset.task_map, 'episode_split': episode_split, 'settle_steps': dataset.settle,
            'normalization': stats, 'wandb': wandb_identity,
@@ -1512,6 +1536,10 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
         else:
             val_frames = choose_val_figure_frames(val_dataset, args.seed)
             LOGGER.info('Validation action figures at (episode, frame) %s', val_frames)
+    if stop_requested(args.stop_file, device, distributed):
+        if is_main:
+            LOGGER.info('Stop file %s exists before step %d: exiting without training', args.stop_file, start + 1)
+        return None
     batches = optimizer_batches(loader, per_rank_batch_size, args.loader_batch_size, device=device, stream=copy_stream)
     fetch_start = time.monotonic()
     upcoming = next(batches, None)
@@ -1551,6 +1579,7 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
             if cuda:
                 torch.cuda.synchronize(device)
             trained = time.monotonic()
+            stop = stop_requested(args.stop_file, device, distributed)
             if is_main:
                 record = {'step': step, **{k: float(v) for k, v in zip(loss_keys, loss_values)},
                           'grad_norm': float(grad_norm), 'lr': optimizer.param_groups[0]['lr'],
@@ -1578,7 +1607,7 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                 if args.export_every and step % args.export_every == 0:
                     exported = save_eval_checkpoint(run, policy, step, output)
                     LOGGER.info('Queued eval-only checkpoint %s', exported)
-                if step % args.save_every == 0 or step == args.max_steps or (args.save_first_step and step == 1):
+                if step % args.save_every == 0 or step == args.max_steps or (args.save_first_step and step == 1) or stop:
                     saved = {'format': 'act-b1k', 'version': CHECKPOINT_VERSION, 'checkpoint_type': 'full',
                              'step': step, **run, 'model': policy.state_dict(), 'optimizer': optimizer.state_dict(),
                              'torch_rng': torch.get_rng_state(),
@@ -1599,6 +1628,10 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                     tracked.log({**record, **val_images}, step=step)
             del images, qpos, actions, is_pad, goal, task_id, losses, loss_values, grad_norm, batch, timings, lang_emb, kwargs
             previous_end = time.monotonic()
+            if stop:
+                if is_main:
+                    LOGGER.info('Stop file %s: stopped after step %d (checkpoint %s)', args.stop_file, step, path)
+                break
     if distributed:
         dist.barrier()
     return path
