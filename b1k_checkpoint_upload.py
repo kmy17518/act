@@ -16,7 +16,7 @@ import uuid
 
 
 MARKER = '.b1k-uploader.json'
-STEP = re.compile(r'^step[-_](\d{8})\.pt$')
+STEP = re.compile(r'^step[-_](\d{8})\.(pt|tar)$')
 PROTOCOL = 1
 LOGGER = logging.getLogger(__name__)
 
@@ -160,8 +160,8 @@ class CheckpointUploader:
         self.max_steps = max_steps
         self.eval_every = eval_every
         self.metadata = metadata or {}
-        if max_steps <= 0 or eval_every <= 0 or max_steps % eval_every:
-            raise ValueError('max_steps must be a positive multiple of eval_every')
+        if max_steps <= 0 or eval_every <= 0:
+            raise ValueError('max_steps and eval_every must be positive')
         self.state_path = self.staging_dir / 'state.json'
         self.status_path = self.staging_dir / 'status.json'
         self.state = None
@@ -372,14 +372,16 @@ class CheckpointUploader:
             directory = self.run_dir / 'export_queue' / kind
             matches = []
             seen_steps = set()
-            for path in directory.glob('*.pt'):
+            for path in [*directory.glob('*.pt'), *directory.glob('*.tar')]:
                 if path.is_symlink():
                     raise SafetyError(f'Queue checkpoint must not be a symlink: {path}')
                 match = STEP.fullmatch(path.name)
                 if not match:
                     raise SafetyError(f'Unexpected queue filename: {path}')
                 step = int(match.group(1))
-                if not 0 < step <= self.max_steps or (kind == 'eval' and step % self.eval_every):
+                # A trainer's last checkpoint can be off the eval_every grid (openpi: num_train_steps - 1).
+                if (not 0 < step <= self.max_steps
+                        or (kind == 'eval' and step % self.eval_every and step != self.max_steps)):
                     raise SafetyError(f'Unexpected {kind} checkpoint step: {step}')
                 if step in seen_steps:
                     raise SafetyError(f'Duplicate {kind} queue checkpoint step: {step}')
@@ -392,7 +394,7 @@ class CheckpointUploader:
                 if kind == 'full' and current and step < current['step']:
                     continue
                 entries.append({'kind': kind, 'step': step, 'source': str(path),
-                                'path': f'{"eval" if kind == "eval" else "resume"}/step-{step:08d}.pt'})
+                                'path': f'{"eval" if kind == "eval" else "resume"}/step-{step:08d}{path.suffix}'})
         return entries
 
     def prepare(self):
@@ -401,7 +403,7 @@ class CheckpointUploader:
             return False
         transaction = str(uuid.uuid4())
         for index, entry in enumerate(entries):
-            entry['stage'] = str(self.staging_dir / 'files' / f'{transaction}-{index}.pt')
+            entry['stage'] = str(self.staging_dir / 'files' / f'{transaction}-{index}{Path(entry["path"]).suffix}')
         self.state['pending'] = {'id': transaction, 'phase': 'stage', 'entries': entries,
                                  'parent': self.state['head'], 'old_full': [], 'gc_intent': []}
         self.save()
@@ -490,7 +492,7 @@ class CheckpointUploader:
             if (item.filename != old['path'] or item.size != old['size']
                     or item.ref not in (None, 'main', 'refs/heads/main')):
                 raise SafetyError('GC object does not match the exact recorded old-full path/size/ref')
-            if not re.fullmatch(r'resume/step-\d{8}\.pt', item.filename):
+            if not re.fullmatch(r'resume/step-\d{8}\.(pt|tar)', item.filename):
                 raise SafetyError('GC candidate is not a known full checkpoint')
             deletions.append(item)
         # Check refs, marker, complete live tree and head again immediately before destruction.
@@ -561,7 +563,7 @@ class CheckpointUploader:
         self.state['last_success'] = now()
         self.state['last_error'] = None
         self.save()
-        expected = set(range(self.eval_every, self.max_steps + 1, self.eval_every))
+        expected = set(range(self.eval_every, self.max_steps + 1, self.eval_every)) | {self.max_steps}
         complete = (self.state['manifest']['full'] or {}).get('step') == self.max_steps
         complete = complete and expected == {int(step) for step in self.state['manifest']['eval']}
         self.status('complete' if complete else 'idle')

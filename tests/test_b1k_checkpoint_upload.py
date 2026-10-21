@@ -63,7 +63,7 @@ class FakeApi:
     def list_repo_tree(self, *args, **kwargs):
         assert kwargs['revision'] == self.head
         for path, data in sorted(self.files.items()):
-            lfs = SimpleNamespace(sha256=hashlib.sha256(data).hexdigest()) if path.endswith('.pt') else None
+            lfs = SimpleNamespace(sha256=hashlib.sha256(data).hexdigest()) if path.endswith(('.pt', '.tar')) else None
             yield SimpleNamespace(path=path, size=len(data), blob_id=upload.git_oid(data), lfs=lfs)
 
     def advance(self):
@@ -80,7 +80,7 @@ class FakeApi:
                 value = operation.path_or_fileobj
                 data = value if isinstance(value, bytes) else Path(value).read_bytes()
                 self.files[operation.path_in_repo] = data
-                if operation.path_in_repo.endswith('.pt'):
+                if operation.path_in_repo.endswith(('.pt', '.tar')):
                     oid = hashlib.sha256(data).hexdigest()
                     self.lfs.setdefault(oid, SimpleNamespace(file_oid=oid, filename=operation.path_in_repo,
                                                             size=len(data), ref='refs/heads/main'))
@@ -106,7 +106,8 @@ class FakeApi:
         if self.fail_before_gc:
             self.fail_before_gc = False
             raise ConnectionError('connection failed before GC')
-        live = {hashlib.sha256(data).hexdigest() for path, data in self.files.items() if path.endswith('.pt')}
+        live = {hashlib.sha256(data).hexdigest() for path, data in self.files.items()
+                if path.endswith(('.pt', '.tar'))}
         for item in files:
             assert item.file_oid not in live
             self.deleted.append(item.file_oid)
@@ -118,10 +119,10 @@ class FakeApi:
             raise ConnectionError('lost GC response after history rewrite')
 
 
-def queue(run, kind, step, data=b'checkpoint', separator='_'):
+def queue(run, kind, step, data=b'checkpoint', separator='_', suffix='.pt'):
     directory = run / 'export_queue' / kind
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f'step{separator}{step:08d}.pt'
+    path = directory / f'step{separator}{step:08d}{suffix}'
     path.write_bytes(data)
     return path
 
@@ -446,11 +447,12 @@ def test_pr_appearing_during_gc_listing_blocks_deletion(tmp_path):
         assert not api.deleted
 
 
-def test_duplicate_step_filenames_rejected(tmp_path):
+@pytest.mark.parametrize('suffixes', [('.pt', '.pt'), ('.pt', '.tar')])
+def test_duplicate_step_filenames_rejected(tmp_path, suffixes):
     api = FakeApi()
     run = tmp_path / 'run'
-    queue(run, 'eval', 10000, b'eval1', separator='_')
-    queue(run, 'eval', 10000, b'eval2', separator='-')
+    queue(run, 'eval', 10000, b'eval1', separator='_', suffix=suffixes[0])
+    queue(run, 'eval', 10000, b'eval2', separator='-', suffix=suffixes[1])
     with uploader(tmp_path, api) as worker:
         with pytest.raises(upload.SafetyError, match='Duplicate'):
             worker.run_once()
@@ -479,6 +481,51 @@ def test_cli_creates_private_repo_by_default_and_public_with_flag(tmp_path, monk
         assert upload.main(argv + ([] if flags else ['--public'])) == 0  # restart asking for the other visibility
         assert api.private is private
         assert 'leaving its visibility unchanged' in caplog.text
+
+
+def test_tar_exports_keep_one_resume_tar_and_collect_the_superseded_one(tmp_path):
+    api = FakeApi()
+    run = tmp_path / 'run'
+    queue(run, 'full', 5000, b'first full tar', suffix='.tar')
+    queue(run, 'eval', 5000, b'first eval tar', suffix='.tar')
+    with uploader(tmp_path, api, max_steps=99999, eval_every=5000) as worker:
+        worker.run_once()
+        assert not list((run / 'export_queue').rglob('*.tar'))
+        queue(run, 'full', 10000, b'second full tar', suffix='.tar')
+        queue(run, 'eval', 10000, b'second eval tar', suffix='.tar')
+        worker.run_once()
+        assert api.deleted == [hashlib.sha256(b'first full tar').hexdigest()]
+        assert {path: data for path, data in api.files.items() if path.startswith(('eval/', 'resume/'))} == {
+            'eval/step-00005000.tar': b'first eval tar', 'eval/step-00010000.tar': b'second eval tar',
+            'resume/step-00010000.tar': b'second full tar'}
+        assert not list((run / 'export_queue').rglob('*.tar'))
+        assert not list((tmp_path / 'stage/files').iterdir())
+        assert worker.state['gc_freed_bytes'] == len(b'first full tar')
+
+
+def test_final_step_off_the_eval_grid_is_uploaded_and_ends_the_cli(tmp_path, monkeypatch):
+    api = FakeApi()
+    run = tmp_path / 'run'
+    for step in range(5000, 100000, 5000):
+        queue(run, 'eval', step, b'eval %d' % step, suffix='.tar')
+    queue(run, 'full', 95000, b'full 95000', suffix='.tar')
+    with uploader(tmp_path, api, max_steps=99999, eval_every=5000) as worker:
+        assert not worker.run_once()
+        queue(run, 'eval', 97500, b'off the grid', suffix='.tar')
+        with pytest.raises(upload.SafetyError, match='Unexpected eval checkpoint step: 97500'):
+            worker.run_once()
+    (run / 'export_queue/eval/step_00097500.tar').unlink()
+    queue(run, 'eval', 99999, b'eval 99999', suffix='.tar')
+    queue(run, 'full', 99999, b'full 99999', suffix='.tar')
+    monkeypatch.setattr(upload, 'make_api', lambda *args: api)
+    monkeypatch.setattr(upload.time, 'sleep', lambda seconds: pytest.fail('the uploader kept polling'))
+    assert upload.main(['--run-dir', str(run), '--staging-dir', str(tmp_path / 'stage'),
+                        '--repo-id', 'tester/dedicated', '--max-steps', '99999', '--eval-every', '5000']) == 0
+    assert json.loads((tmp_path / 'stage/status.json').read_text())['health'] == 'complete'
+    assert api.files['eval/step-00099999.tar'] == b'eval 99999'
+    assert [path for path in api.files if path.startswith('resume/')] == ['resume/step-00099999.tar']
+    assert len([path for path in api.files if path.startswith('eval/')]) == 20
+    assert not list((run / 'export_queue').rglob('*.tar'))
 
 
 def test_cli_fatal_status_and_exit_code(tmp_path, monkeypatch):
