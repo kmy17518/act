@@ -5,6 +5,7 @@ from contextlib import contextmanager, ExitStack, nullcontext
 import fcntl
 from functools import partial
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -576,6 +577,85 @@ def evaluate_validation(policy, val_dataset, val_batches, val_batch_size, langua
         metrics[f'val/inference_l1/{family}'] = inf_sum / max(1, count)
     metrics['timing/val_s'] = time.monotonic() - started
     return metrics
+
+
+def choose_val_figure_frames(val_dataset, seed, count=4):
+    """Fixed (episode, frame) pairs for the validation action figures: one per task family (task name before the
+    first '-') when the run has more than one family, else frames of `count` different validation episodes."""
+    rng = np.random.default_rng(seed)
+    family_of = {int(task): str(name).split('-')[0] for task, name in val_dataset.task_map.items()}
+    families = sorted(set(family_of.values()))
+    if len(families) > 1:
+        groups = [[ep for ep in val_dataset.episodes if family_of[int(ep['task_index'])] == family]
+                  for family in families]
+        episodes = [group[rng.integers(len(group))] for group in groups]
+    else:
+        picks = rng.choice(len(val_dataset.episodes), min(count, len(val_dataset.episodes)), replace=False)
+        episodes = [val_dataset.episodes[i] for i in picks]
+    return [(int(ep['episode_index']), int(rng.integers(int(ep['length'])))) for ep in episodes]
+
+
+def action_chunk_figure(prediction, target, valid, title):
+    """Matplotlib figure of one (chunk, action_dim) chunk: one small plot per action dimension over the valid steps."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    steps = np.flatnonzero(valid)
+    dims = target.shape[-1]
+    figure, axes = plt.subplots(-(-dims // 6), 6, figsize=(18, 10), squeeze=False, layout='constrained')
+    for dim, axis in enumerate(axes.flat):
+        if dim >= dims:
+            axis.remove()
+            continue
+        axis.plot(steps, target[steps, dim], color='tab:blue', linewidth=1, label='ground truth')
+        axis.plot(steps, prediction[steps, dim], color='tab:orange', linewidth=1, label='prediction')
+        axis.set_title(f'action {dim}', fontsize=8)
+        axis.tick_params(labelsize=6)
+    axes.flat[0].legend(fontsize=6)
+    figure.suptitle(title, fontsize=10)
+    return figure
+
+
+def figure_image(figure):
+    """RGB uint8 array of a matplotlib figure, which is closed."""
+    import matplotlib.pyplot as plt
+    try:
+        figure.canvas.draw()
+        return np.asarray(figure.canvas.buffer_rgba())[..., :3].copy()
+    finally:
+        plt.close(figure)
+
+
+def validation_action_figures(policy, val_dataset, frames, language_embeddings, task_map, device, autocast,
+                              channels_last):
+    """`val/actions/sample_<i>` RGB images of the zero-latent prediction and ground truth (action units) at `frames`."""
+    samples = [val_dataset.sample_at(episode, frame) for episode, frame in frames]
+    batch = tuple(torch.stack(column).to(device) for column in zip(*samples))
+    images, qpos, actions, is_pad, goal, task_id, _ = consume_batch(batch, None, channels_last)
+    lang_emb = language_for_tasks(task_id, language_embeddings, task_map)
+    kwargs = {'lang_emb': lang_emb} if lang_emb is not None else {}
+    if goal is not None:
+        kwargs['goal'] = goal
+    was_training = policy.training
+    try:
+        policy.eval()
+        # Eager: under --compile a new batch shape would otherwise recompile regions the training step shares.
+        with torch.compiler.set_stance('force_eager'), torch.random.fork_rng(
+                devices=[device] if device.type == 'cuda' else []), torch.no_grad(), autocast():
+            prediction = policy(qpos, images, **kwargs)
+    finally:
+        policy.train(was_training)
+    if prediction.dim() == 2:
+        prediction = prediction.unsqueeze(1)
+    queries = prediction.shape[1]
+    mean = np.asarray(val_dataset.stats['action_mean'], dtype=np.float32)
+    std = np.asarray(val_dataset.stats['action_std'], dtype=np.float32)
+    prediction = prediction.float().cpu().numpy() * std + mean
+    target = actions[:, :queries].float().cpu().numpy() * std + mean
+    valid = (~is_pad[:, :queries]).cpu().numpy()
+    return {f'val/actions/sample_{i}': figure_image(action_chunk_figure(
+                prediction[i], target[i], valid[i], f'{task_map[int(task)]}  episode {episode}  frame {frame}'))
+            for i, ((episode, frame), task) in enumerate(zip(frames, task_id.tolist()))}
 
 
 def configure_cpu_threads(worker_id=None, torch_threads=1, arrow_threads=1, opencv_threads=1):
@@ -1425,6 +1505,13 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
     previous_end = begin
     val_every = (args.val_every or args.save_every) if val_dataset is not None else 0
     val_batch_size = args.val_batch_size or min(64, args.batch_size)
+    val_frames = []
+    if tracked and val_dataset is not None:
+        if importlib.util.find_spec('matplotlib') is None:
+            LOGGER.warning('matplotlib is not installed: no val/actions figures')
+        else:
+            val_frames = choose_val_figure_frames(val_dataset, args.seed)
+            LOGGER.info('Validation action figures at (episode, frame) %s', val_frames)
     batches = optimizer_batches(loader, per_rank_batch_size, args.loader_batch_size, device=device, stream=copy_stream)
     fetch_start = time.monotonic()
     upcoming = next(batches, None)
@@ -1476,11 +1563,17 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                 else:
                     record.update({f'gpu/{key}_bytes': 0 for key in
                                    ('allocated', 'reserved', 'peak_allocated', 'peak_reserved')})
+                val_images = {}
                 if val_dataset is not None and (step % val_every == 0 or step == args.max_steps
                                                 or (args.save_first_step and step == 1)):
                     record.update(evaluate_validation(policy, val_dataset, args.val_batches, val_batch_size,
                                                       language_embeddings, dataset.task_map, device, autocast,
                                                       args.channels_last, args.seed))
+                    if val_frames:
+                        import wandb
+                        val_images = {key: wandb.Image(image) for key, image in validation_action_figures(
+                            policy, val_dataset, val_frames, language_embeddings, dataset.task_map, device, autocast,
+                            args.channels_last).items()}
                 checkpoint_start = time.monotonic()
                 if args.export_every and step % args.export_every == 0:
                     exported = save_eval_checkpoint(run, policy, step, output)
@@ -1503,7 +1596,7 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                 metrics.flush()
                 LOGGER.info('%s', json.dumps(record))
                 if tracked:
-                    tracked.log(record, step=step)
+                    tracked.log({**record, **val_images}, step=step)
             del images, qpos, actions, is_pad, goal, task_id, losses, loss_values, grad_norm, batch, timings, lang_emb, kwargs
             previous_end = time.monotonic()
     if distributed:

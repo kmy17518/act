@@ -18,6 +18,7 @@ import uuid
 MARKER = '.b1k-uploader.json'
 STEP = re.compile(r'^step[-_](\d{8})\.pt$')
 PROTOCOL = 1
+LOGGER = logging.getLogger(__name__)
 
 
 class SafetyError(RuntimeError):
@@ -149,11 +150,12 @@ class CheckpointUploader:
     """Keep all remote mutations recoverable from an fsynced local journal."""
 
     def __init__(self, run_dir, staging_dir, repo_id, api, *, run_id=None,
-                 max_steps=300000, eval_every=10000, metadata=None):
+                 max_steps=300000, eval_every=10000, metadata=None, public=False):
         self.run_dir = Path(run_dir).resolve()
         self.staging_dir = Path(staging_dir).resolve()
         self.repo_id = repo_id
         self.api = api
+        self.public = public
         self.run_id = run_id or self.run_dir.name
         self.max_steps = max_steps
         self.eval_every = eval_every
@@ -165,6 +167,7 @@ class CheckpointUploader:
         self.state = None
         self._locks = None
         self._authenticated = False
+        self._visibility_checked = False
 
     def __enter__(self):
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -313,6 +316,12 @@ class CheckpointUploader:
 
     def initialize(self):
         from huggingface_hub.errors import RepositoryNotFoundError
+        if self.state['phase'] not in ('new', 'creating') and not self._visibility_checked:
+            private = self.api.repo_info(self.repo_id, repo_type='model').private
+            if private == self.public:
+                LOGGER.warning('%s already exists as %s but %s was requested; leaving its visibility unchanged',
+                               self.repo_id, 'private' if private else 'public', 'public' if self.public else 'private')
+            self._visibility_checked = True
         if self.state['phase'] == 'ready':
             return
         if self.state['phase'] == 'new':
@@ -324,14 +333,14 @@ class CheckpointUploader:
                 raise SafetyError('Refusing an existing repository without this local ownership journal')
             self.state['phase'] = 'creating'
             self.save()
-            self.api.create_repo(self.repo_id, repo_type='model', private=True, exist_ok=False)
+            self.api.create_repo(self.repo_id, repo_type='model', private=not self.public, exist_ok=False)
             self.state['phase'] = 'created'
             self.save()
         if self.state['phase'] == 'creating':
             try:
                 self.api.repo_info(self.repo_id, repo_type='model')
             except RepositoryNotFoundError:
-                self.api.create_repo(self.repo_id, repo_type='model', private=True, exist_ok=False)
+                self.api.create_repo(self.repo_id, repo_type='model', private=not self.public, exist_ok=False)
                 self.state['phase'] = 'created'
                 self.save()
             else:
@@ -572,6 +581,8 @@ def parser():
     result.add_argument('--metadata', action='append', default=[], metavar='KEY=VALUE')
     result.add_argument('--metadata-json', type=Path)
     result.add_argument('--once', action='store_true')
+    result.add_argument('--public', action='store_true',
+                        help='Create the repo public (default private); an existing repo keeps its visibility')
     return result
 
 
@@ -591,7 +602,7 @@ def main(argv=None):
     try:
         with CheckpointUploader(args.run_dir, args.staging_dir, args.repo_id, api,
                                 run_id=args.run_id, max_steps=args.max_steps,
-                                eval_every=args.eval_every, metadata=metadata) as uploader:
+                                eval_every=args.eval_every, metadata=metadata, public=args.public) as uploader:
             while True:
                 try:
                     complete = uploader.run_once()

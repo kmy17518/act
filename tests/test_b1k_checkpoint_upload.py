@@ -25,6 +25,7 @@ spec.loader.exec_module(upload)
 class FakeApi:
     def __init__(self):
         self.exists = False
+        self.private = None
         self.head = '0' * 40
         self.title = 'initial commit'
         self.files = {'.gitattributes': b'*.pt filter=lfs diff=lfs merge=lfs -text\n'}
@@ -46,12 +47,13 @@ class FakeApi:
     def repo_info(self, *args, **kwargs):
         if not self.exists:
             raise RepositoryNotFoundError('missing')
-        return SimpleNamespace(sha=self.head)
+        return SimpleNamespace(sha=self.head, private=self.private)
 
     def create_repo(self, *args, **kwargs):
-        assert kwargs['private'] and not kwargs['exist_ok']
+        assert not kwargs['exist_ok']
         assert not self.exists
         self.exists = True
+        self.private = kwargs['private']
 
     def list_repo_refs(self, *args, **kwargs):
         assert kwargs['include_pull_requests']
@@ -462,6 +464,21 @@ def test_cli_exits_when_all_checkpoints_complete(tmp_path, monkeypatch):
     monkeypatch.setattr(upload, 'make_api', lambda *args: api)
     assert upload.main(['--run-dir', str(run), '--staging-dir', str(tmp_path / 'stage'),
                         '--repo-id', 'tester/dedicated', '--max-steps', '10000']) == 0
+
+
+def test_cli_creates_private_repo_by_default_and_public_with_flag(tmp_path, monkeypatch, caplog):
+    for flags, private in (([], True), (['--public'], False)):
+        api = FakeApi()
+        monkeypatch.setattr(upload, 'make_api', lambda *args: api)
+        root = tmp_path / ('public' if flags else 'private')
+        argv = ['--run-dir', str(root / 'run'), '--staging-dir', str(root / 'stage'), '--repo-id', 'tester/dedicated',
+                '--once']
+        assert upload.main(argv + flags) == 0
+        assert api.private is private
+        caplog.clear()
+        assert upload.main(argv + ([] if flags else ['--public'])) == 0  # restart asking for the other visibility
+        assert api.private is private
+        assert 'leaving its visibility unchanged' in caplog.text
 
 
 def test_cli_fatal_status_and_exit_code(tmp_path, monkeypatch):

@@ -304,6 +304,41 @@ def test_validation_reports_per_family_l1_only_for_multi_family_runs(tiny_root):
         assert low <= metrics['val/inference_l1'] <= high
 
 
+def test_validation_action_figures_plot_valid_steps_of_fixed_frames(tiny_root):
+    from contextlib import nullcontext
+    from b1k_training import action_chunk_figure, choose_val_figure_frames, validation_action_figures
+    import matplotlib.pyplot as plt
+    rng = np.random.default_rng(0)
+    prediction, target = rng.normal(size=(8, 23)), rng.normal(size=(8, 23))
+    figure = action_chunk_figure(prediction, target, np.arange(8) < 5, 'first  episode 0  frame 3')
+    assert len(figure.axes) == 23
+    for dim, axis in enumerate(figure.axes):
+        truth, predicted = axis.lines
+        np.testing.assert_array_equal(truth.get_xdata(), np.arange(5))
+        np.testing.assert_array_equal(truth.get_ydata(), target[:5, dim])
+        np.testing.assert_array_equal(predicted.get_ydata(), prediction[:5, dim])
+    plt.close(figure)
+    torch.set_num_threads(1)
+    for tasks in (['first', 'second'], ['first']):
+        dataset = B1KDataset(tiny_root, tasks, chunk_size=4, image_size=(32, 32))
+        dataset.stats = dataset.compute_stats()
+        frames = choose_val_figure_frames(dataset, 0)
+        assert frames == choose_val_figure_frames(dataset, 0)
+        task_of = {int(ep['episode_index']): dataset.task_map[int(ep['task_index'])] for ep in dataset.episodes}
+        if len(tasks) > 1:
+            assert sorted(task_of[episode] for episode, _ in frames) == ['first', 'second']
+        else:
+            assert len({episode for episode, _ in frames}) == len(frames) == min(4, len(dataset.episodes))
+        torch.manual_seed(14)
+        policy = make_policy(dict(small_model_config(), state_dim=len(dataset[0][1])), 'cpu')
+        images = validation_action_figures(policy, dataset, frames, None, dataset.task_map, torch.device('cpu'),
+                                           nullcontext, False)
+        dataset.close()
+        assert list(images) == [f'val/actions/sample_{i}' for i in range(len(frames))]
+        assert all(image.dtype == np.uint8 and image.ndim == 3 and image.shape[-1] == 3 for image in images.values())
+        assert policy.training and not plt.get_fignums()
+
+
 def test_gripper_snap_clamps_and_opens_on_every_session_path():
     from b1k_server import GRIPPER_ACTION_DIMS, snap_grippers
     assert GRIPPER_ACTION_DIMS == [14, 22]
@@ -1776,7 +1811,7 @@ def test_network_handshake_health_reset_batch_and_connection_isolation():
     asyncio.run(run())
 
 
-def test_val_split_logs_val_metrics_isolates_rng_and_resumes_exactly(tiny_root, tmp_path):
+def test_val_split_logs_val_metrics_isolates_rng_and_resumes_exactly(tiny_root, tmp_path, fake_wandb):
     torch.set_num_threads(1)
     # 1 episode per task is rejected when --val-fraction > 0.
     with pytest.raises(ValueError, match='at least 2 are required for --val-fraction'):
@@ -1807,12 +1842,20 @@ def test_val_split_logs_val_metrics_isolates_rng_and_resumes_exactly(tiny_root, 
               '--device', 'cpu', '--chunk-size', '4', '--image-size', '32', '32', '--hidden-dim', '32',
               '--dim-feedforward', '64', '--enc-layers', '1', '--dec-layers', '1', '--nheads', '4',
               '--no-pretrained-backbone', '--save-every', '1', '--val-batches', '2', '--val-batch-size', '2']
-    # Running validation at every step (--val-every 1, which defaults --val-fraction to 0.1) vs only at step 3
-    # (--val-fraction 0.1 --val-every 3) must leave the training trajectory and weights bitwise identical.
+    # Running validation at every step (--val-every 1, which defaults --val-fraction to 0.1, with W&B action figures)
+    # vs only at step 3 (--val-fraction 0.1 --val-every 3) must leave the training trajectory and weights bitwise
+    # identical.
     every_1 = tmp_path / 'every1'
     every_3 = tmp_path / 'every3'
     resumed_dir = tmp_path / 'resumed'
-    train(parser().parse_args(common + ['--output-dir', str(every_1), '--max-steps', '3', '--val-every', '1']))
+    train(parser().parse_args(common + ['--output-dir', str(every_1), '--max-steps', '3', '--val-every', '1',
+                                        '--wandb-mode', 'online', '--wandb-project', 'test-project',
+                                        '--wandb-entity', 'test-entity']))
+    sdk, runs = fake_wandb
+    logged = [(call.args[0], call.kwargs['step']) for call in runs[0].log.call_args_list]
+    assert [(sorted(k for k in row if k.startswith('val/actions/')), row['step'], step) for row, step in logged] == [
+        (['val/actions/sample_0'], step, step) for step in (1, 2, 3)]  # one validation episode: one frame
+    assert sdk.Image.call_count == 3 and sdk.Image.call_args.args[0].dtype == np.uint8
     train(parser().parse_args(common + ['--output-dir', str(every_3), '--max-steps', '3',
                                         '--val-fraction', '0.1', '--val-every', '3']))
     train(parser().parse_args(common + ['--output-dir', str(resumed_dir), '--max-steps', '2', '--val-every', '1']))
