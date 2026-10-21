@@ -294,10 +294,12 @@ def test_validation_reports_per_family_l1_only_for_multi_family_runs(tiny_root):
                                       False, 0)
         family_keys = {key for key in metrics if key.count('/') == 2}
         dataset.close()
+        assert metrics['val/l1_action_units'] > 0
         if len(tasks) == 1:
             assert not family_keys
             continue
-        assert family_keys == {'val/l1/first', 'val/l1/second', 'val/inference_l1/first', 'val/inference_l1/second'}
+        assert family_keys == {'val/l1/first', 'val/l1/second', 'val/inference_l1/first', 'val/inference_l1/second',
+                               'val/l1_action_units/first', 'val/l1_action_units/second'}
         assert all(np.isfinite(metrics[key]) and metrics[key] > 0 for key in family_keys)
         # the two families partition the pooled zero-latent L1 (the same valid elements)
         low, high = sorted([metrics['val/inference_l1/first'], metrics['val/inference_l1/second']])

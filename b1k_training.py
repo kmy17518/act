@@ -21,10 +21,11 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from b1k_dataset import (B1KDataset, CAMERAS, GOAL_OBS_KEYS, GOAL_SOURCES, GOAL_VIDEO_KEYS, GRIPPER_STATES, OBS_KEYS,
-                         STATE_INDICES, VIDEO_KEYS, SplitBatchSampler, StepBatchSampler, describe_episode_split,
+from b1k_dataset import (ACTION_DELTA, ACTION_REPRESENTATIONS, B1KDataset, CAMERAS, GOAL_OBS_KEYS, GOAL_SOURCES,
+                         GOAL_VIDEO_KEYS, GRIPPER_STATES, NORMALIZATIONS, OBS_KEYS, QUANTILE_MIN_RANGE, STATE_INDICES,
+                         VIDEO_KEYS, SplitBatchSampler, StepBatchSampler, decode_actions, describe_episode_split,
                          expand_task_groups, goal_views_to_indices, parse_settle_steps, proprio_dim,
-                         resolve_episode_split)
+                         resolve_episode_split, unnormalize)
 from b1k_frame_cache import dequantize_images
 from detr.models.backbone import SpaceToDepthStem, parse_goal_stem_init, replaces_stem
 from detr.models.detr_vae import (GOAL_CONTENTS, GOAL_ENCODERS, GOAL_ENTRIES, GOAL_FUSIONS, GOAL_POSITIONS, GOAL_TOKENS,
@@ -102,8 +103,16 @@ def load_checkpoint(path):
         raise ValueError('Unsupported checkpoint gripper state layout')
     if adapter['video_keys'] != VIDEO_KEYS or adapter['observation_keys'] != OBS_KEYS:
         raise ValueError('Unsupported checkpoint camera mapping')
-    if adapter['action_transform'] != 'identity' or adapter['action_shift'] != 0:
+    representation = checkpoint['model_config'].get('action_representation', 'absolute')
+    # relative checkpoints record action_transform 'relative' so that code from before the option refuses them
+    if (representation not in ACTION_REPRESENTATIONS or adapter['action_shift'] != 0
+            or adapter['action_transform'] != {'absolute': 'identity', 'relative': 'relative'}[representation]):
         raise ValueError('Unsupported checkpoint action semantics')
+    stats = checkpoint['normalization']
+    if (checkpoint['model_config'].get('normalization', 'zscore') != stats.get('method', 'zscore')
+            or representation != stats.get('action_representation', 'absolute')
+            or (representation == 'relative') != ('action_delta' in stats)):
+        raise ValueError('Checkpoint normalization statistics do not match its action representation / normalization')
     if adapter.get('task_conditioning', 'onehot') not in ('onehot', 'none'):
         raise ValueError('Unsupported checkpoint task conditioning')
     name = policy_class(checkpoint['model_config'])
@@ -370,9 +379,13 @@ def verify_resynced_dataset(dataset, stats, fingerprint):
     """
     if stats.get('approximate'):
         raise ValueError('Resume dataset metadata/files differ from checkpoint; use the same local subset')
-    recomputed = dataset.compute_stats()
+    recomputed = dataset.compute_normalization_stats(stats.get('method', 'zscore'),
+                                                     stats.get('action_representation', 'absolute'),
+                                                     min_range=stats.get('min_range', QUANTILE_MIN_RANGE))
     keys = ('qpos_mean', 'qpos_std', 'action_mean', 'action_std', 'count', 'std_correction', 'std_floor')
-    if any(recomputed[key] != stats[key] for key in keys) or recomputed['approximate']:
+    if 'method' in stats:
+        keys = [key for key in stats if key != 'fingerprint']
+    if any(recomputed.get(key) != stats[key] for key in keys) or recomputed['approximate']:
         raise ValueError('Resume dataset metadata/files differ from checkpoint; use the same local subset')
     LOGGER.warning('Dataset fingerprint changed (%s -> %s) but the exact statistics of all %d selected frames are '
                    'identical; accepting the re-synced files', stats['fingerprint'][:16], fingerprint[:16], stats['count'])
@@ -500,6 +513,21 @@ def describe_val_split(val_split):
             f'across {len(val_split["tasks"])} tasks')
 
 
+def action_unit_errors(prediction, actions, is_pad, qpos, stats, gripper_state):
+    """Per-sample sums and counts of |prediction - target| over the valid chunk steps, both decoded to absolute actions
+    in action units (relative ones with the state of the sample's frame), so that runs with different action
+    representations or normalizations compare. `qpos` is the network's normalized input."""
+    prediction = prediction.detach().float().cpu().numpy().astype(np.float64)
+    if prediction.ndim == 2:
+        prediction = prediction[:, None]
+    queries = prediction.shape[1]
+    target = actions[:, :queries].float().cpu().numpy().astype(np.float64)
+    valid = (~is_pad[:, :queries]).cpu().numpy()
+    proprio = unnormalize(qpos[:, :proprio_dim(gripper_state)].float().cpu().numpy().astype(np.float64), stats, 'qpos')
+    error = np.abs(decode_actions(prediction, stats, proprio) - decode_actions(target, stats, proprio))
+    return (error * valid[..., None]).sum((1, 2)), valid.sum(1) * error.shape[-1]
+
+
 def evaluate_validation(policy, val_dataset, val_batches, val_batch_size, language_embeddings, task_map,
                         device, autocast, channels_last, seed):
     """Held-out validation losses (teacher-forced CVAE and zero-latent inference L1) without mutating RNG or mode."""
@@ -520,6 +548,8 @@ def evaluate_validation(policy, val_dataset, val_batches, val_batch_size, langua
     family_of = {int(task): str(name).split('-')[0] for task, name in task_map.items()}
     per_family = hasattr(policy, 'l1_normalization') and len(set(family_of.values())) > 1
     families = {}
+    # val/l1_action_units[/<family>]: the zero-latent L1 on absolute actions in action units (`action_unit_errors`)
+    units = {}
     try:
         policy.eval()
         torch.manual_seed(seed)
@@ -540,6 +570,12 @@ def evaluate_validation(policy, val_dataset, val_batches, val_batch_size, langua
                     else:
                         losses = policy(qpos, images, actions, is_pad, **kwargs)
                     prediction = policy(qpos, images, **kwargs)
+                for task, l1_sum, count in zip(task_id.tolist(), *action_unit_errors(
+                        prediction, actions, is_pad, qpos, val_dataset.stats, val_dataset.gripper_state)):
+                    for key in ('', family_of[int(task)]):
+                        total = units.setdefault(key, [0.0, 0])
+                        total[0] += float(l1_sum)
+                        total[1] += int(count)
                 for key, value in losses.items():
                     val = float(value.detach())
                     if not np.isfinite(val):
@@ -579,6 +615,9 @@ def evaluate_validation(policy, val_dataset, val_batches, val_batch_size, langua
     for family, (l1_sum, inf_sum, count) in sorted(families.items()):
         metrics[f'val/l1/{family}'] = l1_sum / max(1, count)
         metrics[f'val/inference_l1/{family}'] = inf_sum / max(1, count)
+    for family, (l1_sum, count) in sorted(units.items()):
+        if not family or len(set(family_of.values())) > 1:
+            metrics['val/l1_action_units' + (f'/{family}' if family else '')] = l1_sum / max(1, count)
     metrics['timing/val_s'] = time.monotonic() - started
     return metrics
 
@@ -652,10 +691,10 @@ def validation_action_figures(policy, val_dataset, frames, language_embeddings, 
     if prediction.dim() == 2:
         prediction = prediction.unsqueeze(1)
     queries = prediction.shape[1]
-    mean = np.asarray(val_dataset.stats['action_mean'], dtype=np.float32)
-    std = np.asarray(val_dataset.stats['action_std'], dtype=np.float32)
-    prediction = prediction.float().cpu().numpy() * std + mean
-    target = actions[:, :queries].float().cpu().numpy() * std + mean
+    stats = val_dataset.stats
+    proprio = unnormalize(qpos[:, :proprio_dim(val_dataset.gripper_state)].float().cpu().numpy(), stats, 'qpos')
+    prediction = decode_actions(prediction.float().cpu().numpy(), stats, proprio)
+    target = decode_actions(actions[:, :queries].float().cpu().numpy(), stats, proprio)
     valid = (~is_pad[:, :queries]).cpu().numpy()
     return {f'val/actions/sample_{i}': figure_image(action_chunk_figure(
                 prediction[i], target[i], valid[i], f'{task_map[int(task)]}  episode {episode}  frame {frame}'))
@@ -920,6 +959,17 @@ def parser():
                         'recorded frame), a number of frames (0 keeps the program only) or a decimal fraction of the '
                         'program length (0.2), capped at the recorded window. Goal images stay the last recorded frame. '
                         'Resume reuses the checkpoint\'s value; an explicit SPEC must equal it')
+    p.add_argument('--action-representation', choices=ACTION_REPRESENTATIONS, default='absolute', action=ExplicitOption,
+                   help='absolute (default): the dataset\'s commands; relative: as openpi pi05_b1k with gripper deltas, '
+                        'every chunk step minus the state at the sample\'s frame on the torso 3:7 and arm 7:14 / 15:22 '
+                        'joints, the grippers 14 / 22 minus their opening in command units (20 * (q1 + q2) - 1), the base '
+                        '0:3 unchanged (needs --gripper-state sum). Saved; resume uses the checkpoint\'s (absolute for '
+                        'checkpoints without it)')
+    p.add_argument('--normalization', choices=NORMALIZATIONS, default='zscore', action=ExplicitOption,
+                   help='zscore (default): (x - mean) / std; quantile: pi05\'s (x - q01) / (q99 - q01 + 1e-6) * 2 - 1 for '
+                        'the state and the actions, with exact 1%%/99%% quantiles of the training frames and valid chunk '
+                        'steps (dimensions narrower than 0.02 are widened to 0.02). Saved; resume uses the '
+                        'checkpoint\'s (zscore for checkpoints without it)')
     p.add_argument('--gripper-state', choices=GRIPPER_STATES, default='sum', action=ExplicitOption,
                    help='Gripper proprioception: sum (default) adds the two finger positions of each gripper into one '
                         'opening, giving a 23-value state in the action\'s layout; fingers keeps both (25 values). '
@@ -1210,7 +1260,8 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                              ('goal_stem_init', 'zero'), ('goal_tokens', 'grid'), ('lr_goal', None),
                              ('goal_pos', 'sine'), ('goal_content', 'goal'), ('goal_entry', 'encoder'),
                              ('goal_stem_gain', None), ('goal_stem_diff', False), ('goal_fusion_depth', 0),
-                             ('goal_detach_views', [])]:
+                             ('goal_detach_views', []), ('action_representation', 'absolute'),
+                             ('normalization', 'zscore')]:
             saved_value = model_config.get(key, default)
             if getattr(args, f'_{key}_explicit', False) and getattr(args, key) != saved_value:
                 raise ValueError(f'--{key.replace("_", "-")} differs from checkpoint')
@@ -1304,7 +1355,14 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                         'goal_stem_gain': args.goal_stem_gain, 'goal_stem_diff': bool(args.goal_stem_diff),
                         'goal_fusion_depth': int(args.goal_fusion_depth),
                         **({'goal_detach_views': list(args.goal_detach_views)} if args.goal_detach_views else {}),
-                        'dilation': False, 'masks': False, 'action_dim': 23}
+                        'dilation': False, 'masks': False, 'action_dim': 23,
+                        # older checkpoints: absolute / zscore; the statistics record the delta mapping
+                        'action_representation': args.action_representation, 'normalization': args.normalization}
+        if args.action_representation == 'relative':
+            if args.gripper_state != 'sum':
+                raise ValueError('--action-representation relative needs --gripper-state sum (one state value per '
+                                 'action dimension)')
+            adapter['action_transform'] = 'relative'
         if args.policy_class == 'ACT':
             model_config['l1_normalization'] = 'valid'  # resumed and older checkpoints keep their own ('all' if absent)
         if args.language_conditioning != 'none':
@@ -1382,9 +1440,12 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                 dist.barrier()
             stats['fingerprint'] = fingerprint
     else:
-        stats_path = output / f'stats_{fingerprint[:16]}_{args.stats_max_frames or "all"}.json'
+        representation = model_config.get('action_representation', 'absolute')
+        method = model_config.get('normalization', 'zscore')
+        mode = '' if (representation, method) == ('absolute', 'zscore') else f'_{representation}_{method}'
+        stats_path = output / f'stats_{fingerprint[:16]}_{args.stats_max_frames or "all"}{mode}.json'
         if is_main and not stats_path.exists():
-            stats = dataset.compute_stats(args.stats_max_frames)
+            stats = dataset.compute_normalization_stats(method, representation, args.stats_max_frames)
             atomic_json(stats, stats_path)
         if distributed:
             dist.barrier()
@@ -1515,6 +1576,10 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                     goal['goal_views'], adapter.get('goal_source', 'episode_last'), goal['goal_encoder'],
                     goal['goal_role_embedding'], goal['language_on_goal_encoder'],
                     sum(parameter.numel() for parameter in policy.parameters()))
+        LOGGER.info('Actions %s, normalization %s%s', model_config.get('action_representation', 'absolute'),
+                    model_config.get('normalization', 'zscore'),
+                    f' (q99 - q01 widened to {stats["min_range"]} on qpos dims {stats["guarded"]["qpos"]} and action '
+                    f'dims {stats["guarded"]["action"]})' if stats.get('method') == 'quantile' else '')
         if goal['goal_fusion'] != 'none':
             LOGGER.info('Goal mechanism: tag init %s, stem init %s (gain %s, diff %s, fusion depth %s), tokens %s, '
                         'positions %s, content %s, entry %s, goal LR %s (%d goal-group parameters)',

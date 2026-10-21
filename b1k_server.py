@@ -11,7 +11,7 @@ import torch
 import websockets.asyncio.server as websocket_server
 from websockets.exceptions import ConnectionClosed
 
-from b1k_dataset import CAMERAS, GOAL_OBS_KEYS, OBS_KEYS, preprocess_image, preprocess_state
+from b1k_dataset import CAMERAS, GOAL_OBS_KEYS, OBS_KEYS, decode_actions, extract_state, preprocess_image, preprocess_state
 from b1k_training import goal_config, load_checkpoint, make_policy, policy_class
 from b1k_language import language_embedding_table, language_for_tasks
 
@@ -76,8 +76,10 @@ class PolicyPredictor:
         self.policy.eval()
 
     @torch.inference_mode()
-    def __call__(self, qpos, images, task_ids=None, goal=None):
-        """Denormalized actions for a batch; `task_ids` (B,) select the cached prompt, `goal` is (B, views, 3, H, W)."""
+    def __call__(self, qpos, images, task_ids=None, goal=None, states=None):
+        """Absolute actions in action units for a batch; `task_ids` (B,) select the cached prompt, `goal` is
+        (B, views, 3, H, W). Relative-action checkpoints need `states`, the observations' raw (B, 61) R1Pro states
+        the prediction is made from: their chunks are relative to them."""
         qpos, images = qpos.to(self.device), images.to(self.device)
         kwargs = {}
         if self.language_embeddings is not None:
@@ -90,9 +92,8 @@ class PolicyPredictor:
                 raise ValueError(f'Goal-conditioned checkpoint needs goal images for views {self.goal_views}')
             kwargs['goal'] = goal.to(self.device)
         actions = self.policy(qpos, images, **kwargs).cpu().numpy()
-        stats = self.checkpoint['normalization']
-        return (actions * np.asarray(stats['action_std'], dtype=np.float32) +
-                np.asarray(stats['action_mean'], dtype=np.float32)).astype(np.float32)
+        proprio = None if states is None else extract_state(np.asarray(states, dtype=np.float32), 'sum')
+        return decode_actions(actions, self.checkpoint['normalization'], proprio).astype(np.float32)
 
 
 # Compatibility for clients importing the original B1K predictor name.
@@ -136,6 +137,9 @@ class Session:
         self.fixed_goals = {view: np.asarray(image) for view, image in (fixed_goals or {}).items() if view in self.goal_views}
         self.policy_class = policy_class(checkpoint['model_config'])
         self.chunk_size = checkpoint['model_config']['num_queries']
+        # relative chunks become absolute with the state of their own observation (the predictor's `states`), before
+        # a plan is stored or overlapping chunks are aggregated, and before the gripper snap
+        self.relative = checkpoint['model_config'].get('action_representation', 'absolute') == 'relative'
         self.temporal_agg = temporal_agg
         if self.policy_class == 'CNNMLP' and temporal_agg:
             raise ValueError('Temporal aggregation is only supported for ACT; CNNMLP predicts one action')
@@ -200,13 +204,13 @@ class Session:
                     raise ValueError(f'Goal-conditioned checkpoint needs {key} in the observation (or --goal-image {view}=PATH)')
             goal = self.batch_images(goal_batch, list(self.goal_keys.values()), batch_size)
         if self.policy_class == 'CNNMLP':
-            predictions = self.predictor(qpos, images, task_ids)
+            predictions = self.predict(state, qpos, images, task_ids)
             self.validate_predictions(predictions, (batch_size, 23))
             self.task_ids = task_ids
             return snap_grippers(predictions.astype(np.float32), self.gripper_snap)
         if self.temporal_agg:
             # the weighted average of overlapping chunks can bring a +1 opening below 1, so snap after it
-            return snap_grippers(self.aggregate(qpos, images, task_ids, goal), self.gripper_snap)
+            return snap_grippers(self.aggregate(qpos, images, task_ids, goal, state), self.gripper_snap)
         if self.plans is None or len(self.plans) != batch_size:
             plans = np.zeros((batch_size, self.action_horizon, 23), dtype=np.float32)
             positions = np.full(batch_size, self.action_horizon, dtype=np.int64)
@@ -216,8 +220,8 @@ class Session:
             positions[task_ids != self.task_ids] = self.action_horizon
         needs_plan = positions >= self.action_horizon
         if needs_plan.any():
-            predictions = self.predictor(qpos[needs_plan], images[needs_plan], task_ids[needs_plan],
-                                         None if goal is None else goal[torch.from_numpy(needs_plan)])
+            predictions = self.predict(state[needs_plan], qpos[needs_plan], images[needs_plan], task_ids[needs_plan],
+                                       None if goal is None else goal[torch.from_numpy(needs_plan)])
             expected = (int(needs_plan.sum()), self.chunk_size, 23)
             self.validate_predictions(predictions, expected)
             plans[needs_plan] = predictions[:, :self.action_horizon]
@@ -243,8 +247,13 @@ class Session:
         if predictions.shape != expected or not np.isfinite(predictions).all():
             raise ValueError(f'Invalid model output; expected finite {expected}, got {predictions.shape}')
 
-    def aggregate(self, qpos, images, task_ids, goal=None):
-        predictions = self.predictor(qpos, images, task_ids, goal)
+    def predict(self, state, *args):
+        """The predictor's absolute actions for `args` (qpos, images, task_ids[, goal]); a relative checkpoint's
+        predictor decodes them with the observations' raw `state`."""
+        return self.predictor(*args, states=state) if self.relative else self.predictor(*args)
+
+    def aggregate(self, qpos, images, task_ids, goal=None, state=None):
+        predictions = self.predict(state, qpos, images, task_ids, goal)
         batch_size = len(task_ids)
         self.validate_predictions(predictions, (batch_size, self.chunk_size, 23))
         history = []
@@ -296,6 +305,9 @@ class B1KServer:
                          'goal_observation_keys': [GOAL_OBS_KEYS[view] for view in goal['goal_views']],
                          'goal_source': checkpoint['adapter_config'].get('goal_source') if goal['goal_views'] else None,
                          'fixed_goal_views': sorted(self.fixed_goals),
+                         'action_representation': checkpoint['model_config'].get('action_representation', 'absolute'),
+                         'normalization': checkpoint['model_config'].get('normalization', 'zscore'),
+                         'served_actions': 'absolute',
                          'gripper_action_dims': GRIPPER_ACTION_DIMS,
                          'gripper_clamp': [-1.0, 1.0] if gripper_snap is not None else None,
                          'gripper_snap_threshold': gripper_snap}

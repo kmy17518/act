@@ -22,6 +22,8 @@ MATRIX = [
     {'name': 'act-learned-post', 'policy': 'ACT', 'position': 'learned', 'pre_norm': False, 'image_size': [64, 64]},
     {'name': 'act-sine-pre', 'policy': 'ACT', 'position': 'sine', 'pre_norm': True, 'image_size': [64, 64]},
     {'name': 'act-learned-pre', 'policy': 'ACT', 'position': 'learned', 'pre_norm': True, 'image_size': [64, 64]},
+    {'name': 'act-relative-quantile', 'policy': 'ACT', 'position': 'sine', 'pre_norm': False, 'image_size': [64, 64],
+     'flags': ['--action-representation', 'relative', '--normalization', 'quantile']},
     {'name': 'cnnmlp-native', 'policy': 'CNNMLP', 'image_size': [480, 640]},
     {'name': 'cnnmlp-spatial', 'policy': 'CNNMLP', 'image_size': [416, 416]},
 ]
@@ -94,12 +96,13 @@ async def exercise_websocket(checkpoint, predictor, observations, temporal_agg, 
     first, second = observations[:2]
     stats, tasks = checkpoint['normalization'], checkpoint['task_map']
     gripper_state = checkpoint['adapter_config'].get('gripper_state', 'fingers')
-    def predict(obs):
+    relative = checkpoint['model_config'].get('action_representation', 'absolute') == 'relative'
+    def predict(obs):  # absolute actions: a relative checkpoint's chunks are decoded with the observation's state
         qpos = torch.stack([preprocess_state(state, obs['task_id'], stats, tasks, gripper_state=gripper_state)
                             for state in obs['robot_r1::proprio']])
         images = torch.stack([torch.stack([preprocess_image(image, checkpoint['adapter_config']['image_size'])
                                           for image in obs[key]]) for key in OBS_KEYS], dim=1)
-        return predictor(qpos, images)
+        return predictor(qpos, images, **({'states': obs['robot_r1::proprio']} if relative else {}))
 
     reference = [predict(obs) for obs in observations[:2]]
     is_cnn = checkpoint['model_config']['policy_class'] == 'CNNMLP'
@@ -241,6 +244,7 @@ def run_variant(args, variant, observations):
             common += ['--image-size', *map(str, variant['image_size'])]
         if variant['policy'] == 'ACT':
             common += ['--position-embedding', variant['position'], '--pre-norm' if variant['pre_norm'] else '--no-pre-norm']
+        common += variant.get('flags', [])
         first_args = common + ['--max-steps', '2']
         result['commands'].append([sys.executable, 'scripts/b1k/train_b1k.py', *first_args])
         step2 = train(parser().parse_args(first_args))

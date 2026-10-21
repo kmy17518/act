@@ -46,6 +46,27 @@ TASK_GROUPS_FILE = 'isg_meta/task_groups.json'
 TASK_GROUPS_FORMAT = 'isg-task-groups/v1'
 SETTLE_WINDOWS_FILE = 'isg_meta/settle_windows.json'
 SETTLE_WINDOWS_FORMAT = 'isg-settle-windows/v1'
+# Action representation and normalization (model_config 'action_representation' / 'normalization'); the statistics
+# record both, so `dataset.stats = checkpoint['normalization']` applies a checkpoint's own transform:
+#   absolute -- the dataset's commands (checkpoints without the key);
+#   relative -- openpi pi05_b1k with --data.gripper-action delta (MappedDeltaActions): every step of a chunk minus the
+#               state at the sample's frame (not the previous action) on the torso 3:7 and arm 7:14 / 15:22 joints,
+#               the grippers 14 / 22 minus their opening in command units (20 * (q1 + q2) - 1, openpi's B1KInputs),
+#               the base velocities 0:3 unchanged (ACTION_DELTA; the `sum` gripper state lines up with the actions);
+#   zscore   -- (x - mean) / std per dimension (checkpoints without the key);
+#   quantile -- pi05's (x - q01) / (q99 - q01 + 1e-6) * 2 - 1, the quantiles of the training episodes' frames (state)
+#               and valid chunk steps (actions) (`compute_normalization_stats`).
+ACTION_REPRESENTATIONS = ('absolute', 'relative')
+NORMALIZATIONS = ('zscore', 'quantile')
+ACTION_DELTA = {'joint_action_dims': list(range(3, 14)) + list(range(15, 22)),
+                'joint_state_dims': list(range(3, 14)) + list(range(15, 22)),
+                'gripper_action_dims': [14, 22], 'gripper_state_dims': [14, 22],
+                'gripper_command_from_state': [20.0, -1.0], 'absolute_action_dims': [0, 1, 2]}
+QUANTILE_EPS = 1e-6  # openpi's
+# Dimensions whose q99 - q01 is narrower are normalized over this range around their center instead (a constant state
+# or a near-constant relative torso command would otherwise blow noise up by 1/(q99 - q01)); 0.02 matches the z-score
+# std floor of 0.01: a deviation of 0.01 maps to 1.
+QUANTILE_MIN_RANGE = 0.02
 LOGGER = logging.getLogger(__name__)
 
 
@@ -230,6 +251,79 @@ def proprio_dim(gripper_state='sum'):
     return len(STATE_INDICES) - 2 if gripper_state == 'sum' else len(STATE_INDICES)
 
 
+def action_reference(proprio, delta):
+    """What relative actions are taken against (float64, (..., 23)), from `sum`-layout proprioception (..., 23): the
+    state on the joint dims, the gripper openings in command units on the gripper dims, zero on the absolute dims."""
+    proprio = np.asarray(proprio, dtype=np.float64)
+    if proprio.shape[-1] != 23:
+        raise ValueError(f'Relative actions need the 23-value `sum` gripper state, got {proprio.shape[-1]} values')
+    reference = np.zeros(proprio.shape[:-1] + (23,))
+    reference[..., delta['joint_action_dims']] = proprio[..., delta['joint_state_dims']]
+    scale, offset = delta['gripper_command_from_state']
+    reference[..., delta['gripper_action_dims']] = scale * proprio[..., delta['gripper_state_dims']] + offset
+    return reference
+
+
+def normalize(values, stats, kind):
+    """`kind` ('qpos' or 'action') values normalized with the statistics' method (z-score unless they say quantile)."""
+    if stats.get('method', 'zscore') == 'quantile':
+        q01, q99 = (np.asarray(stats[f'{kind}_{q}'], dtype=np.float64) for q in ('q01', 'q99'))
+        return (np.asarray(values, dtype=np.float64) - q01) / (q99 - q01 + QUANTILE_EPS) * 2 - 1
+    return (values - np.asarray(stats[f'{kind}_mean'])) / np.asarray(stats[f'{kind}_std'])
+
+
+def unnormalize(values, stats, kind):
+    """Inverse of `normalize`; the z-score inverse keeps the dtype of `values` (float32 for served actions)."""
+    if stats.get('method', 'zscore') == 'quantile':
+        q01, q99 = (np.asarray(stats[f'{kind}_{q}'], dtype=np.float64) for q in ('q01', 'q99'))
+        return (np.asarray(values, dtype=np.float64) + 1) / 2 * (q99 - q01 + QUANTILE_EPS) + q01
+    values = np.asarray(values)
+    return (values * np.asarray(stats[f'{kind}_std'], dtype=values.dtype)
+            + np.asarray(stats[f'{kind}_mean'], dtype=values.dtype))
+
+
+def statistics_dim(stats, kind):
+    """Number of `kind` ('qpos' or 'action') values the statistics normalize."""
+    return len(stats[f'{kind}_q01'] if stats.get('method', 'zscore') == 'quantile' else stats[f'{kind}_mean'])
+
+
+def encode_actions(actions, proprio, stats):
+    """Raw action chunks (..., T, 23) to network targets: taken relative to `proprio` (the state of each chunk's frame,
+    (..., 23), `sum` layout) when the statistics are relative, then normalized."""
+    if stats.get('action_representation', 'absolute') == 'relative':
+        actions = np.asarray(actions, dtype=np.float64) - action_reference(proprio, stats['action_delta'])[..., None, :]
+    return normalize(actions, stats, 'action')
+
+
+def decode_actions(normalized, stats, proprio=None):
+    """Network outputs (chunks (..., T, 23) or single actions (..., 23)) to absolute actions in action units: the
+    inverse normalization, plus, when relative, the reference of `proprio`, the state they were predicted from."""
+    actions = unnormalize(normalized, stats, 'action')
+    if stats.get('action_representation', 'absolute') == 'relative':
+        if proprio is None:
+            raise ValueError('Relative actions decode only with the state they were predicted from')
+        reference = action_reference(proprio, stats['action_delta'])
+        actions = actions + (reference[..., None, :] if actions.ndim == reference.ndim + 1 else reference)
+    return actions
+
+
+def linear_quantiles(values, quantiles):
+    """numpy's default (linear) quantiles of a 1-D float array, from a partial sort of `values` in place."""
+    n = len(values)
+    positions = [q * (n - 1) for q in quantiles]
+    values.partition(sorted({min(int(p) + i, n - 1) for p in positions for i in (0, 1)}))
+    return [float(values[int(p)] + (p - int(p)) * (values[min(int(p) + 1, n - 1)] - values[int(p)])) for p in positions]
+
+
+def guard_quantiles(q01, q99, min_range):
+    """(q01, q99, guarded dims): dims with q99 - q01 < min_range get [center - min_range / 2, center + min_range / 2]."""
+    q01, q99 = np.asarray(q01, dtype=np.float64), np.asarray(q99, dtype=np.float64)
+    narrow = q99 - q01 < min_range
+    center = (q01 + q99) / 2
+    return (np.where(narrow, center - min_range / 2, q01), np.where(narrow, center + min_range / 2, q99),
+            np.flatnonzero(narrow).tolist())
+
+
 def preprocess_state(state, task_id, stats, task_map, task_onehot=True, gripper_state='sum'):
     """Normalized proprioception (`extract_state` layout `gripper_state`), plus the one-hot task category unless
     `task_onehot` is False.
@@ -243,13 +337,13 @@ def preprocess_state(state, task_id, stats, task_map, task_onehot=True, gripper_
     state = np.asarray(state, dtype=np.float32)
     if state.shape != (61,) or not np.isfinite(state).all():
         raise ValueError('Expected finite 61-dimensional R1Pro state')
-    if len(stats['qpos_mean']) != proprio_dim(gripper_state):
-        raise ValueError(f'Normalization statistics hold {len(stats["qpos_mean"])} proprioception values; '
+    if statistics_dim(stats, 'qpos') != proprio_dim(gripper_state):
+        raise ValueError(f'Normalization statistics hold {statistics_dim(stats, "qpos")} proprioception values; '
                          f'gripper_state {gripper_state!r} has {proprio_dim(gripper_state)}')
     task_ids = sorted(task_map)
     if task_id not in task_map:
         raise ValueError(f'Unseen task_id {task_id}; checkpoint tasks: {task_map}')
-    qpos = (extract_state(state, gripper_state) - np.asarray(stats['qpos_mean'])) / np.asarray(stats['qpos_std'])
+    qpos = normalize(extract_state(state, gripper_state), stats, 'qpos')
     if not task_onehot:
         return torch.from_numpy(qpos.astype(np.float32))
     onehot = np.zeros(len(task_ids), dtype=np.float32)
@@ -727,7 +821,7 @@ class B1KDataset(torch.utils.data.Dataset):
         is_pad = np.arange(self.chunk_size) >= count
         qpos = preprocess_state(table['state'][row], int(ep['task_index']), self.stats, self.task_map, self.task_onehot,
                                 gripper_state=self.gripper_state)
-        actions = (actions - np.asarray(self.stats['action_mean'])) / np.asarray(self.stats['action_std'])
+        actions = encode_actions(actions, extract_state(table['state'][row], self.gripper_state), self.stats)
         middle = time.perf_counter() if self.profile_reads else 0
         images = np.empty((len(VIDEO_KEYS), *self.image_size, 3), dtype=np.uint8)
         for camera, key in enumerate(VIDEO_KEYS):
@@ -751,7 +845,7 @@ class B1KDataset(torch.utils.data.Dataset):
         image = torch.stack([preprocess_image(x, self.image_size) for x in images])
         qpos = preprocess_state(state, task_id, self.stats, self.task_map, self.task_onehot,
                                 gripper_state=self.gripper_state)
-        actions = (actions - np.asarray(self.stats['action_mean'])) / np.asarray(self.stats['action_std'])
+        actions = encode_actions(actions, extract_state(state, self.gripper_state), self.stats)
         return (image, qpos, torch.from_numpy(actions.astype(np.float32)), torch.from_numpy(is_pad),
                 self.goal_for(self.positions[int(episode_id)], draw), torch.tensor(int(task_id), dtype=torch.int64))
 
@@ -835,6 +929,73 @@ class B1KDataset(torch.utils.data.Dataset):
                 'action_std': std[split:].astype(np.float32).tolist(),
                 'count': count, 'std_correction': 1, 'std_floor': 0.01,
                 'approximate': count != len(self), 'fingerprint': self.fingerprint()}
+
+    def compute_normalization_stats(self, normalization='zscore', action_representation='absolute', max_frames=None,
+                                    min_range=QUANTILE_MIN_RANGE):
+        """Statistics of `normalization` for `action_representation` over the selected episodes (a run's training
+        episodes), from the low-dim Parquet rows (never the images); absolute z-score is `compute_stats`.
+
+        State statistics cover every kept frame; action statistics every valid (unpadded) step of every frame's chunk
+        (`chunk_size` steps, cut at the episode's kept end), relative to that frame's state when relative. Quantiles
+        are exact (numpy's linear interpolation between order statistics); openpi approximates them with 5,000-bin
+        running histograms over whole chunks, padding included. `max_frames` (smoke runs) uses the chunks of the first
+        frames only.
+        """
+        if normalization not in NORMALIZATIONS or action_representation not in ACTION_REPRESENTATIONS:
+            raise ValueError(f'Unknown normalization {normalization!r} or action representation {action_representation!r}')
+        if (normalization, action_representation) == ('zscore', 'absolute'):
+            return self.compute_stats(max_frames)
+        relative = action_representation == 'relative'
+        if relative and self.gripper_state != 'sum':
+            raise ValueError('Relative actions need --gripper-state sum (one state value per action dimension)')
+        started = time.perf_counter()
+        table = self._ensure_table()
+        total = len(self)
+        count = total if max_frames is None else min(max_frames, total)
+        if count < 2:
+            raise ValueError('At least two frames required for normalization statistics')
+        actions = table['action'].astype(np.float64)
+        reference = action_reference(extract_state(table['state'], 'sum'), ACTION_DELTA) if relative else None
+        frame = np.arange(total) - np.repeat(self.starts, self.lengths)
+        steps = np.minimum(np.repeat(self.lengths, self.lengths) - frame, self.chunk_size)[:count]
+        masks = [steps[:min(count, total - k)] > k for k in range(self.chunk_size)]  # samples whose step k is valid
+
+        def chunk_values(dim):
+            parts = []
+            for k, mask in enumerate(masks):
+                values = actions[k:k + len(mask), dim][mask]
+                parts.append(values - reference[:len(mask), dim][mask] if relative else values)
+            return np.concatenate(parts)
+
+        stats = {'method': normalization, 'action_representation': action_representation, 'count': count,
+                 'action_count': int(steps.sum()), 'chunk_size': self.chunk_size, 'approximate': count != total}
+        if relative:
+            stats['action_delta'] = json.loads(json.dumps(ACTION_DELTA))
+        if normalization == 'quantile':
+            proprio = extract_state(table['state'][:count], self.gripper_state).astype(np.float64)
+            q = {'qpos': np.quantile(proprio, [0.01, 0.99], axis=0),
+                 'action': np.array([linear_quantiles(chunk_values(dim), [0.01, 0.99]) for dim in range(23)]).T}
+            stats.update(quantile_eps=QUANTILE_EPS, min_range=min_range, guarded={},
+                         quantile_method='exact: linear interpolation between order statistics (numpy default) of '
+                                         'every kept frame (state) and every valid chunk step (actions)')
+            for kind, (q01, q99) in q.items():
+                g01, g99, guarded = guard_quantiles(q01, q99, min_range)
+                stats.update({f'{kind}_q01': g01.tolist(), f'{kind}_q99': g99.tolist(),
+                              f'{kind}_q01_raw': q01.tolist(), f'{kind}_q99_raw': q99.tolist()})
+                stats['guarded'][kind] = guarded
+                if guarded:
+                    LOGGER.warning('Quantile statistics: %s dims %s have q99 - q01 %s < %g; normalized over %g around '
+                                   'their centers', kind, guarded, [float(f'{q99[d] - q01[d]:.3g}') for d in guarded],
+                                   min_range, min_range)
+        else:
+            base = self.compute_stats(max_frames)
+            moments = [(float(c.mean()), max(float(c.std(ddof=1)), 0.01)) for c in map(chunk_values, range(23))]
+            stats.update(qpos_mean=base['qpos_mean'], qpos_std=base['qpos_std'], action_mean=[m for m, _ in moments],
+                         action_std=[s for _, s in moments], std_correction=1, std_floor=0.01)
+        stats['fingerprint'] = self.fingerprint()
+        LOGGER.info('%s statistics of %s actions: %d frames, %d valid chunk steps in %.1fs', normalization,
+                    action_representation, count, stats['action_count'], time.perf_counter() - started)
+        return stats
 
 
 class SplitBatchSampler:
