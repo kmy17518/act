@@ -582,9 +582,10 @@ def parser():
     result.add_argument('--eval-every', type=int, default=10000)
     result.add_argument('--poll-seconds', type=float, default=30)
     result.add_argument('--http-timeout', type=float, default=120)
-    result.add_argument('--xet', action='store_true',
+    result.add_argument('--xet', action='store_true', default=os.environ.get('B1K_UPLOAD_XET') == '1',
                         help='Upload file contents with hf-xet instead of plain LFS (S3), for hosts whose egress proxy '
-                             'refuses the S3 endpoints; those transfers are not bounded by --http-timeout')
+                             'refuses the S3 endpoints; those transfers are not bounded by --http-timeout. '
+                             'B1K_UPLOAD_XET=1 sets it for launchers that cannot add flags')
     result.add_argument('--metadata', action='append', default=[], metavar='KEY=VALUE')
     result.add_argument('--metadata-json', type=Path)
     result.add_argument('--once', action='store_true')

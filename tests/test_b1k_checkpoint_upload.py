@@ -356,7 +356,11 @@ def test_xet_opt_in(monkeypatch):
     seen = []
     monkeypatch.setattr(upload, 'CheckpointUploader', lambda *args, **kwargs: (_ for _ in ()).throw(SystemExit(0)))
     monkeypatch.setattr(upload, 'make_api', lambda *args: seen.append(args))
-    for argv, xet in [([], False), (['--xet'], True)]:
+    for argv, env, xet in [([], None, False), (['--xet'], None, True), ([], '1', True), ([], '0', False)]:
+        if env is None:
+            monkeypatch.delenv('B1K_UPLOAD_XET', raising=False)
+        else:
+            monkeypatch.setenv('B1K_UPLOAD_XET', env)
         with pytest.raises(SystemExit):
             upload.main(['--run-dir', 'r', '--staging-dir', 's', '--repo-id', 'tester/dedicated', *argv])
         assert seen.pop() == (120, xet)
