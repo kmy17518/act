@@ -351,6 +351,22 @@ def test_backend_has_finite_timeouts(monkeypatch):
     assert constants.HF_HUB_ENABLE_HF_TRANSFER is False
 
 
+def test_xet_opt_in(monkeypatch):
+    from huggingface_hub import constants
+    seen = []
+    monkeypatch.setattr(upload, 'CheckpointUploader', lambda *args, **kwargs: (_ for _ in ()).throw(SystemExit(0)))
+    monkeypatch.setattr(upload, 'make_api', lambda *args: seen.append(args))
+    for argv, xet in [([], False), (['--xet'], True)]:
+        with pytest.raises(SystemExit):
+            upload.main(['--run-dir', 'r', '--staging-dir', 's', '--repo-id', 'tester/dedicated', *argv])
+        assert seen.pop() == (120, xet)
+    monkeypatch.undo()
+    upload.make_api(77, True)
+    assert constants.HF_HUB_DISABLE_XET is False and os.environ['HF_HUB_DISABLE_XET'] == '0'
+    upload.make_api(77)
+    assert constants.HF_HUB_DISABLE_XET is True and os.environ['HF_HUB_DISABLE_XET'] == '1'
+
+
 @pytest.mark.parametrize('prefix', ['https://example.invalid/object', '/object'])
 def test_signed_url_and_token_redaction(prefix, monkeypatch):
     monkeypatch.setenv('HF_TOKEN', 'private-test-token')
@@ -539,9 +555,10 @@ def test_cli_fatal_status_and_exit_code(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(os.environ.get('B1K_LIVE_UPLOAD_TEST') != '1', reason='explicit private HF smoke opt-in required')
-def test_live_private_repo_replacement_and_permanent_gc(tmp_path):
+@pytest.mark.parametrize('xet', [False, True])
+def test_live_private_repo_replacement_and_permanent_gc(tmp_path, xet):
     from huggingface_hub import hf_hub_download
-    api = upload.make_api()
+    api = upload.make_api(120, xet)
     assert api.whoami()['name'] == 'kmy17518'
     repo_id = 'kmy17518/b1k-upload-smoke-' + uuid.uuid4().hex[:16]
     run = tmp_path / 'live-run'
@@ -554,7 +571,7 @@ def test_live_private_repo_replacement_and_permanent_gc(tmp_path):
     eval_oid = hashlib.sha256(eval_bytes).hexdigest()
     queue(run, 'full', 2500, first_bytes)
     queue(run, 'eval', 10000, eval_bytes)
-    evidence = {'repo_id': repo_id, 'old_oid': old_oid, 'new_oid': new_oid, 'eval_oid': eval_oid,
+    evidence = {'repo_id': repo_id, 'xet': xet, 'old_oid': old_oid, 'new_oid': new_oid, 'eval_oid': eval_oid,
                 'full_size_bytes': len(first_bytes), 'eval_size_bytes': len(eval_bytes)}
     created = False
     try:
