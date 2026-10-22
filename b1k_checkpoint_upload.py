@@ -124,15 +124,17 @@ def exclusive_lock(path):
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def make_api(http_timeout=120):
-    # The requests backend also bounds HF endpoints that omit a timeout themselves.
+def make_api(http_timeout=120, xet=False):
+    # The requests backend also bounds HF endpoints that omit a timeout themselves. With xet, file contents go
+    # through hf-xet's own client (its retries, not http_timeout); without it, through S3 endpoints that some egress
+    # proxies refuse (the GB300 buildboxes: TLS EOF from hf-hub-lfs-us-east-1.s3-accelerate.amazonaws.com).
     os.environ['CUDA_VISIBLE_DEVICES'] = ''
-    os.environ['HF_HUB_DISABLE_XET'] = '1'
+    os.environ['HF_HUB_DISABLE_XET'] = '0' if xet else '1'
     os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '0'
     import requests
     from huggingface_hub import HfApi, configure_http_backend, constants
 
-    constants.HF_HUB_DISABLE_XET = True
+    constants.HF_HUB_DISABLE_XET = not xet
     constants.HF_HUB_ENABLE_HF_TRANSFER = False
 
     class BoundedSession(requests.Session):
@@ -580,6 +582,9 @@ def parser():
     result.add_argument('--eval-every', type=int, default=10000)
     result.add_argument('--poll-seconds', type=float, default=30)
     result.add_argument('--http-timeout', type=float, default=120)
+    result.add_argument('--xet', action='store_true',
+                        help='Upload file contents with hf-xet instead of plain LFS (S3), for hosts whose egress proxy '
+                             'refuses the S3 endpoints; those transfers are not bounded by --http-timeout')
     result.add_argument('--metadata', action='append', default=[], metavar='KEY=VALUE')
     result.add_argument('--metadata-json', type=Path)
     result.add_argument('--once', action='store_true')
@@ -600,7 +605,7 @@ def main(argv=None):
             raise SystemExit('metadata must use KEY=VALUE')
         key, value = item.split('=', 1)
         metadata[key] = value
-    api = make_api(args.http_timeout)
+    api = make_api(args.http_timeout, args.xet)
     try:
         with CheckpointUploader(args.run_dir, args.staging_dir, args.repo_id, api,
                                 run_id=args.run_id, max_steps=args.max_steps,
