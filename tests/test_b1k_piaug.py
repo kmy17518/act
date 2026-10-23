@@ -38,23 +38,31 @@ def chw(array):
     return torch.from_numpy(np.asarray(array, dtype=np.float32)).permute(0, 3, 1, 2)
 
 
+def trainer_layout(images, channels_last):
+    """prepare_images' layout: with channels_last, each camera's (batch, 3, H, W) slice a dense channels-last block."""
+    return images.permute(1, 0, 3, 4, 2).contiguous().permute(1, 0, 4, 2, 3) if channels_last else images.contiguous()
+
+
 @pytest.mark.parametrize('channels_last', [False, True])
 def test_pi05_augment_reproduces_augmax(channels_last):
     """scripts/b1k/compare_pi05_augment.py --fixture: openpi 93f8a4e's preprocess_observation(train=True) on augmax
-    0.4.1 (jax 0.11.1) for non-square 20x26 frames. Given augmax's draws, the torch version matches every key."""
+    0.4.1 (jax 0.11.1) for non-square 20x26 frames. Given augmax's draws, the torch version matches every key and keeps
+    the trainer's memory layout."""
     reference = np.load(FIXTURE)
     images = {key: chw(reference[f'input.{key}'] / np.float32(255)) for key in
               ('base_0_rgb', 'left_wrist_0_rgb', 'right_wrist_0_rgb', 'goal_0_rgb')}
-    cameras = torch.stack([images['base_0_rgb'], images['left_wrist_0_rgb'], images['right_wrist_0_rgb']], 1)
+    cameras = trainer_layout(torch.stack([images['base_0_rgb'], images['left_wrist_0_rgb'],
+                                          images['right_wrist_0_rgb']], 1), channels_last)
+    goal_in = trainer_layout(images['goal_0_rgb'][:, None], channels_last)
     params = fixture_params(reference)
     assert params['color']['apply'].any() and not params['color']['apply'].all()  # both branches of the jitter
     assert params['wrist_color']['apply'].any() and not params['wrist_color']['apply'].all()
-    out, goal = pi05_augment(cameras, images['goal_0_rgb'][:, None], [False, True, True], params, channels_last)
+    out, goal = pi05_augment(cameras, goal_in, (False, True, True), params)
+    assert out.stride() == cameras.stride() and goal.stride() == goal_in.stride()
     for got, key in ((out[:, 0], 'base_0_rgb'), (out[:, 1], 'left_wrist_0_rgb'), (out[:, 2], 'right_wrist_0_rgb'),
                      (goal[:, 0], 'goal_0_rgb')):
         torch.testing.assert_close(got, chw(reference[f'output.{key}']), atol=2e-5, rtol=0, msg=key)
-    if channels_last:  # prepare_images' layout: each camera's (batch, 3, H, W) slice a dense channels-last block
-        assert out.permute(1, 0, 3, 4, 2).is_contiguous() and goal.permute(1, 0, 3, 4, 2).is_contiguous()
+    if channels_last:
         assert out[:, 1].is_contiguous(memory_format=torch.channels_last)
 
 
@@ -100,18 +108,37 @@ def test_color_space_and_identity_parameters():
              'wrist_color': {'apply': torch.zeros(2, dtype=torch.bool), 'brightness': zero + 0.3, 'contrast': zero,
                              'hue': zero}}
     cameras = torch.rand(2, 3, 3, 9, 11, generator=generator)
-    out, goal = pi05_augment(cameras, pixels, [False, True, True], still, channels_last=False)
+    out, goal = pi05_augment(cameras, pixels, (False, True, True), still)
     torch.testing.assert_close(out, cameras, atol=2e-6, rtol=0)
     torch.testing.assert_close(goal, pixels, atol=2e-6, rtol=0)
+
+
+def test_a_compile_failure_falls_back_to_eager(monkeypatch, caplog):
+    import b1k_augment
+    monkeypatch.setattr(b1k_augment, '_COMPILED', {})
+
+    def failing():
+        def augment(*args):
+            raise RuntimeError('inductor failed')
+        return augment
+
+    monkeypatch.setattr(b1k_augment, 'compiled_pi05_augment', failing)
+    generator = torch.Generator().manual_seed(1)
+    images, goal = torch.rand(2, 3, 3, 8, 10, generator=generator), torch.rand(2, 1, 3, 8, 10, generator=generator)
+    with caplog.at_level('WARNING', logger='b1k_augment'):
+        got = augment_batch(images, goal, (False, True, True), 0, 1, 0, compiled=True)
+    want = augment_batch(images, goal, (False, True, True), 0, 1, 0)
+    assert all(torch.equal(a, b) for a, b in zip(got, want))
+    assert 'torch.compile failed' in caplog.text and 'inductor failed' in b1k_augment._COMPILED['failed']
 
 
 def augmented_calls(monkeypatch):
     import b1k_training
     calls = []
 
-    def recorded(images, goal, wrist, seed, step, rank, channels_last):
+    def recorded(images, goal, wrist, seed, step, rank, compiled=False):
         calls.append({'step': step, 'rank': rank, 'batch': images.shape[0], 'goal': goal is not None})
-        return augment_batch(images, goal, wrist, seed, step, rank, channels_last)
+        return augment_batch(images, goal, wrist, seed, step, rank, compiled)
 
     monkeypatch.setattr(b1k_training, 'augment_batch', recorded)
     return calls
@@ -183,9 +210,9 @@ def augment_rank_worker(rank, world_size, port, argv, record):
     torch.set_num_threads(1)
     calls = []
 
-    def recorded(images, goal, wrist, seed, step, rank_, channels_last):
+    def recorded(images, goal, wrist, seed, step, rank_, compiled=False):
         draws = torch.rand(images.shape[0], 11, generator=augment_generator(seed, step, rank_))
-        out = augment_batch(images, goal, wrist, seed, step, rank_, channels_last)
+        out = augment_batch(images, goal, wrist, seed, step, rank_, compiled)
         pixels = hashlib.sha256()
         for tensor in (images, goal, *out):
             pixels.update(tensor.contiguous().numpy().tobytes())

@@ -1,8 +1,8 @@
 """openpi pi05_b1k's training image augmentation, in torch on the GPU (`--image-augment pi05`).
 
 Replicates openpi 93f8a4e `models/model.py:preprocess_observation(train=True)` with augmax 0.4.1 (the version of its
-.venv-jax) on 224x224 images in [0, 1]. openpi splits one key per sample and uses that same key for every image of
-the sample, so all images that run the same augmax chain get the same draws:
+.venv-jax) on images in [0, 1] (224x224 in the B1K runs). openpi splits one key per sample and uses that same key
+for every image of the sample, so all images that run the same augmax chain get the same draws:
 
 - non-wrist images (the head camera zed_link and every goal image; openpi keys without "wrist"):
   `augmax.Chain(RandomCrop(212, 212), Resize(224, 224), Rotate((-5, 5)), ColorJitter(...))`, which augmax splits into
@@ -13,7 +13,7 @@ the sample, so all images that run the same augmax chain get the same draws:
   differ from the non-wrist ones; both wrists share theirs.
 
 ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5) keeps augmax's defaults hue=0.1 and p=0.5: with probability
-0.5 per image, in HSV, the value gets brightness b ~ U(-0.3, 0.3) (v * (1 + b) for b < 0, else v * (1 - b) + b), then
+0.5 per sample and chain, in HSV, the value gets brightness b ~ U(-0.3, 0.3) (v * (1 + b) for b < 0, else v * (1 - b) + b), then
 contrast c ~ U(-0.4, 0.4) (augmax's invertible piecewise curve with slant tan((c + 1) * pi / 4)), the hue shifts by
 U(-0.1, 0.1); the saturation draw changes nothing (augmax 0.4.1 discards the result of that adjustment).
 
@@ -21,11 +21,13 @@ The draws come from a CPU generator seeded by (seed, step, rank): a resume repro
 rank draws its own.
 """
 import hashlib
+import logging
 import math
 
 import torch
 import torch.nn.functional as F
 
+LOGGER = logging.getLogger(__name__)
 IMAGE_AUGMENTS = ('none', 'pi05')
 CROP_FRACTION = 0.95
 ANGLE_DEGREES = 5.0
@@ -134,37 +136,47 @@ def color_jitter(images, color):
     return torch.where(color['apply'].view(view + (1,)), jittered, images)
 
 
-def pi05_augment(images, goal, wrist, params, channels_last=True):
-    """The augmented (images, goal): images (batch, cameras, 3, H, W) in [0, 1] with `wrist[c]` per camera, goal
-    (batch, views, 3, H, W) or None (always non-wrist, like openpi's goal keys)."""
-    size = tuple(images.shape[-2:])
-    grid = sampling_grid(params, size, images.device)
-    wrist = list(wrist)
-    # slices and cat only: indexing with a list of cameras would copy an index tensor to the GPU and synchronize
-    cameras = [images[:, index:index + 1] for index in range(len(wrist))]
-    head = [camera for camera, is_wrist in zip(cameras, wrist) if not is_wrist]
-    stacked = color_jitter(warp(torch.cat(head + ([goal] if goal is not None else []), dim=1).float(), grid),
-                           params['color'])
-    hands = [camera for camera, is_wrist in zip(cameras, wrist) if is_wrist]
+def pi05_augment(images, goal, wrist, params):
+    """The augmented (images, goal) in the inputs' memory layouts: images (batch, cameras, 3, H, W) in [0, 1] with
+    `wrist[c]` per camera, goal (batch, views, 3, H, W) or None (always non-wrist, like openpi's goal keys)."""
+    grid = sampling_grid(params, tuple(images.shape[-2:]), images.device)
+    head = [index for index, is_wrist in enumerate(wrist) if not is_wrist]
+    hands = [index for index, is_wrist in enumerate(wrist) if is_wrist]
+    # slices only: indexing with a list of cameras would copy an index tensor to the GPU and synchronize
+    nonwrist = torch.cat([images[:, i:i + 1] for i in head] + ([goal] if goal is not None else []), dim=1)
+    nonwrist = color_jitter(warp(nonwrist.float(), grid), params['color'])
+    out = torch.empty_like(images)
+    for k, i in enumerate(head):
+        out[:, i:i + 1] = nonwrist[:, k:k + 1]
     if hands:
-        hands = color_jitter(torch.cat(hands, dim=1).float(), params['wrist_color'])
-    parts, counts = [], [0, 0]
-    for is_wrist in wrist:
-        source = hands if is_wrist else stacked
-        parts.append(source[:, counts[is_wrist]:counts[is_wrist] + 1])
-        counts[is_wrist] += 1
-    out = torch.cat(parts, dim=1).to(images.dtype)
-    new_goal = stacked[:, len(head):].to(goal.dtype) if goal is not None else None
-    if channels_last:  # the dense per-camera channels-last blocks prepare_images makes
-        out = out.permute(1, 0, 3, 4, 2).contiguous().permute(1, 0, 4, 2, 3)
-        if new_goal is not None:
-            new_goal = new_goal.permute(1, 0, 3, 4, 2).contiguous().permute(1, 0, 4, 2, 3)
-    elif new_goal is not None:
-        new_goal = new_goal.contiguous()
+        jittered = color_jitter(torch.cat([images[:, i:i + 1] for i in hands], dim=1).float(), params['wrist_color'])
+        for k, i in enumerate(hands):
+            out[:, i:i + 1] = jittered[:, k:k + 1]
+    if goal is None:
+        return out, None
+    new_goal = torch.empty_like(goal)
+    new_goal.copy_(nonwrist[:, len(head):])
     return out, new_goal
 
 
-def augment_batch(images, goal, wrist, seed, step, rank, channels_last=True):
-    """`--image-augment pi05` for one training batch: draws from (seed, step, rank), then pi05_augment."""
+_COMPILED = {}
+
+
+def compiled_pi05_augment():
+    """pi05_augment through torch.compile (inductor, static shapes): its elementwise passes fused into a few kernels."""
+    if 'augment' not in _COMPILED:
+        _COMPILED['augment'] = torch.compile(pi05_augment, dynamic=False, fullgraph=True)
+    return _COMPILED['augment']
+
+
+def augment_batch(images, goal, wrist, seed, step, rank, compiled=False):
+    """`--image-augment pi05` for one training batch: draws from (seed, step, rank), then pi05_augment, compiled when
+    the run compiles its policy on CUDA (eager if compiling fails: the same augmentation, only slower)."""
     params = sample_params(images.shape[0], tuple(images.shape[-2:]), augment_generator(seed, step, rank), images.device)
-    return pi05_augment(images, goal, wrist, params, channels_last)
+    if compiled and 'failed' not in _COMPILED:
+        try:
+            return compiled_pi05_augment()(images, goal, tuple(wrist), params)
+        except Exception as error:  # noqa: BLE001 - a compiler failure; a real error repeats in eager below
+            _COMPILED['failed'] = repr(error)
+            LOGGER.warning('--image-augment pi05: torch.compile failed (%r); the augmentation runs eagerly', error)
+    return pi05_augment(images, goal, tuple(wrist), params)

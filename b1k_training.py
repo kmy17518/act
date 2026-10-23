@@ -977,7 +977,8 @@ def parser():
                    help='none (default) or pi05: openpi pi05_b1k\'s training augmentation (b1k_augment.py) on the GPU, '
                         'training batches only: the head camera and the goal images randomly cropped to 95%%, resized '
                         'back and rotated by up to 5 degrees, then every image color-jittered as augmax 0.4.1 does; draws '
-                        'from (seed, step, rank). Saved; resume uses the checkpoint\'s (none for checkpoints without it)')
+                        'from (seed, step, rank); torch.compile\'d when --compile is not none. Saved; resume uses the '
+                        'checkpoint\'s (none for checkpoints without it)')
     p.add_argument('--gripper-state', choices=GRIPPER_STATES, default='sum', action=ExplicitOption,
                    help='Gripper proprioception: sum (default) adds the two finger positions of each gripper into one '
                         'opening, giving a 23-value state in the action\'s layout; fingers keeps both (25 values). '
@@ -1631,7 +1632,8 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
             optimizer.zero_grad(set_to_none=True)
             images, qpos, actions, is_pad, goal, task_id, timings = consume_batch(batch, copy_stream, args.channels_last)
             if args.image_augment == 'pi05':
-                images, goal = augment_batch(images, goal, WRIST_CAMERAS, args.seed, step, rank, args.channels_last)
+                images, goal = augment_batch(images, goal, WRIST_CAMERAS, args.seed, step, rank,
+                                             compiled=cuda and args.compile != 'none')
             lang_emb = language_for_tasks(task_id, language_embeddings, dataset.task_map)
             kwargs = {'lang_emb': lang_emb} if lang_emb is not None else {}
             if goal is not None:

@@ -123,8 +123,7 @@ def ours_augment(frames, params):
     """frames {key: (B, H, W, 3)} -> b1k_augment.pi05_augment with ACT's layout (cameras zed_link, left, right)."""
     to_chw = lambda key: torch.from_numpy(np.asarray(frames[key])).permute(0, 3, 1, 2)
     images = torch.stack([to_chw('base_0_rgb'), to_chw('left_wrist_0_rgb'), to_chw('right_wrist_0_rgb')], 1)
-    out, goal = b1k_augment.pi05_augment(images, to_chw('goal_0_rgb')[:, None], [False, True, True], params,
-                                         channels_last=False)
+    out, goal = b1k_augment.pi05_augment(images, to_chw('goal_0_rgb')[:, None], (False, True, True), params)
     return {'base_0_rgb': out[:, 0], 'left_wrist_0_rgb': out[:, 1], 'right_wrist_0_rgb': out[:, 2],
             'goal_0_rgb': goal[:, 0]}
 
