@@ -26,6 +26,7 @@ from b1k_dataset import (ACTION_DELTA, ACTION_REPRESENTATIONS, B1KDataset, CAMER
                          VIDEO_KEYS, SplitBatchSampler, StepBatchSampler, decode_actions, describe_episode_split,
                          expand_task_groups, goal_views_to_indices, parse_settle_steps, proprio_dim,
                          resolve_episode_split, unnormalize)
+from b1k_augment import IMAGE_AUGMENTS, augment_batch
 from b1k_frame_cache import dequantize_images
 from detr.models.backbone import SpaceToDepthStem, parse_goal_stem_init, replaces_stem
 from detr.models.detr_vae import (GOAL_CONTENTS, GOAL_ENCODERS, GOAL_ENTRIES, GOAL_FUSIONS, GOAL_POSITIONS, GOAL_TOKENS,
@@ -38,6 +39,8 @@ from b1k_language import (ENCODERS, build_language_cache, language_dim, language
 
 
 LOGGER = logging.getLogger(__name__)
+# openpi's wrist keys (left/right_wrist_0_rgb) are the realsense cameras; zed_link is the head (base_0_rgb)
+WRIST_CAMERAS = ['realsense' in camera for camera in CAMERAS]
 CHECKPOINT_VERSION = 1
 # Rank 0 alone validates and saves (and under --compile first compiles the validation shapes) while the other ranks
 # wait in their next collective; NCCL's default watchdog (10 min) would abort them on a slow first validation.
@@ -970,6 +973,11 @@ def parser():
                         'the state and the actions, with exact 1%%/99%% quantiles of the training frames and valid chunk '
                         'steps (dimensions narrower than 0.02 are widened to 0.02). Saved; resume uses the '
                         'checkpoint\'s (zscore for checkpoints without it)')
+    p.add_argument('--image-augment', choices=IMAGE_AUGMENTS, default='none', action=ExplicitOption,
+                   help='none (default) or pi05: openpi pi05_b1k\'s training augmentation (b1k_augment.py) on the GPU, '
+                        'training batches only: the head camera and the goal images randomly cropped to 95%%, resized '
+                        'back and rotated by up to 5 degrees, then every image color-jittered as augmax 0.4.1 does; draws '
+                        'from (seed, step, rank). Saved; resume uses the checkpoint\'s (none for checkpoints without it)')
     p.add_argument('--gripper-state', choices=GRIPPER_STATES, default='sum', action=ExplicitOption,
                    help='Gripper proprioception: sum (default) adds the two finger positions of each gripper into one '
                         'opening, giving a 23-value state in the action\'s layout; fingers keeps both (25 values). '
@@ -1261,7 +1269,7 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                              ('goal_pos', 'sine'), ('goal_content', 'goal'), ('goal_entry', 'encoder'),
                              ('goal_stem_gain', None), ('goal_stem_diff', False), ('goal_fusion_depth', 0),
                              ('goal_detach_views', []), ('action_representation', 'absolute'),
-                             ('normalization', 'zscore')]:
+                             ('normalization', 'zscore'), ('image_augment', 'none')]:
             saved_value = model_config.get(key, default)
             if getattr(args, f'_{key}_explicit', False) and getattr(args, key) != saved_value:
                 raise ValueError(f'--{key.replace("_", "-")} differs from checkpoint')
@@ -1357,7 +1365,8 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                         **({'goal_detach_views': list(args.goal_detach_views)} if args.goal_detach_views else {}),
                         'dilation': False, 'masks': False, 'action_dim': 23,
                         # older checkpoints: absolute / zscore; the statistics record the delta mapping
-                        'action_representation': args.action_representation, 'normalization': args.normalization}
+                        'action_representation': args.action_representation, 'normalization': args.normalization,
+                        'image_augment': args.image_augment}
         if args.action_representation == 'relative':
             if args.gripper_state != 'sum':
                 raise ValueError('--action-representation relative needs --gripper-state sum (one state value per '
@@ -1576,6 +1585,7 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                     goal['goal_views'], adapter.get('goal_source', 'episode_last'), goal['goal_encoder'],
                     goal['goal_role_embedding'], goal['language_on_goal_encoder'],
                     sum(parameter.numel() for parameter in policy.parameters()))
+        LOGGER.info('Image augmentation: %s', model_config.get('image_augment', 'none'))
         LOGGER.info('Actions %s, normalization %s%s', model_config.get('action_representation', 'absolute'),
                     model_config.get('normalization', 'zscore'),
                     f' (q99 - q01 widened to {stats["min_range"]} on qpos dims {stats["guarded"]["qpos"]} and action '
@@ -1620,6 +1630,8 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                 torch.cuda.reset_peak_memory_stats(device)
             optimizer.zero_grad(set_to_none=True)
             images, qpos, actions, is_pad, goal, task_id, timings = consume_batch(batch, copy_stream, args.channels_last)
+            if args.image_augment == 'pi05':
+                images, goal = augment_batch(images, goal, WRIST_CAMERAS, args.seed, step, rank, args.channels_last)
             lang_emb = language_for_tasks(task_id, language_embeddings, dataset.task_map)
             kwargs = {'lang_emb': lang_emb} if lang_emb is not None else {}
             if goal is not None:
