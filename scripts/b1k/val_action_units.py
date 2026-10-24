@@ -5,7 +5,9 @@ val/l1_action_units is the zero-latent L1 between predicted and recorded actions
 so runs with different action representations or normalizations compare (b1k_training.action_unit_errors). Runs from
 before the metric (e.g. TODO 1's, absolute z-score) are evaluated here on the same frames as the side runs: the
 checkpoint's validation episodes, batches StepBatchSampler(val episodes, val batch size, 0, val batches, seed) as in
-training, its own statistics, preprocessing and autocast. Takes full or eval-only checkpoints, e.g.
+training, its own statistics, preprocessing and autocast. --settle-steps validates on another settle cut of the same
+validation episodes: with 0, a run trained with settle frames is measured on exactly the frames of runs trained
+without them (same episodes, seed and batches). Takes full or eval-only checkpoints, e.g.
 
     hf download kmy17518/act-isg1020-multitask5-bs1024-s0 eval/step-00100000.pt --local-dir /tmp/dev/runs/todo1-eval
     python scripts/b1k/val_action_units.py --checkpoint /tmp/dev/runs/todo1-eval/eval/step-00100000.pt \\
@@ -21,7 +23,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import torch  # noqa: E402
 
-from b1k_dataset import B1KDataset  # noqa: E402
+from b1k_dataset import B1KDataset, parse_settle_steps  # noqa: E402
 from b1k_language import language_embedding_table  # noqa: E402
 from b1k_training import evaluate_validation, goal_config, load_checkpoint, make_policy  # noqa: E402
 
@@ -34,6 +36,9 @@ def main():
     p.add_argument('--device', default='cuda')
     p.add_argument('--val-batches', type=int, help="Default: the run's (16)")
     p.add_argument('--val-batch-size', type=int, help="Default: the run's (min(64, batch size))")
+    p.add_argument('--settle-steps', metavar='SPEC',
+                   help="Validate on this --settle-steps cut of the run's validation episodes (all, a number of frames "
+                        "or a fraction of the program length, e.g. 0) instead of the run's own. Default: the run's")
     p.add_argument('--output', type=Path, help='Also write the metrics as JSON')
     args = p.parse_args()
 
@@ -47,12 +52,14 @@ def main():
     device = torch.device(args.device)
     cuda = device.type == 'cuda'
     goal = goal_config(config)
+    run_settle = (checkpoint.get('settle_steps') or {}).get('spec', 'all')
+    settle = run_settle if args.settle_steps is None else parse_settle_steps(args.settle_steps)
     dataset = B1KDataset(root, list(checkpoint['task_map'].values()), config['num_queries'], adapter['image_size'],
                          timestamp_tolerance=adapter['timestamp_tolerance'], frame_cache=cache,
                          goal_views=goal['goal_views'], goal_source=adapter.get('goal_source', 'episode_last'),
                          task_onehot=adapter.get('task_conditioning', 'onehot') == 'onehot',
                          episodes=checkpoint['val_split']['val_episodes'],
-                         settle_steps=(checkpoint.get('settle_steps') or {}).get('spec', 'all'),
+                         settle_steps=settle,
                          gripper_state=adapter.get('gripper_state', 'fingers'),
                          goal_mismatch_views=adapter.get('goal_mismatch_views', []),
                          goal_mismatch_seed=train['seed'])
@@ -75,10 +82,12 @@ def main():
                                   args.val_batch_size or train.get('val_batch_size') or min(64, train['batch_size']),
                                   None if embeddings is None else embeddings.to(device), checkpoint['task_map'],
                                   device, autocast, channels_last, train['seed'])
+    val_frames = len(dataset)
     dataset.close()
     result = {'checkpoint': str(args.checkpoint), 'step': checkpoint['step'],
               'action_representation': config.get('action_representation', 'absolute'),
-              'normalization': config.get('normalization', 'zscore'), 'metrics': metrics}
+              'normalization': config.get('normalization', 'zscore'), 'settle_steps': settle,
+              'run_settle_steps': run_settle, 'val_frames': val_frames, 'metrics': metrics}
     if args.output:
         args.output.write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result))

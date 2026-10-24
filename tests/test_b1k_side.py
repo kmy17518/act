@@ -18,7 +18,7 @@ from b1k_dataset import (ACTION_DELTA, CAMERAS, OBS_KEYS, B1KDataset, action_ref
                          guard_quantiles, normalize, preprocess_state, unnormalize)
 from b1k_training import (committed_checkpoints, ddp_ignored_parameter_names, load_checkpoint, make_policy, parser,
                           resolve_val_split, train, unused_gradients)
-from test_b1k import small_model_config, tiny_root  # noqa: F401  (fixture)
+from test_b1k import small_model_config, tiny_root, write_settle_windows  # noqa: F401  (fixture)
 
 
 def late_config():
@@ -478,6 +478,42 @@ def test_smoke_client_passes_against_a_served_relative_late_fusion_checkpoint(ti
     result = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert result['result'] == 'PASS' and 'plan_decoded_at_plan_time' in result['checks']
     assert result['metadata']['action_representation'] == 'relative' and result['metadata']['served_actions'] == 'absolute'
+
+def test_offline_validation_on_another_settle_cut(tiny_root, tmp_path, capsys):
+    """val_action_units.py --settle-steps validates a checkpoint on another settle cut of its run's validation episodes:
+    the run's own by default (the logged metrics), the programs alone with 0."""
+    import importlib.util
+    import sys
+    torch.set_num_threads(1)
+    add_episodes(tiny_root, 9, shift=0.5)
+    write_settle_windows(tiny_root, {42: 3, 99: 2, **{50 + i: 3 for i in range(9)}})  # 5 recorded frames each
+    output = tmp_path / 'run'
+    train_fn(tiny_common(tiny_root) + ['--task-names', 'first', '--max-steps', '2', '--output-dir', str(output),
+                                       '--settle-steps', '1', '--val-fraction', '0.1', '--val-every', '2',
+                                       '--val-batches', '2', '--val-batch-size', '3', '--export-every', '2'])
+    logged = [json.loads(line) for line in (output / 'metrics.jsonl').read_text().splitlines()][-1]
+    spec = importlib.util.spec_from_file_location('val_action_units',
+                                                  Path(__file__).parents[1] / 'scripts/b1k/val_action_units.py')
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+
+    def evaluate(*extra):
+        sys_argv, sys.argv = sys.argv, ['val_action_units.py', '--checkpoint',
+                                        str(output / 'export_queue/eval/step_00000002.pt'), '--device', 'cpu', *extra]
+        try:
+            script.main()
+        finally:
+            sys.argv = sys_argv
+        return json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    own, respelled, programs = evaluate(), evaluate('--settle-steps', '01'), evaluate('--settle-steps', '0')
+    assert own['settle_steps'] == own['run_settle_steps'] == '1' and own['val_frames'] == 4  # 1 val episode: 3 + 1
+    for key in ('val/l1', 'val/l1_action_units', 'val/inference_l1'):
+        assert own['metrics'][key] == pytest.approx(logged[key], rel=1e-6)
+    measured = lambda result: {k: v for k, v in result['metrics'].items() if not k.startswith('timing/')}
+    assert respelled['settle_steps'] == '1' and measured(respelled) == measured(own)
+    assert programs['settle_steps'] == '0' and programs['run_settle_steps'] == '1' and programs['val_frames'] == 3
+    assert programs['metrics']['val/l1'] != own['metrics']['val/l1']
 
 
 @pytest.mark.parametrize('mode', [[], RELQ])
