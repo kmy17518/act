@@ -332,10 +332,23 @@ def test_offline_evaluation_replays_validation_episodes_through_the_session(tiny
                                          np.array([7]), torch.rand(1, 1, 3, 16, 16), np.zeros((1, 61), dtype=np.float32))
     assert actions.shape == (1, 4, 23) and signals.shape == (1, 4, 2) and signals.min() >= 0 and signals.max() <= 1
 
-    # Method B on the same episodes: features from a tiny frame cache, train, eval, and the A + B combination
+    # the frame-cache path of the replay (what the buildboxes use) gives the same episodes and per-step signals
     from b1k_frame_cache import build_frame_cache
     cache = tmp_path / 'cache'
     build_frame_cache(B1KDataset(tiny_root, chunk_size=1, image_size=(16, 16), task_names=['first']), cache, log=lambda *_: None)
+    cached = tmp_path / 'eval-cached'
+    result = subprocess.run([python, str(REPO / 'scripts/b1k/eval_stop_offline.py'), '--checkpoint', str(path), '--frame-cache',
+                             str(cache), '--device', 'cpu', '--slots', '3', '--action-horizon', '2', '--stop-hold-steps', '1',
+                             '--stop-threshold', '0.0', '--progress-threshold', '0.0', '--output', str(cached)],
+                            capture_output=True, text=True, timeout=600)
+    assert result.returncode == 0, result.stderr[-2000:]
+    cached_traces = np.load(cached / 'traces.npz')
+    assert sorted(cached_traces['episodes'].tolist()) == sorted(traces['episodes'].tolist())
+    for row in rows:
+        np.testing.assert_allclose(cached_traces[f"stop_{row['episode']}"], traces[f"stop_{row['episode']}"], atol=2e-2)
+        np.testing.assert_allclose(cached_traces[f"motion_{row['episode']}"], traces[f"motion_{row['episode']}"], atol=2e-2)
+
+    # Method B on the same episodes: features from the tiny frame cache, train, eval, and the A + B combination
     script = REPO / 'scripts/b1k/stop_verifier.py'
     features, verifier, b_out, ab_out = tmp_path / 'features', tmp_path / 'verifier.pt', tmp_path / 'b', tmp_path / 'ab'
     common = ['--device', 'cpu']
