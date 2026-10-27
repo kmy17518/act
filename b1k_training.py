@@ -1004,9 +1004,9 @@ def parser():
     p.add_argument('--stop-pos-weight', type=float, default=1.0, metavar='W',
                    help='--stop-dims: weight of the positive (stop = 1) chunk steps in the stop L1 (default 1: none)')
     p.add_argument('--stop-loss-weight', type=float, default=1.0, metavar='W',
-                   help='--stop-dims: coefficient of the stop L1 in the loss (default 1)')
+                   help='--stop-dims: coefficient of the stop L1 in the loss (default 1; 0 = progress-only ablation)')
     p.add_argument('--progress-loss-weight', type=float, default=1.0, metavar='W',
-                   help='--stop-dims: coefficient of the progress L1 in the loss (default 1)')
+                   help='--stop-dims: coefficient of the progress L1 in the loss (default 1; 0 = stop-only ablation)')
     p.add_argument('--stop-oversample', type=float, default=0.0, metavar='FRACTION',
                    help='Draw this fraction of every batch from the last chunk-size frames of their (episode-uniform) '
                         'episodes, the windows whose chunk reaches the episode end (default 0: uniform frames)')

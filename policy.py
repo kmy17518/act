@@ -25,8 +25,9 @@ class ACTPolicy(nn.Module):
         self.stop_pos_weight = float(args_override.get('stop_pos_weight', 1.0))
         self.stop_loss_weight = float(args_override.get('stop_loss_weight', 1.0))
         self.progress_loss_weight = float(args_override.get('progress_loss_weight', 1.0))
-        if self.stop_dims and min(self.stop_pos_weight, self.stop_loss_weight, self.progress_loss_weight) <= 0:
-            raise ValueError('stop_pos_weight, stop_loss_weight and progress_loss_weight must be positive')
+        if self.stop_dims and (self.stop_pos_weight <= 0 or min(self.stop_loss_weight, self.progress_loss_weight) < 0):
+            raise ValueError('stop_pos_weight must be positive, stop_loss_weight and progress_loss_weight non-negative '
+                             '(0 drops that term: the stop-only / progress-only ablations)')
         print(f'KL Weight {self.kl_weight}')
 
     def forward(self, qpos, image, actions=None, is_pad=None, lang_emb=None, goal=None, goal_valid=None,
