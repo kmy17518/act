@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import http
+import json
 import logging
 
 import msgpack
@@ -11,12 +12,67 @@ import torch
 import websockets.asyncio.server as websocket_server
 from websockets.exceptions import ConnectionClosed
 
-from b1k_dataset import CAMERAS, GOAL_OBS_KEYS, OBS_KEYS, decode_actions, extract_state, preprocess_image, preprocess_state
+from b1k_dataset import (ACTION_DELTA, CAMERAS, GOAL_OBS_KEYS, OBS_KEYS, action_reference, decode_actions, extract_state,
+                         preprocess_image, preprocess_state, split_stop_signals)
 from b1k_training import goal_config, load_checkpoint, make_policy, policy_class
 from b1k_language import language_embedding_table, language_for_tasks
 
 
 LOGGER = logging.getLogger(__name__)
+# Stop study, Method A gating defaults (b1k_server --stop-threshold ... ; `StopGate`): DONE when the stop signal is at
+# least STOP_THRESHOLD and the progress signal at least PROGRESS_THRESHOLD for STOP_HOLD_STEPS consecutive control
+# steps (30 = 1 s at 30 Hz).
+STOP_THRESHOLD = 0.5
+PROGRESS_THRESHOLD = 0.9
+STOP_HOLD_STEPS = 30
+
+
+class StopGate:
+    """Per-slot DONE decision from a --stop-dims checkpoint's signals, and the pose held once DONE.
+
+    `update(stop, progress, state, action)` counts consecutive control steps with stop >= threshold and
+    progress >= progress_threshold; at `hold_steps` of them the slot is DONE (latched until `reset`), and the hold
+    pose is fixed: the torso / arm joints at the state of that step, zero base velocity, the grippers at the last
+    executed command (a command derived from the finger opening could differ from the one holding an object).
+    `enabled=False` keeps counting and reporting but never declares DONE (signals-only serving)."""
+    def __init__(self, threshold=STOP_THRESHOLD, progress_threshold=PROGRESS_THRESHOLD, hold_steps=STOP_HOLD_STEPS,
+                 enabled=True):
+        if not 0 <= threshold <= 1 or not 0 <= progress_threshold <= 1 or hold_steps < 1:
+            raise ValueError('stop / progress thresholds must be in [0, 1] and hold_steps positive')
+        self.threshold, self.progress_threshold, self.hold_steps, self.enabled = threshold, progress_threshold, hold_steps, enabled
+        self.reset()
+
+    def reset(self):
+        self.count = None
+        self.done = None
+        self.hold = None
+
+    def config(self):
+        return {'stop_threshold': self.threshold, 'progress_threshold': self.progress_threshold,
+                'hold_steps': self.hold_steps, 'enabled': self.enabled, 'done_action': 'hold_pose'}
+
+    def update(self, stop, progress, state, action, keep=None):
+        """`stop`, `progress` (B,) signals of this control step, `state` (B, 61) raw states, `action` (B, 23) the
+        absolute action that would be executed; `keep` (B,) False resets a slot (task change). Returns
+        (action to execute (B, 23), done (B,))."""
+        batch = len(stop)
+        if self.count is None or len(self.count) != batch:
+            self.count = np.zeros(batch, dtype=np.int64)
+            self.done = np.zeros(batch, dtype=bool)
+            self.hold = np.zeros((batch, action.shape[-1]), dtype=np.float32)
+        if keep is not None:
+            self.count[~keep] = 0
+            self.done[~keep] = False
+        active = (stop >= self.threshold) & (progress >= self.progress_threshold)
+        self.count = np.where(active, self.count + 1, 0)
+        newly = self.enabled & (self.count >= self.hold_steps) & ~self.done
+        if newly.any():
+            hold = action_reference(extract_state(np.asarray(state, dtype=np.float32)[newly], 'sum'), ACTION_DELTA)
+            hold[:, ACTION_DELTA['gripper_action_dims']] = action[newly][:, ACTION_DELTA['gripper_action_dims']]
+            self.hold[newly] = hold.astype(np.float32)
+            self.done[newly] = True
+        action = np.where(self.done[:, None], self.hold, action).astype(np.float32)
+        return action, self.done.copy()
 
 
 def load_goal_images(specs):
@@ -76,10 +132,11 @@ class PolicyPredictor:
         self.policy.eval()
 
     @torch.inference_mode()
-    def __call__(self, qpos, images, task_ids=None, goal=None, states=None):
-        """Absolute actions in action units for a batch; `task_ids` (B,) select the cached prompt, `goal` is
-        (B, views, 3, H, W). Relative-action checkpoints need `states`, the observations' raw (B, 61) R1Pro states
-        the prediction is made from: their chunks are relative to them."""
+    def predict(self, qpos, images, task_ids=None, goal=None, states=None):
+        """(absolute actions in action units (B, T, 23), signals) for a batch; `task_ids` (B,) select the cached
+        prompt, `goal` is (B, views, 3, H, W). Relative-action checkpoints need `states`, the observations' raw
+        (B, 61) R1Pro states the prediction is made from: their chunks are relative to them. `signals` are the
+        stop / progress columns (B, T, 2) in [0, 1] of a --stop-dims checkpoint, else None."""
         qpos, images = qpos.to(self.device), images.to(self.device)
         kwargs = {}
         if self.language_embeddings is not None:
@@ -91,9 +148,14 @@ class PolicyPredictor:
             if goal is None:
                 raise ValueError(f'Goal-conditioned checkpoint needs goal images for views {self.goal_views}')
             kwargs['goal'] = goal.to(self.device)
-        actions = self.policy(qpos, images, **kwargs).cpu().numpy()
+        outputs = self.policy(qpos, images, **kwargs).cpu().numpy()
+        actions, signals = split_stop_signals(outputs)
         proprio = None if states is None else extract_state(np.asarray(states, dtype=np.float32), 'sum')
-        return decode_actions(actions, self.checkpoint['normalization'], proprio).astype(np.float32)
+        return decode_actions(actions, self.checkpoint['normalization'], proprio).astype(np.float32), signals
+
+    def __call__(self, qpos, images, task_ids=None, goal=None, states=None):
+        """The absolute actions of `predict` (the signals of a --stop-dims checkpoint dropped)."""
+        return self.predict(qpos, images, task_ids, goal, states)[0]
 
 
 # Compatibility for clients importing the original B1K predictor name.
@@ -120,10 +182,18 @@ def snap_grippers(actions, threshold):
 
 
 class Session:
+    """One client's execution state: cached chunks (or the temporal-aggregation history), and for a --stop-dims
+    checkpoint the stop / progress signals of every control step (`signals` after `act`) with the `StopGate` that
+    turns them into DONE: chunked execution summarizes a new chunk's first `stop_positions` steps (default: the
+    action horizon) by their mean and keeps that until the next chunk; temporal aggregation uses the aggregated
+    current-step values (the signal columns are averaged over the overlapping chunks like the actions)."""
     def __init__(self, predictor, checkpoint, action_horizon=None, task_name=None, temporal_agg=False,
-                 fixed_goals=None, gripper_snap=None):
+                 fixed_goals=None, gripper_snap=None, stop_gate=None, stop_positions=None):
         self.predictor = predictor
         self.gripper_snap = gripper_snap  # applied to every returned action (`snap_grippers`); B1KServer sets 0.9
+        self.stop_signals = bool(checkpoint['model_config'].get('stop_dims', False))
+        self.stop_gate = stop_gate if stop_gate is not None else StopGate()
+        self.signals = None
         self.task_map = checkpoint['task_map']
         self.stats = checkpoint['normalization']
         adapter = checkpoint['adapter_config']
@@ -150,6 +220,12 @@ class Session:
         if temporal_agg and action_horizon != 1:
             raise ValueError('ACT temporal aggregation queries every observation; --action-horizon must be 1')
         self.action_horizon = action_horizon
+        if stop_positions is None:
+            stop_positions = 1 if temporal_agg else action_horizon
+        if not 1 <= stop_positions <= self.chunk_size or (temporal_agg and stop_positions != 1):
+            raise ValueError(f'--stop-positions must be between 1 and the chunk size {self.chunk_size} (1 with temporal '
+                             f'aggregation, which averages the current step over the overlapping chunks)')
+        self.stop_positions = stop_positions
         self.default_task = next(iter(self.task_map)) if len(self.task_map) == 1 else None
         if task_name is not None:
             matching = [i for i, name in self.task_map.items() if name == task_name]
@@ -160,9 +236,12 @@ class Session:
 
     def reset(self):
         self.plans = None
+        self.summaries = None
         self.positions = None
         self.task_ids = None
         self.history = []
+        self.signals = None
+        self.stop_gate.reset()
 
     def resolve_tasks(self, value, batch_size):
         if value is None:
@@ -204,31 +283,51 @@ class Session:
                     raise ValueError(f'Goal-conditioned checkpoint needs {key} in the observation (or --goal-image {view}=PATH)')
             goal = self.batch_images(goal_batch, list(self.goal_keys.values()), batch_size)
         if self.policy_class == 'CNNMLP':
-            predictions = self.predict(state, qpos, images, task_ids)
+            predictions, _ = self.predict(state, qpos, images, task_ids)
             self.validate_predictions(predictions, (batch_size, 23))
             self.task_ids = task_ids
             return snap_grippers(predictions.astype(np.float32), self.gripper_snap)
+        keep = None
+        if self.task_ids is not None and len(self.task_ids) == batch_size:
+            keep = task_ids == self.task_ids
         if self.temporal_agg:
             # the weighted average of overlapping chunks can bring a +1 opening below 1, so snap after it
-            return snap_grippers(self.aggregate(qpos, images, task_ids, goal, state), self.gripper_snap)
+            action, signals = self.aggregate(qpos, images, task_ids, goal, state)
+        else:
+            action, signals = self.chunked(qpos, images, task_ids, goal, state, batch_size)
+        action = snap_grippers(action.astype(np.float32), self.gripper_snap)
+        self.signals = None
+        if signals is not None:
+            action, done = self.stop_gate.update(signals[:, 0], signals[:, 1], state, action, keep)
+            self.signals = {'stop': signals[:, 0].astype(np.float32), 'progress': signals[:, 1].astype(np.float32),
+                            'done': done, 'hold_count': self.stop_gate.count.copy()}
+        return action
+
+    def chunked(self, qpos, images, task_ids, goal, state, batch_size):
+        """One action per slot from its cached chunk (a new chunk when it is used up or the task changed), plus the
+        chunk's signal summary (B, 2) for a --stop-dims checkpoint (None otherwise)."""
         if self.plans is None or len(self.plans) != batch_size:
             plans = np.zeros((batch_size, self.action_horizon, 23), dtype=np.float32)
+            summaries = np.zeros((batch_size, 2), dtype=np.float32)
             positions = np.full(batch_size, self.action_horizon, dtype=np.int64)
         else:
-            plans = self.plans.copy()
+            plans, summaries = self.plans.copy(), self.summaries.copy()
             positions = self.positions.copy()
             positions[task_ids != self.task_ids] = self.action_horizon
         needs_plan = positions >= self.action_horizon
         if needs_plan.any():
-            predictions = self.predict(state[needs_plan], qpos[needs_plan], images[needs_plan], task_ids[needs_plan],
-                                       None if goal is None else goal[torch.from_numpy(needs_plan)])
-            expected = (int(needs_plan.sum()), self.chunk_size, 23)
-            self.validate_predictions(predictions, expected)
+            predictions, signals = self.predict(state[needs_plan], qpos[needs_plan], images[needs_plan],
+                                                task_ids[needs_plan], None if goal is None else goal[torch.from_numpy(needs_plan)])
+            count = int(needs_plan.sum())
+            self.validate_predictions(predictions, (count, self.chunk_size, 23))
             plans[needs_plan] = predictions[:, :self.action_horizon]
             positions[needs_plan] = 0
+            if signals is not None:
+                self.validate_predictions(signals, (count, self.chunk_size, 2))
+                summaries[needs_plan] = signals[:, :self.stop_positions].mean(axis=1)
         action = plans[np.arange(batch_size), positions].copy()
-        self.plans, self.positions, self.task_ids = plans, positions + 1, task_ids
-        return snap_grippers(action.astype(np.float32), self.gripper_snap)
+        self.plans, self.summaries, self.positions, self.task_ids = plans, summaries, positions + 1, task_ids
+        return action, (summaries.copy() if self.stop_signals else None)
 
     def batch_images(self, observation, keys, batch_size):
         """uint8 (B,H,W,3|4) arrays under `keys` to one float (B, len(keys), 3, H, W) tensor at the training size."""
@@ -248,21 +347,30 @@ class Session:
             raise ValueError(f'Invalid model output; expected finite {expected}, got {predictions.shape}')
 
     def predict(self, state, *args):
-        """The predictor's absolute actions for `args` (qpos, images, task_ids[, goal]); a relative checkpoint's
-        predictor decodes them with the observations' raw `state`."""
-        return self.predictor(*args, states=state) if self.relative else self.predictor(*args)
+        """(absolute actions, signals or None) of the predictor for `args` (qpos, images, task_ids[, goal]); a
+        relative checkpoint's predictor decodes them with the observations' raw `state`. Predictors without a
+        `predict` method (plain callables returning actions) give no signals."""
+        kwargs = {'states': state} if self.relative else {}
+        if hasattr(self.predictor, 'predict'):
+            return self.predictor.predict(*args, **kwargs)
+        return self.predictor(*args, **kwargs), None
 
     def aggregate(self, qpos, images, task_ids, goal=None, state=None):
-        predictions = self.predict(state, qpos, images, task_ids, goal)
+        """Temporal aggregation: (the weighted average of the overlapping chunks' current step (B, 23), the same
+        average of the signal columns (B, 2) for a --stop-dims checkpoint, else None)."""
+        predictions, signals = self.predict(state, qpos, images, task_ids, goal)
         batch_size = len(task_ids)
         self.validate_predictions(predictions, (batch_size, self.chunk_size, 23))
+        if signals is not None:
+            self.validate_predictions(signals, (batch_size, self.chunk_size, 2))
+            predictions = np.concatenate([predictions, signals.astype(np.float32)], axis=-1)
         history = []
         if self.task_ids is not None and len(self.task_ids) == batch_size:
             unchanged = task_ids == self.task_ids
             for remaining, valid in self.history:
                 history.append((remaining, valid & unchanged))
         history.append((predictions, np.ones(batch_size, dtype=bool)))
-        action = np.empty((batch_size, 23), dtype=np.float32)
+        action = np.empty((batch_size, predictions.shape[-1]), dtype=np.float32)
         for slot in range(batch_size):
             # Preserve upstream oldest-first weights; validity does not depend on action values.
             candidates = np.stack([remaining[slot, 0] for remaining, valid in history if valid[slot]])
@@ -272,20 +380,25 @@ class Session:
         self.history = [(remaining[:, 1:].copy(), valid) for remaining, valid in history
                         if remaining.shape[1] > 1 and valid.any()]
         self.task_ids = task_ids
-        return action
+        return action[:, :23], (action[:, 23:] if signals is not None else None)
 
 
 class B1KServer:
     def __init__(self, checkpoint, predictor, host='0.0.0.0', port=8000, action_horizon=None,
-                 task_name=None, temporal_agg=False, fixed_goals=None, gripper_snap=DEFAULT_GRIPPER_SNAP):
+                 task_name=None, temporal_agg=False, fixed_goals=None, gripper_snap=DEFAULT_GRIPPER_SNAP,
+                 stop_gate=None, stop_positions=None, signal_log=None):
         self.checkpoint, self.predictor = checkpoint, predictor
         self.host, self.port = host, port
         self.fixed_goals = fixed_goals or {}
         self.gripper_snap = gripper_snap
-        session = Session(predictor, checkpoint, action_horizon, task_name, temporal_agg, self.fixed_goals,
-                          gripper_snap)
-        self.action_horizon, self.task_name = session.action_horizon, task_name
-        self.temporal_agg = temporal_agg
+        self.stop_gate_config = (stop_gate if stop_gate is not None else StopGate()).config()
+        self.stop_positions = stop_positions
+        self.signal_log = signal_log  # path of a JSON-lines log of every control step's signals (--stop-dims checkpoints)
+        self.sessions = 0
+        self.action_horizon, self.task_name, self.temporal_agg = action_horizon, task_name, temporal_agg
+        session = self.session()  # validates the options; client sessions are numbered from 1
+        self.sessions = 0
+        self.action_horizon = session.action_horizon
         mode = 'single_action' if session.policy_class == 'CNNMLP' else ('temporal_aggregation' if temporal_agg else 'chunked')
         goal = goal_config(checkpoint['model_config'])
         self.metadata = {'policy': session.policy_class, 'protocol': 'behavior-numpy-msgpack', 'action_dim': 23,
@@ -310,11 +423,32 @@ class B1KServer:
                          'served_actions': 'absolute',
                          'gripper_action_dims': GRIPPER_ACTION_DIMS,
                          'gripper_clamp': [-1.0, 1.0] if gripper_snap is not None else None,
-                         'gripper_snap_threshold': gripper_snap}
+                         'gripper_snap_threshold': gripper_snap,
+                         # --stop-dims checkpoints: every response also carries stop / progress (B,) float32 in
+                         # [0, 1] and done (B,) bool; a DONE slot's action is its hold pose until the next reset
+                         'stop_signals': ({'response_keys': ['stop', 'progress', 'done'], 'stop_positions': session.stop_positions,
+                                           **self.stop_gate_config} if session.stop_signals else None)}
+
+    def session(self):
+        self.sessions += 1
+        gate = StopGate(self.stop_gate_config['stop_threshold'], self.stop_gate_config['progress_threshold'],
+                        self.stop_gate_config['hold_steps'], self.stop_gate_config['enabled'])
+        return Session(self.predictor, self.checkpoint, self.action_horizon, self.task_name, self.temporal_agg,
+                       self.fixed_goals, self.gripper_snap, gate, self.stop_positions)
+
+    def log_signals(self, session_id, step, signals):
+        if not self.signal_log or signals is None:
+            return
+        with open(self.signal_log, 'a') as handle:
+            for slot in range(len(signals['stop'])):
+                handle.write(json.dumps({'session': session_id, 'step': step, 'slot': slot,
+                                         'stop': float(signals['stop'][slot]), 'progress': float(signals['progress'][slot]),
+                                         'hold_count': int(signals['hold_count'][slot]), 'done': bool(signals['done'][slot])})
+                             + '\n')
 
     async def handler(self, websocket):
-        session = Session(self.predictor, self.checkpoint, self.action_horizon, self.task_name, self.temporal_agg,
-                          self.fixed_goals, self.gripper_snap)
+        session = self.session()
+        session_id, step = self.sessions, 0
         await websocket.send(packb(self.metadata))
         try:
             async for message in websocket:
@@ -322,9 +456,17 @@ class B1KServer:
                     observation = unpackb(message)
                     if isinstance(observation, dict) and 'reset' in observation:
                         session.reset()
+                        self.sessions += 1
+                        session_id, step = self.sessions, 0
                         continue
                     action = session.act(observation)
-                    await websocket.send(packb({'action': action}))
+                    step += 1
+                    payload = {'action': action}
+                    if session.signals is not None:
+                        payload.update(stop=session.signals['stop'], progress=session.signals['progress'],
+                                       done=session.signals['done'])
+                        self.log_signals(session_id, step, session.signals)
+                    await websocket.send(packb(payload))
                 except (ValueError, KeyError, TypeError, msgpack.ExtraData) as exc:
                     LOGGER.warning('Rejected observation: %s', exc)
                     await websocket.close(code=1008, reason=str(exc)[:100])
@@ -368,10 +510,31 @@ def main():
                    help='Clamp the gripper commands (action dims 14, 22) to [-1, 1] and send those above T fully open '
                         '(+1), the only command at which OmniGibson releases an assisted grasp (default 0.9); "none" '
                         'returns them as predicted')
+    p.add_argument('--stop-threshold', type=float, default=STOP_THRESHOLD, metavar='T',
+                   help='--stop-dims checkpoints: a control step counts towards DONE when its stop signal is at least T '
+                        f'(default {STOP_THRESHOLD})')
+    p.add_argument('--progress-threshold', type=float, default=PROGRESS_THRESHOLD, metavar='T',
+                   help=f'... and its progress signal at least T (default {PROGRESS_THRESHOLD})')
+    p.add_argument('--stop-hold-steps', type=int, default=STOP_HOLD_STEPS, metavar='N',
+                   help=f'DONE after N consecutive such control steps (default {STOP_HOLD_STEPS}: 1 s at 30 Hz); the '
+                        'slot then holds its pose (joints at that step\'s state, zero base velocity, the last gripper '
+                        'commands) until the next reset')
+    p.add_argument('--stop-positions', type=int, default=None, metavar='K',
+                   help='Chunked execution: a new chunk\'s stop / progress signals are the means over its first K steps '
+                        '(default: the action horizon); temporal aggregation averages the current step over the '
+                        'overlapping chunks instead (K = 1)')
+    p.add_argument('--no-stop-gating', action='store_true',
+                   help='Serve and log the stop / progress signals but never declare DONE (the baseline termination '
+                        'stays with the client)')
+    p.add_argument('--signal-log', metavar='PATH',
+                   help='Append every control step\'s stop / progress / hold count / done per slot as JSON lines')
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     checkpoint = load_checkpoint(args.model_path)
+    gate = StopGate(args.stop_threshold, args.progress_threshold, args.stop_hold_steps, not args.no_stop_gating)
     server = B1KServer(checkpoint, PolicyPredictor(checkpoint, args.device), args.host, args.port,
                        args.action_horizon, args.task_name, args.temporal_agg, load_goal_images(args.goal_image),
-                       args.gripper_snap_threshold)
+                       args.gripper_snap_threshold, gate, args.stop_positions, args.signal_log)
+    if server.metadata['stop_signals']:
+        LOGGER.info('Stop signals: %s', server.metadata['stop_signals'])
     asyncio.run(server.run())

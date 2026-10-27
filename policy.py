@@ -18,6 +18,15 @@ class ACTPolicy(nn.Module):
         self.l1_normalization = args_override.get('l1_normalization', 'all')
         if self.l1_normalization not in ('all', 'valid'):
             raise ValueError(f"l1_normalization must be 'all' or 'valid', got {self.l1_normalization!r}")
+        # Stop study, Method A: the last two action dims are the stop and progress targets (b1k_dataset.stop_targets).
+        # Their L1 covers every chunk step, padded ones included (that is where stop = 1 lives); the motion dims keep
+        # the is_pad masking above. `stop_pos_weight` upweights the positive (stop = 1) steps of the stop term.
+        self.stop_dims = bool(args_override.get('stop_dims', False))
+        self.stop_pos_weight = float(args_override.get('stop_pos_weight', 1.0))
+        self.stop_loss_weight = float(args_override.get('stop_loss_weight', 1.0))
+        self.progress_loss_weight = float(args_override.get('progress_loss_weight', 1.0))
+        if self.stop_dims and min(self.stop_pos_weight, self.stop_loss_weight, self.progress_loss_weight) <= 0:
+            raise ValueError('stop_pos_weight, stop_loss_weight and progress_loss_weight must be positive')
         print(f'KL Weight {self.kl_weight}')
 
     def forward(self, qpos, image, actions=None, is_pad=None, lang_emb=None, goal=None, goal_valid=None,
@@ -42,6 +51,9 @@ class ACTPolicy(nn.Module):
             total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
             loss_dict = dict()
             all_l1 = F.l1_loss(actions, a_hat, reduction='none')
+            extra = None
+            if self.stop_dims:
+                all_l1, extra = all_l1[..., :-2], all_l1[..., -2:]
             valid = ~is_pad.unsqueeze(-1)
             if self.l1_normalization == 'valid':
                 l1 = (all_l1 * valid).sum() / (valid.sum() * all_l1.shape[-1]).clamp_min(1)
@@ -50,6 +62,13 @@ class ACTPolicy(nn.Module):
             loss_dict['l1'] = l1
             loss_dict['kl'] = total_kld[0]
             loss_dict['loss'] = loss_dict['l1'] + loss_dict['kl'] * self.kl_weight
+            if extra is not None:
+                positive = (actions[..., -2] > 0).to(extra.dtype)
+                weight = 1 + (self.stop_pos_weight - 1) * positive
+                loss_dict['l1_stop'] = (extra[..., 0] * weight).sum() / weight.sum().clamp_min(1)
+                loss_dict['l1_progress'] = extra[..., 1].mean()
+                loss_dict['loss'] = (loss_dict['loss'] + self.stop_loss_weight * loss_dict['l1_stop']
+                                     + self.progress_loss_weight * loss_dict['l1_progress'])
             if l1_terms:
                 return loss_dict, {'l1_sum': (all_l1 * valid).sum((1, 2)), 'l1_count': valid.sum((1, 2)) * all_l1.shape[-1]}
             return loss_dict

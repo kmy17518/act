@@ -22,11 +22,12 @@ import torch
 from torch.utils.data import DataLoader
 
 from b1k_dataset import (ACTION_DELTA, ACTION_REPRESENTATIONS, B1KDataset, CAMERAS, GOAL_OBS_KEYS, GOAL_SOURCES,
-                         GOAL_VIDEO_KEYS, GRIPPER_STATES, NORMALIZATIONS, OBS_KEYS, QUANTILE_MIN_RANGE, STATE_INDICES,
-                         VIDEO_KEYS, SplitBatchSampler, StepBatchSampler, decode_actions, describe_episode_split,
-                         expand_task_groups, goal_views_to_indices, parse_settle_steps, proprio_dim,
-                         resolve_episode_split, unnormalize)
+                         GOAL_VIDEO_KEYS, GRIPPER_STATES, NORMALIZATIONS, OBS_KEYS, QUANTILE_MIN_RANGE,
+                         SETTLE_WINDOWS_FILE, STATE_INDICES, VIDEO_KEYS, SplitBatchSampler, StepBatchSampler,
+                         decode_actions, describe_episode_split, expand_task_groups, goal_views_to_indices,
+                         parse_settle_steps, proprio_dim, resolve_episode_split, statistics_dim, unnormalize)
 from b1k_augment import IMAGE_AUGMENTS, augment_batch
+from b1k_stop_eval import auroc, stop_signal_metrics  # noqa: F401  (auroc re-exported for scripts and tests)
 from b1k_frame_cache import dequantize_images
 from detr.models.backbone import SpaceToDepthStem, parse_goal_stem_init, replaces_stem
 from detr.models.detr_vae import (GOAL_CONTENTS, GOAL_ENCODERS, GOAL_ENTRIES, GOAL_FUSIONS, GOAL_POSITIONS, GOAL_TOKENS,
@@ -524,7 +525,9 @@ def action_unit_errors(prediction, actions, is_pad, qpos, stats, gripper_state):
     if prediction.ndim == 2:
         prediction = prediction[:, None]
     queries = prediction.shape[1]
-    target = actions[:, :queries].float().cpu().numpy().astype(np.float64)
+    motion = statistics_dim(stats, 'action')  # a --stop-dims chunk carries two signal columns after the actions
+    prediction = prediction[..., :motion]
+    target = actions[:, :queries, :motion].float().cpu().numpy().astype(np.float64)
     valid = (~is_pad[:, :queries]).cpu().numpy()
     proprio = unnormalize(qpos[:, :proprio_dim(gripper_state)].float().cpu().numpy().astype(np.float64), stats, 'qpos')
     error = np.abs(decode_actions(prediction, stats, proprio) - decode_actions(target, stats, proprio))
@@ -553,6 +556,8 @@ def evaluate_validation(policy, val_dataset, val_batches, val_batch_size, langua
     families = {}
     # val/l1_action_units[/<family>]: the zero-latent L1 on absolute actions in action units (`action_unit_errors`)
     units = {}
+    motion = statistics_dim(val_dataset.stats, 'action')
+    signals = []  # --stop-dims: (zero-latent stop / progress predictions, targets, is_pad) per batch
     try:
         policy.eval()
         torch.manual_seed(seed)
@@ -586,7 +591,12 @@ def evaluate_validation(policy, val_dataset, val_batches, val_batch_size, langua
                     totals[key] = totals.get(key, 0.0) + val
                 if prediction.dim() == 3:
                     queries = prediction.shape[1]
-                    target = actions[:, :queries]
+                    if prediction.shape[-1] > motion:
+                        signals.append((prediction[..., motion:].float().cpu().numpy(),
+                                        actions[:, :queries, motion:].float().cpu().numpy(),
+                                        is_pad[:, :queries].cpu().numpy()))
+                    prediction = prediction[..., :motion]
+                    target = actions[:, :queries, :motion]
                     valid = ~is_pad[:, :queries]
                     mask = valid.unsqueeze(-1).float()
                     inf_per_sample = ((prediction.float() - target.float()).abs() * mask).sum((1, 2))
@@ -621,6 +631,8 @@ def evaluate_validation(policy, val_dataset, val_batches, val_batch_size, langua
     for family, (l1_sum, count) in sorted(units.items()):
         if not family or len(set(family_of.values())) > 1:
             metrics['val/l1_action_units' + (f'/{family}' if family else '')] = l1_sum / max(1, count)
+    if signals:
+        metrics.update(stop_signal_metrics(*(np.concatenate(parts) for parts in zip(*signals))))
     metrics['timing/val_s'] = time.monotonic() - started
     return metrics
 
@@ -983,6 +995,21 @@ def parser():
                    help='Gripper proprioception: sum (default) adds the two finger positions of each gripper into one '
                         'opening, giving a 23-value state in the action\'s layout; fingers keeps both (25 values). '
                         'Resume uses the checkpoint\'s layout (fingers for checkpoints that do not record one)')
+    p.add_argument('--stop-dims', default=False, action=ExplicitBooleanOption,
+                   help='Stop study, Method A: the ACT head predicts 25 values per chunk step, the 23 actions plus stop '
+                        '(2 * [frame >= T_end] - 1) and progress (2 * clip(frame / T_end, 0, 1) - 1), T_end the episode\'s '
+                        'program length from <dataset root>/isg_meta/settle_windows.json (labels computed on the fly, '
+                        'nothing on disk changes). Both are L1 targets on every chunk step, padded steps included; the '
+                        'motion dims keep their padding mask and normalization. Saved; resume uses the checkpoint\'s')
+    p.add_argument('--stop-pos-weight', type=float, default=1.0, metavar='W',
+                   help='--stop-dims: weight of the positive (stop = 1) chunk steps in the stop L1 (default 1: none)')
+    p.add_argument('--stop-loss-weight', type=float, default=1.0, metavar='W',
+                   help='--stop-dims: coefficient of the stop L1 in the loss (default 1)')
+    p.add_argument('--progress-loss-weight', type=float, default=1.0, metavar='W',
+                   help='--stop-dims: coefficient of the progress L1 in the loss (default 1)')
+    p.add_argument('--stop-oversample', type=float, default=0.0, metavar='FRACTION',
+                   help='Draw this fraction of every batch from the last chunk-size frames of their (episode-uniform) '
+                        'episodes, the windows whose chunk reaches the episode end (default 0: uniform frames)')
     p.add_argument('--output-dir', required=True)
     p.add_argument('--max-steps', type=int, default=50000, help='Total optimizer steps, including resumed steps')
     p.add_argument('--batch-size', type=int, default=8)
@@ -1270,11 +1297,14 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                              ('goal_pos', 'sine'), ('goal_content', 'goal'), ('goal_entry', 'encoder'),
                              ('goal_stem_gain', None), ('goal_stem_diff', False), ('goal_fusion_depth', 0),
                              ('goal_detach_views', []), ('action_representation', 'absolute'),
-                             ('normalization', 'zscore'), ('image_augment', 'none')]:
+                             ('normalization', 'zscore'), ('image_augment', 'none'), ('stop_dims', False)]:
             saved_value = model_config.get(key, default)
             if getattr(args, f'_{key}_explicit', False) and getattr(args, key) != saved_value:
                 raise ValueError(f'--{key.replace("_", "-")} differs from checkpoint')
             setattr(args, key, saved_value)
+        for key in ('stop_pos_weight', 'stop_loss_weight', 'progress_loss_weight'):
+            if key in model_config:
+                setattr(args, key, model_config[key])
         saved_source = adapter.get('goal_source', 'episode_last')
         if getattr(args, '_goal_source_explicit', False) and args.goal_source != saved_source:
             raise ValueError('--goal-source differs from checkpoint')
@@ -1364,10 +1394,19 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                         'goal_stem_gain': args.goal_stem_gain, 'goal_stem_diff': bool(args.goal_stem_diff),
                         'goal_fusion_depth': int(args.goal_fusion_depth),
                         **({'goal_detach_views': list(args.goal_detach_views)} if args.goal_detach_views else {}),
-                        'dilation': False, 'masks': False, 'action_dim': 23,
+                        'dilation': False, 'masks': False, 'action_dim': 23 + (2 if args.stop_dims else 0),
                         # older checkpoints: absolute / zscore; the statistics record the delta mapping
                         'action_representation': args.action_representation, 'normalization': args.normalization,
                         'image_augment': args.image_augment}
+        if args.stop_dims:
+            if args.policy_class != 'ACT':
+                raise ValueError('--stop-dims extends the ACT action chunk; CNNMLP predicts one action')
+            model_config.update(stop_dims=True, stop_pos_weight=float(args.stop_pos_weight),
+                                stop_loss_weight=float(args.stop_loss_weight),
+                                progress_loss_weight=float(args.progress_loss_weight))
+            adapter['stop_signals'] = ['stop', 'progress']  # network outputs 23, 24: served as signals, not actions
+        elif (args.stop_pos_weight, args.stop_loss_weight, args.progress_loss_weight) != (1.0, 1.0, 1.0):
+            raise ValueError('--stop-pos-weight / --stop-loss-weight / --progress-loss-weight need --stop-dims')
         if args.action_representation == 'relative':
             if args.gripper_state != 'sum':
                 raise ValueError('--action-representation relative needs --gripper-state sum (one state value per '
@@ -1404,6 +1443,7 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
         LOGGER.info('Validation split %s', describe_val_split(val_split))
     selected_episodes = (val_split['train_episodes'] if val_split
                          else (episode_split['episodes'] if episode_split else None))
+    stop_dims = bool(model_config.get('stop_dims', False))
     dataset = B1KDataset(root, task_names, model_config['num_queries'], adapter['image_size'],
                          cache_row_groups=args.cache_row_groups, profile_reads=True,
                          timestamp_tolerance=adapter['timestamp_tolerance'],
@@ -1411,7 +1451,8 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                          goal_views=goal['goal_views'], goal_source=adapter.get('goal_source', 'episode_last'),
                          task_onehot=task_onehot, episodes=selected_episodes,
                          settle_steps=args.settle_steps, gripper_state=adapter.get('gripper_state', 'fingers'),
-                         goal_mismatch_views=adapter.get('goal_mismatch_views', []), goal_mismatch_seed=args.seed)
+                         goal_mismatch_views=adapter.get('goal_mismatch_views', []), goal_mismatch_seed=args.seed,
+                         stop_dims=stop_dims)
     resources.callback(dataset.close)
     val_dataset = None
     if val_split and is_main:
@@ -1422,7 +1463,8 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                                  goal_views=goal['goal_views'], goal_source=adapter.get('goal_source', 'episode_last'),
                                  task_onehot=task_onehot, episodes=val_split['val_episodes'],
                                  settle_steps=args.settle_steps, gripper_state=adapter.get('gripper_state', 'fingers'),
-                                 goal_mismatch_views=adapter.get('goal_mismatch_views', []), goal_mismatch_seed=args.seed)
+                                 goal_mismatch_views=adapter.get('goal_mismatch_views', []), goal_mismatch_seed=args.seed,
+                                 stop_dims=stop_dims)
         resources.callback(val_dataset.close)
     if checkpoint and dataset.task_map != checkpoint['task_map']:
         raise ValueError('Resume task map differs from checkpoint')
@@ -1536,7 +1578,16 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
             tracked.config.update(run, allow_val_change=True)
     per_rank_batch_size = args.batch_size // world_size
     sampler = StepBatchSampler(dataset, args.batch_size, start, args.max_steps, args.seed,
-                               tag=bool(dataset.goal_mismatch_slots), rank=rank, world_size=world_size)
+                               tag=bool(dataset.goal_mismatch_slots), rank=rank, world_size=world_size,
+                               end_window=model_config['num_queries'], end_fraction=args.stop_oversample)
+    if is_main and args.stop_oversample:
+        LOGGER.info('Stop oversampling: %.0f%% of every batch from the last %d frames of their episodes',
+                    100 * args.stop_oversample, model_config['num_queries'])
+    if is_main and stop_dims:
+        LOGGER.info('Stop dims: 23 actions + stop / progress targets (T_end = program length of %s), stop positives '
+                    'weighted %.1f, loss coefficients stop %.2f progress %.2f', SETTLE_WINDOWS_FILE,
+                    model_config['stop_pos_weight'], model_config['stop_loss_weight'],
+                    model_config['progress_loss_weight'])
     if is_main and dataset.goal_mismatch_slots:
         LOGGER.info('Goal mismatch control: views %s show another episode of the same task, drawn per sample '
                     '(seed %d, step, slot)', dataset.goal_mismatch_views, args.seed)

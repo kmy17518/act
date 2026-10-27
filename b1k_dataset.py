@@ -165,6 +165,59 @@ def settle_frames(spec, program_length):
     return math.ceil(Fraction(spec) * program_length) if '.' in spec else int(spec)
 
 
+def read_settle_windows(dataset_path, purpose):
+    """(path, bytes, parsed) of <root>/isg_meta/settle_windows.json, the program length of every episode; `purpose`
+    names the option that needs it in the FileNotFoundError."""
+    path = Path(dataset_path).resolve() / SETTLE_WINDOWS_FILE
+    if not path.is_file():
+        raise FileNotFoundError(f'{purpose} needs {path}, the program length of every episode; only datasets '
+                                'whose episodes end with a recorded settle window ship it')
+    content = path.read_bytes()
+    windows = json.loads(content)
+    if windows.get('format') != SETTLE_WINDOWS_FORMAT or not isinstance(windows.get('episodes'), dict):
+        raise ValueError(f'{path} is not an {SETTLE_WINDOWS_FORMAT} file (format {windows.get("format")!r})')
+    return path, content, windows
+
+
+def settle_window(windows, path, episode_index, recorded_length):
+    """The program length of an episode of `recorded_length` recorded frames from a parsed settle windows file."""
+    entry = windows['episodes'].get(str(episode_index))
+    if not entry or entry.get('length') != recorded_length or not 0 < entry.get('program_length', 0) <= recorded_length:
+        raise ValueError(f'{path} has no settle window for episode {episode_index} of length {recorded_length} '
+                         f'(entry {entry}); regenerate it for this dataset')
+    return int(entry['program_length'])
+
+
+def load_program_lengths(dataset_path, recorded_lengths, purpose='--stop-dims'):
+    """{episode_index: program_length} for `recorded_lengths` ({episode_index: recorded frames}): T_end of every
+    episode, the first frame after its demonstration program (the recorded settle window follows it)."""
+    path, _, windows = read_settle_windows(dataset_path, purpose)
+    return {int(episode): settle_window(windows, path, episode, length) for episode, length in recorded_lengths.items()}
+
+
+def stop_targets(frame, program_length, chunk_size):
+    """Method A targets of the action chunk starting at `frame` (chunk_size, 2), in the network's [-1, 1] units:
+    stop = 2 * [t >= T_end] - 1 and progress = 2 * clip(t / T_end, 0, 1) - 1 for the chunk's frames t = frame + k,
+    T_end = program_length. Chunk steps past the loaded episode count as well: with --settle-steps 0 (the episode
+    cut at T_end) they are exactly the padded steps, where stop = 1 lives."""
+    frames = frame + np.arange(chunk_size)
+    stop = (frames >= program_length).astype(np.float32)
+    progress = np.clip(frames / float(program_length), 0.0, 1.0).astype(np.float32)
+    return np.stack([2 * stop - 1, 2 * progress - 1], axis=-1)
+
+
+def split_stop_signals(outputs, action_dim=23):
+    """Network outputs (..., action_dim + 2) of a --stop-dims checkpoint to (motion (..., action_dim), signals
+    (..., 2) in [0, 1]: stop probability-like score and progress). Outputs without the extra dims pass through
+    with signals None."""
+    outputs = np.asarray(outputs)
+    if outputs.shape[-1] == action_dim:
+        return outputs, None
+    if outputs.shape[-1] != action_dim + 2:
+        raise ValueError(f'Expected {action_dim} or {action_dim + 2} output dims, got {outputs.shape[-1]}')
+    return outputs[..., :action_dim], np.clip((outputs[..., action_dim:].astype(np.float32) + 1) / 2, 0.0, 1.0)
+
+
 def apply_settle_steps(dataset_path, spec, episodes):
     """Cut episodes (meta/episodes rows; `length` and `dataset_to_index` change in place) to `--settle-steps SPEC`.
 
@@ -175,21 +228,10 @@ def apply_settle_steps(dataset_path, spec, episodes):
     spec = parse_settle_steps(spec)
     if spec == 'all':
         return None
-    path = Path(dataset_path).resolve() / SETTLE_WINDOWS_FILE
-    if not path.is_file():
-        raise FileNotFoundError(f'--settle-steps {spec} needs {path}, the program length of every episode; only datasets '
-                                'whose episodes end with a recorded settle window ship it')
-    content = path.read_bytes()
-    windows = json.loads(content)
-    if windows.get('format') != SETTLE_WINDOWS_FORMAT or not isinstance(windows.get('episodes'), dict):
-        raise ValueError(f'{path} is not an {SETTLE_WINDOWS_FORMAT} file (format {windows.get("format")!r})')
+    path, content, windows = read_settle_windows(dataset_path, f'--settle-steps {spec}')
     recorded = settle = capped = 0
     for ep in episodes:
-        entry = windows['episodes'].get(str(ep['episode_index']))
-        if not entry or entry.get('length') != ep['length'] or not 0 < entry.get('program_length', 0) <= ep['length']:
-            raise ValueError(f'{path} has no settle window for episode {ep["episode_index"]} of length {ep["length"]} '
-                             f'(entry {entry}); regenerate it for this dataset')
-        program = entry['program_length']
+        program = settle_window(windows, path, ep['episode_index'], ep['length'])
         wanted = settle_frames(spec, program)
         kept = min(wanted, ep['length'] - program)
         capped += wanted > kept
@@ -392,14 +434,21 @@ class B1KDataset(torch.utils.data.Dataset):
     of another episode of the same task, drawn uniformly for every sample (`mismatch_partner`, keyed on
     `goal_mismatch_seed` and the sample's (step, slot) from `StepBatchSampler(tag=True)`); the other views keep the
     sample's own goals. Samples are then indexed `(index, step, slot)`.
+
+    `stop_dims` (Method A of the stop study) appends two target columns to every action chunk, computed on the fly
+    from isg_meta/settle_windows.json (`stop_targets`; nothing on disk changes): stop (frame >= T_end) and
+    progress (frame / T_end), T_end the episode's program length. `is_pad` is untouched (it masks the motion dims
+    only); the statistics and the normalization of the 23 motion dims are unchanged.
     """
     def __init__(self, dataset_path, task_names=None, chunk_size=100, image_size=(240, 240),
                  cache_row_groups=2, video_cache_size=3, timestamp_tolerance=0.008, profile_reads=False,
                  frame_cache=None, goal_views=(), goal_source='episode_last', task_onehot=True, episodes=None,
-                 settle_steps='all', gripper_state='sum', goal_mismatch_views=(), goal_mismatch_seed=0):
+                 settle_steps='all', gripper_state='sum', goal_mismatch_views=(), goal_mismatch_seed=0,
+                 stop_dims=False):
         if gripper_state not in GRIPPER_STATES:
             raise ValueError(f'Unknown gripper_state {gripper_state!r}; expected one of {GRIPPER_STATES}')
         self.gripper_state = gripper_state
+        self.stop_dims = bool(stop_dims)
         self.root = Path(dataset_path).resolve()
         self.goal_views = list(goal_views or [])
         self.goal_camera_indices = goal_views_to_indices(self.goal_views)
@@ -518,6 +567,12 @@ class B1KDataset(torch.utils.data.Dataset):
         if len(self.by_id) != len(self.episodes):
             raise ValueError('Duplicate episode_index in metadata')
         self.recorded_lengths = {int(ep['episode_index']): int(ep['length']) for ep in self.episodes}
+        # T_end per episode (position order), only for the stop targets: kept off the episode rows so that the
+        # fingerprint (and with it the statistics files) of a run without them is unchanged
+        self.program_lengths = None
+        if self.stop_dims:
+            programs = load_program_lengths(self.root, self.recorded_lengths)
+            self.program_lengths = np.array([programs[int(ep['episode_index'])] for ep in self.episodes], dtype=np.int64)
         self.settle = apply_settle_steps(self.root, settle_steps, self.episodes)
         if self.settle:
             LOGGER.info('Settle steps %s', describe_settle_steps(self.settle))
@@ -821,7 +876,8 @@ class B1KDataset(torch.utils.data.Dataset):
         is_pad = np.arange(self.chunk_size) >= count
         qpos = preprocess_state(table['state'][row], int(ep['task_index']), self.stats, self.task_map, self.task_onehot,
                                 gripper_state=self.gripper_state)
-        actions = encode_actions(actions, extract_state(table['state'][row], self.gripper_state), self.stats)
+        actions = self.targets(encode_actions(actions, extract_state(table['state'][row], self.gripper_state), self.stats),
+                               position, frame)
         middle = time.perf_counter() if self.profile_reads else 0
         images = np.empty((len(VIDEO_KEYS), *self.image_size, 3), dtype=np.uint8)
         for camera, key in enumerate(VIDEO_KEYS):
@@ -845,9 +901,24 @@ class B1KDataset(torch.utils.data.Dataset):
         image = torch.stack([preprocess_image(x, self.image_size) for x in images])
         qpos = preprocess_state(state, task_id, self.stats, self.task_map, self.task_onehot,
                                 gripper_state=self.gripper_state)
-        actions = encode_actions(actions, extract_state(state, self.gripper_state), self.stats)
+        position = self.positions[int(episode_id)]
+        actions = self.targets(encode_actions(actions, extract_state(state, self.gripper_state), self.stats), position, frame)
         return (image, qpos, torch.from_numpy(actions.astype(np.float32)), torch.from_numpy(is_pad),
-                self.goal_for(self.positions[int(episode_id)], draw), torch.tensor(int(task_id), dtype=torch.int64))
+                self.goal_for(position, draw), torch.tensor(int(task_id), dtype=torch.int64))
+
+    def targets(self, actions, position, frame):
+        """The network targets of a sample: its encoded action chunk, plus the stop / progress columns of
+        `stop_targets` for the chunk starting at `frame` of the episode at `position` when `stop_dims` is set."""
+        if not self.stop_dims:
+            return actions
+        return np.concatenate([np.asarray(actions, dtype=np.float32),
+                               stop_targets(frame, int(self.program_lengths[position]), self.chunk_size)], axis=-1)
+
+    def program_length(self, episode_id):
+        """T_end of an episode: the first frame after its demonstration program (requires `stop_dims`)."""
+        if self.program_lengths is None:
+            raise RuntimeError('Program lengths are loaded with stop_dims=True')
+        return int(self.program_lengths[self.positions[int(episode_id)]])
 
     def __getitem__(self, index):
         draw = None
@@ -1016,17 +1087,25 @@ class StepBatchSampler:
     """Episode-uniform ACT sampling without a full-frame permutation or worker RNG.
 
     `tag=True` yields (index, step, slot) instead of index (the same indices), the key of goal-mismatch draws.
-    When `world_size > 1`, each step draws `batch_size` (global) samples and yields rank `rank`'s contiguous slice."""
-    def __init__(self, dataset, batch_size, start_step, max_steps, seed, tag=False, rank=0, world_size=1):
+    When `world_size > 1`, each step draws `batch_size` (global) samples and yields rank `rank`'s contiguous slice.
+
+    `end_fraction` > 0 (the stop study's --stop-oversample) draws that fraction of the samples from the last
+    `end_window` frames of their episode (the windows whose chunk reaches the episode's end), the rest uniformly as
+    before; 0 keeps the draw sequence of earlier runs exactly."""
+    def __init__(self, dataset, batch_size, start_step, max_steps, seed, tag=False, rank=0, world_size=1,
+                 end_window=0, end_fraction=0.0):
         if world_size < 1 or not 0 <= rank < world_size:
             raise ValueError(f'Invalid rank {rank} / world_size {world_size}')
         if batch_size % world_size != 0:
             raise ValueError(f'Batch size {batch_size} must be divisible by world_size {world_size}')
+        if not 0.0 <= end_fraction <= 1.0 or (end_fraction > 0 and end_window < 1):
+            raise ValueError(f'end_fraction must be in [0, 1] with a positive end_window, got {end_fraction} / {end_window}')
         self.dataset = dataset
         self.global_batch_size = batch_size
         self.batch_size = batch_size // world_size
         self.rank, self.world_size = rank, world_size
         self.start_step, self.max_steps, self.seed, self.tag = start_step, max_steps, seed, tag
+        self.end_window, self.end_fraction = int(end_window), float(end_fraction)
 
     def __iter__(self):
         lo = self.rank * self.batch_size
@@ -1034,7 +1113,12 @@ class StepBatchSampler:
         for step in range(self.start_step, self.max_steps):
             rng = np.random.default_rng(np.random.SeedSequence([self.seed, step]))
             episodes = rng.integers(len(self.dataset.episodes), size=self.global_batch_size)
-            frames = [int(rng.integers(self.dataset.lengths[ep])) for ep in episodes]
+            if self.end_fraction > 0:
+                tail = rng.random(self.global_batch_size) < self.end_fraction
+                frames = [int(rng.integers(max(0, int(self.dataset.lengths[ep]) - self.end_window), self.dataset.lengths[ep]))
+                          if end else int(rng.integers(self.dataset.lengths[ep])) for ep, end in zip(episodes, tail)]
+            else:
+                frames = [int(rng.integers(self.dataset.lengths[ep])) for ep in episodes]
             indices = [int(self.dataset.starts[ep]) + frame for ep, frame in zip(episodes, frames)]
             yield [(indices[slot], step, slot) for slot in range(lo, hi)] if self.tag else indices[lo:hi]
 
