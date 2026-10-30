@@ -464,3 +464,52 @@ CUDA_VISIBLE_DEVICES="$IDLE_GPU" OMP_NUM_THREADS=1 .venv/bin/python scripts/b1k/
 ```
 
 The runner requires one explicit physical GPU index and checks `nvidia-smi` for no compute processes, at most 100 MiB used, and zero utilization **before importing torch**. It fails closed otherwise. This finite CPU smoke is not full-scale ACT training, converged CNNMLP training, a hyperparameter search, or robot/simulator evaluation. No new algorithm or loss replaces either upstream policy.
+
+
+## Portable data path v2 (opt-in JPEG cache)
+
+New training defaults use `--frame-selection pi --gripper-action absolute --stats-estimator exact`.
+The sampler visits every eligible current-frame anchor once per shuffled epoch, including terminal anchors;
+its bounded permutation is not PyTorch's exact RNG sequence. Existing checkpoints resume their saved/legacy
+selection and normalization. Stop oversampling explicitly requires `--frame-selection legacy`.
+
+Relative statistics exclude padding, use population moments, `(std + 1e-6)` and raw `(q99 - q01 + 1e-6)`.
+The identical `b1k_data_core.py` estimator is vendored in ACT, DP and Pi. Exact quantiles use scratch-backed
+columns; `--stats-estimator sampled --stats-sample-size 10000000` is an explicit scalable fallback with exact
+moments. `auto` switches quantiles above 500M valid rows. New keys use immutable dataset revision plus relative
+source paths/sizes, not mtime. Set `B1K_DATASET_REVISION` to the pinned immutable dataset commit on every host;
+without it, HF download receipts or a metadata-content digest supply the revision. Do not reuse a revision for
+modified content. `--stats-file /path/to/stats.json` loads a portable precomputation after selection/recipe checks.
+Old checkpoint/statistics formats and their floors remain readable.
+
+Build v2 in a **new directory** with `--format v2 --image-size 224 224 --jpeg-quality 95 --jpeg-subsampling 0`.
+`--format v1` remains the builder default. v2 stores 4:4:4 JPEGs in 2 GB shards with mmap indices/PTS and chunk
+catalogs. CPU decode plus CUDA resize is available through `--resize-device cuda`; CPU defaults to resize batch 1,
+CUDA to 32. Bound CPU use with `--workers N --decoder-threads T --cpu-budget C` (N*T <= C). GPU resize is not
+bit-exact CPU resize. v1 verification is exact; v2 reports maximum pixel error and PSNR, rejecting PSNR below 30 dB.
+
+A frame cache automatically enables mmap low-dimensional/worker-selection sidecars beside the cache. Spawned
+workers reopen these files; goals use the last **recorded** frame on demand, even after settle cropping. No source
+data or v1 image cache is rewritten. Preserve the sidecar companion directory when it is useful to avoid rebuilding
+low-dimensional tables; it can also be regenerated. Existing cache sources remain necessary for validation and Pi.
+
+The full multitask5 q95/4:4:4 artifact is 179.52 GB including indices/catalogs; 20x projects to 3.59 TB. On the local
+4090 the build took about 50 minutes including its probe, so 20x on that host projects to 16.65 hours, not four.
+The checkpoint inference-only pixel comparison changed L1 0.014319 -> 0.014373 (128 paired anchors; difference CI
+includes zero). It is not a training A/B. Native serving remains the default; `--jpeg-quality 95 --jpeg-subsampling 0`
+opts into the same post-resize JPEG round trip. Keep v2 opt-in until the deployment's pixel-parity choice and loader
+measurements are accepted. The coordination repository's `docs/frame_cache_v2.md` records commands, full measurements,
+checksummed private stash/restore, scale limits and small startup validation; no heavy training was launched.
+
+Precompute exact statistics from a **lowdim-only copy**, without videos, using a new output file outside the dataset:
+
+```bash
+export B1K_DATASET_REVISION=6d812ca2ce553870c9ceb0e09611af6a2c7d5e08
+python -m b1k_stats --dataset-root "$DATASET" --output /tmp/act-exact.json --task-names camera_relocalization object_scaling mental_rotation cm iors_small --horizon 100 --gripper-action absolute --estimator exact
+```
+
+The defaults select seed 0, validation fraction 0.1, settle 0, relative joints, absolute grippers and no task one-hot.
+Pass the generated file to training with `--stats-file`; recipe/selection mismatches are rejected. The JPEG reader
+uses torchvision's CPU decoder by default; `B1K_JPEG_DECODER=pillow` selects the byte-identical measured alternative.
+The measured full-cache NFS restore including verification took 5.49 minutes. Four loaders on svl5's 36 physical cores
+reached 8.58k cold / 9.43k warm samples/s, below the 10k cold target; the coordination report records this limitation.

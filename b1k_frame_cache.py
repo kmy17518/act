@@ -24,6 +24,8 @@ file's size and mtime, so a stale or partially built entry is rebuilt rather tha
 """
 
 import argparse
+from collections import OrderedDict
+from b1k_data_core import revision, source_matches
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 import logging
@@ -78,11 +80,13 @@ def entry_paths(stem):
             stem.with_name(stem.name + '.json'))
 
 
-def _manifest_matches(manifest, source, image_size):
-    stat = Path(source).stat()
+def _manifest_matches(manifest, source, image_size, dataset_revision=None):
+    source = Path(source)
+    root = source
+    for _ in Path(manifest.get('source', 'file')).parts:
+        root = root.parent
     return (manifest.get('format') == FORMAT and manifest.get('image_size') == list(image_size)
-            and manifest.get('source_size') == stat.st_size
-            and manifest.get('source_mtime_ns') == stat.st_mtime_ns)
+            and source_matches(manifest, source, root, dataset_revision))
 
 
 def entry_is_valid(stem, source, image_size):
@@ -170,6 +174,7 @@ def build_entry(source, stem, image_size, dataset_root, torch_threads=1):
         'format': FORMAT, 'image_size': list(image_size), 'frames': int(count),
         'source': str(source.resolve().relative_to(Path(dataset_root).resolve())),
         'source_size': stat.st_size, 'source_mtime_ns': stat.st_mtime_ns,
+        'dataset_revision': revision(dataset_root),
         'pixels': 'preprocess_image (bilinear, antialias, align_corners=False) then round(x * 255)',
         'decoder': f'PyAV {av.__version__}, libavcodec {av.library_versions.get("libavcodec")}',
         'build_seconds': round(time.monotonic() - started, 3),
@@ -190,15 +195,21 @@ class FrameCacheReader:
         self.dataset_root = Path(dataset_root).resolve()
         self.image_size = tuple(image_size)
         self.tolerance = tolerance
-        self.entries = {}
+        self.entries = OrderedDict()
+        self.dataset_revision = revision(dataset_root)
+        self._v2 = None
 
     def __getstate__(self):
-        return dict(self.__dict__, entries={})
+        return dict(self.__dict__, entries=OrderedDict(), _v2=None)
 
     def close(self):
         self.entries.clear()
+        if self._v2 is not None:
+            self._v2.close()
 
     def open(self, path):
+        if self._v2 is not None:
+            return None, self._v2.open(path)[1]
         path = str(path)
         entry = self.entries.get(path)
         if entry is None:
@@ -206,14 +217,23 @@ class FrameCacheReader:
             if not manifest_path.is_file():
                 raise FileNotFoundError(f'No frame cache entry for {path}; build it with scripts/b1k/build_frame_cache.py')
             manifest = json.loads(manifest_path.read_text())
-            if not _manifest_matches(manifest, path, self.image_size):
+            if manifest.get('format') == 'act_b1k_frame_cache_v2':
+                from b1k_cache_v2 import ShardedReader
+                if self._v2 is None:
+                    self._v2 = ShardedReader(self.cache_root, self.dataset_root, self.image_size, self.tolerance)
+                _, pts, _ = self._v2.open(path)
+                return None, pts
+            if not _manifest_matches(manifest, path, self.image_size, self.dataset_revision):
                 raise ValueError(f'Stale or mismatched frame cache entry {manifest_path}; rebuild it')
             frames = np.load(frames_path, mmap_mode='r')
-            pts = np.load(pts_path)
+            pts = np.load(pts_path, mmap_mode='r')
             if (frames.shape != (manifest['frames'], *self.image_size, 3) or frames.dtype != np.uint8
                     or pts.shape != (manifest['frames'],) or np.any(np.diff(pts) <= 0)):
                 raise ValueError(f'Corrupt frame cache entry for {path}; rebuild it')
             entry = self.entries[path] = (frames, pts)
+            while len(self.entries) > 16:
+                self.entries.popitem(last=False)
+        self.entries.move_to_end(path)
         return entry
 
     def validate(self, video_paths):
@@ -241,6 +261,8 @@ class FrameCacheReader:
     def read(self, path, position, out=None):
         """One cached frame as a uint8 HWC array (copied out of the memory map, into `out` if given)."""
         frames, _ = self.open(path)
+        if self._v2 is not None and frames is None:
+            return self._v2.read(path, position, out)
         if out is None:
             return np.array(frames[position])
         np.copyto(out, frames[position])
@@ -302,6 +324,7 @@ def verify_frame_cache(dataset, cache_root, samples=256, seed=0, log=LOGGER.info
     reader = FrameCacheReader(cache_root, dataset.root, dataset.image_size, dataset.timestamp_tolerance)
     rng = np.random.default_rng(seed)
     compared = 0
+    errors, psnrs = [], []
     started = time.monotonic()
     try:
         for index in rng.integers(len(dataset), size=samples):
@@ -312,13 +335,20 @@ def verify_frame_cache(dataset, cache_root, samples=256, seed=0, log=LOGGER.info
             for image, (path, target) in zip(images, dataset.camera_timestamps(ep, frame)):
                 expected = quantize_image(preprocess_image(image, dataset.image_size))
                 actual = reader.read(path, int(reader.positions(path, [target])[0]))
-                if expected.shape != actual.shape or not np.array_equal(expected, actual):
+                if reader._v2 is not None:
+                    diff = expected.astype(np.float64) - actual
+                    errors.append(float(np.abs(diff).max()))
+                    mse = float(np.square(diff).mean())
+                    psnrs.append(float('inf') if mse == 0 else 10*np.log10(255**2/mse))
+                    if psnrs[-1] < 30:
+                        raise ValueError(f'JPEG cache PSNR {psnrs[-1]:.2f} dB is below 30 dB')
+                elif expected.shape != actual.shape or not np.array_equal(expected, actual):
                     raise ValueError(f'Frame cache mismatch: episode {ep["episode_index"]} frame {frame} {path}')
                 compared += 1
     finally:
         reader.close()
     log(f'verified {compared} cached frames from {samples} samples against native decoding in '
-        f'{time.monotonic() - started:.1f}s: identical')
+        f'{time.monotonic() - started:.1f}s: ' + (f'JPEG max abs {max(errors):.0f}, min/mean PSNR {min(psnrs):.2f}/{np.mean(psnrs):.2f} dB' if errors else 'identical'))
     return compared
 
 
@@ -326,6 +356,14 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--dataset-path', '--dataset-root', dest='dataset_path', required=True)
     p.add_argument('--cache-dir', required=True)
+    p.add_argument('--format', choices=('v1', 'v2'), default='v1')
+    p.add_argument('--dataset-revision', help='Immutable dataset revision for portable entries')
+    p.add_argument('--jpeg-quality', type=int, default=95)
+    p.add_argument('--jpeg-subsampling', type=int, choices=(0,1,2), default=0)
+    p.add_argument('--shard-bytes', type=int, default=2_000_000_000)
+    p.add_argument('--resize-device', default='cpu')
+    p.add_argument('--resize-batch-size', type=int, help='Default: CPU 1; GPU 32')
+    p.add_argument('--decoder-threads', type=int, default=1)
     p.add_argument('--task-names', nargs='+', help='Tasks or task groups of <dataset>/isg_meta/task_groups.json. '
                    'Default: every complete local task')
     p.add_argument('--image-size', type=int, nargs=2, default=[240, 240], metavar=('HEIGHT', 'WIDTH'))
@@ -339,10 +377,31 @@ def parser():
 def main(argv=None):
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     args = parser().parse_args(argv)
+    if args.dataset_revision:
+        os.environ['B1K_DATASET_REVISION'] = args.dataset_revision
     dataset = B1KDataset(args.dataset_path, expand_task_groups(args.dataset_path, args.task_names),
                          image_size=args.image_size)
     try:
-        build_frame_cache(dataset, args.cache_dir, workers=args.workers, cpu_budget=args.cpu_budget)
+        if args.format == 'v2':
+            from b1k_cache_v2 import build_group
+            from functools import partial
+            groups = {}
+            for path in selected_videos(dataset):
+                groups.setdefault(path.parent, []).append(path)
+            workers = min(args.workers, args.cpu_budget, len(groups))
+            if workers * args.decoder_threads > args.cpu_budget:
+                raise ValueError('workers * decoder-threads exceeds --cpu-budget')
+            build = partial(build_group, cache_root=args.cache_dir, dataset_root=dataset.root,
+                            image_size=dataset.image_size, dataset_revision=args.dataset_revision,
+                            quality=args.jpeg_quality, subsampling=args.jpeg_subsampling,
+                            shard_bytes=args.shard_bytes, device=args.resize_device, batch_size=args.resize_batch_size,
+                            decoder_threads=args.decoder_threads)
+            with ProcessPoolExecutor(max(1, workers), mp_context=multiprocessing.get_context('spawn')) as pool:
+                for manifests in pool.map(build, groups.values()):
+                    for m in manifests:
+                        LOGGER.info('%s: %d frames, %.1fs, %d JPEG bytes', m['source'], m['frames'], m['build_seconds'], m['jpeg_bytes'])
+        else:
+            build_frame_cache(dataset, args.cache_dir, workers=args.workers, cpu_budget=args.cpu_budget)
         if args.verify:
             verify_frame_cache(dataset, args.cache_dir, samples=args.verify, seed=args.seed)
     finally:

@@ -146,7 +146,7 @@ def test_training_records_the_widened_head_and_validation_stop_metrics_and_resum
     with pytest.raises(ValueError, match='need --stop-dims'):
         train_fn(tiny_common(tiny_root) + ['--settle-steps', '0', '--task-names', 'first', '--stop-pos-weight', '5',
                                            '--max-steps', '1', '--output-dir', str(tmp_path / 'bad')])
-    path = stop_run(tiny_root, tmp_path, 'a', ['--stop-pos-weight', '5', '--stop-oversample', '0.3', '--val-fraction',
+    path = stop_run(tiny_root, tmp_path, 'a', ['--frame-selection', 'legacy', '--stop-pos-weight', '5', '--stop-oversample', '0.3', '--val-fraction',
                                                 '0.4', '--val-every', '1', '--val-batches', '1'])
     checkpoint = load_checkpoint(path)
     config = checkpoint['model_config']

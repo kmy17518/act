@@ -119,7 +119,10 @@ def unpackb(value):
 
 
 class PolicyPredictor:
-    def __init__(self, checkpoint, device='cuda'):
+    def __init__(self, checkpoint, device='cuda', jpeg_quality=None, jpeg_subsampling=0):
+        self.jpeg_quality, self.jpeg_subsampling = jpeg_quality, jpeg_subsampling
+        if jpeg_quality is not None and (not 1 <= jpeg_quality <= 100 or jpeg_subsampling not in (0,1,2)):
+            raise ValueError('invalid JPEG quality/subsampling')
         self.checkpoint = checkpoint
         self.device = torch.device(device)
         embeddings = language_embedding_table(checkpoint['model_config'], checkpoint['task_map'],
@@ -137,6 +140,11 @@ class PolicyPredictor:
         prompt, `goal` is (B, views, 3, H, W). Relative-action checkpoints need `states`, the observations' raw
         (B, 61) R1Pro states the prediction is made from: their chunks are relative to them. `signals` are the
         stop / progress columns (B, T, 2) in [0, 1] of a --stop-dims checkpoint, else None."""
+        if self.jpeg_quality is not None:
+            from b1k_cache_v2 import jpeg_roundtrip_chw
+            images = jpeg_roundtrip_chw(images, self.jpeg_quality, self.jpeg_subsampling)
+            if goal is not None:
+                goal = jpeg_roundtrip_chw(goal, self.jpeg_quality, self.jpeg_subsampling)
         qpos, images = qpos.to(self.device), images.to(self.device)
         kwargs = {}
         if self.language_embeddings is not None:
@@ -498,6 +506,8 @@ def main():
     p.add_argument('--host', default='0.0.0.0')
     p.add_argument('--port', type=int, default=8000)
     p.add_argument('--device', default='cuda')
+    p.add_argument('--jpeg-quality', type=int, help='Opt-in v2 serving parity after resize; match cache quality')
+    p.add_argument('--jpeg-subsampling', type=int, choices=(0,1,2), default=0)
     p.add_argument('--action-horizon', type=int,
                    help='Cached ACT actions (default min(16, chunk size)); CNNMLP/aggregation require 1')
     p.add_argument('--temporal-agg', action='store_true', help='ACT only: query each step and aggregate overlapping chunks')
@@ -532,7 +542,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     checkpoint = load_checkpoint(args.model_path)
     gate = StopGate(args.stop_threshold, args.progress_threshold, args.stop_hold_steps, not args.no_stop_gating)
-    server = B1KServer(checkpoint, PolicyPredictor(checkpoint, args.device), args.host, args.port,
+    server = B1KServer(checkpoint, PolicyPredictor(checkpoint, args.device, args.jpeg_quality, args.jpeg_subsampling), args.host, args.port,
                        args.action_horizon, args.task_name, args.temporal_agg, load_goal_images(args.goal_image),
                        args.gripper_snap_threshold, gate, args.stop_positions, args.signal_log)
     if server.metadata['stop_signals']:

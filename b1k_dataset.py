@@ -311,7 +311,7 @@ def normalize(values, stats, kind):
     if stats.get('method', 'zscore') == 'quantile':
         q01, q99 = (np.asarray(stats[f'{kind}_{q}'], dtype=np.float64) for q in ('q01', 'q99'))
         return (np.asarray(values, dtype=np.float64) - q01) / (q99 - q01 + QUANTILE_EPS) * 2 - 1
-    return (values - np.asarray(stats[f'{kind}_mean'])) / np.asarray(stats[f'{kind}_std'])
+    return (values - np.asarray(stats[f'{kind}_mean'])) / (np.asarray(stats[f'{kind}_std']) + stats.get('std_eps', 0.0))
 
 
 def unnormalize(values, stats, kind):
@@ -320,7 +320,7 @@ def unnormalize(values, stats, kind):
         q01, q99 = (np.asarray(stats[f'{kind}_{q}'], dtype=np.float64) for q in ('q01', 'q99'))
         return (np.asarray(values, dtype=np.float64) + 1) / 2 * (q99 - q01 + QUANTILE_EPS) + q01
     values = np.asarray(values)
-    return (values * np.asarray(stats[f'{kind}_std'], dtype=values.dtype)
+    return (values * (np.asarray(stats[f'{kind}_std'], dtype=values.dtype) + stats.get('std_eps', 0.0))
             + np.asarray(stats[f'{kind}_mean'], dtype=values.dtype))
 
 
@@ -444,7 +444,10 @@ class B1KDataset(torch.utils.data.Dataset):
                  cache_row_groups=2, video_cache_size=3, timestamp_tolerance=0.008, profile_reads=False,
                  frame_cache=None, goal_views=(), goal_source='episode_last', task_onehot=True, episodes=None,
                  settle_steps='all', gripper_state='sum', goal_mismatch_views=(), goal_mismatch_seed=0,
-                 stop_dims=False):
+                 stop_dims=False, lowdim_only=False):
+        if lowdim_only and (frame_cache is not None or goal_views):
+            raise ValueError('lowdim_only statistics cannot request a frame cache or goal images')
+        self.lowdim_only = bool(lowdim_only)
         if gripper_state not in GRIPPER_STATES:
             raise ValueError(f'Unknown gripper_state {gripper_state!r}; expected one of {GRIPPER_STATES}')
         self.gripper_state = gripper_state
@@ -530,7 +533,7 @@ class B1KDataset(torch.utils.data.Dataset):
                 owners.update(zip(table['episode_index'].to_pylist(), table['task_index'].to_pylist()))
             table = table.filter(pc.is_in(table['task_index'], value_set=pa.array(sorted(selected))))
             for ep in table.to_pylist():
-                paths = [self.data_path(ep)] + [self.video_path(ep, key) for key in self.required_video_keys]
+                paths = [self.data_path(ep)] + ([] if lowdim_only else [self.video_path(ep, key) for key in self.required_video_keys])
                 missing = []
                 for file in paths:
                     if file not in existence:
@@ -618,7 +621,10 @@ class B1KDataset(torch.utils.data.Dataset):
         if self.goal_source == 'episode_last':
             key = VIDEO_KEYS[camera_index]
             frame = self.recorded_lengths[int(ep['episode_index'])] - 1
-            if self._table is not None and frame < ep['length']:
+            if self.frame_cache is not None:
+                self._ensure_table()
+                timestamp = float(self._goal_timestamps[self.positions[int(ep['episode_index'])]])
+            elif self._table is not None and frame < ep['length']:
                 timestamp = float(self._table['timestamp'][int(self.starts[self.positions[int(ep['episode_index'])]]) + frame])
             else:
                 timestamp = float(self._read_rows(ep, frame, 1, recorded=True)['timestamp'][0].as_py())
@@ -629,6 +635,9 @@ class B1KDataset(torch.utils.data.Dataset):
         target = offset + timestamp
         if target < offset - self.timestamp_tolerance or target >= ep[f'videos/{key}/to_timestamp'] + self.timestamp_tolerance:
             raise ValueError(f'Goal timestamp {target} outside episode {ep["episode_index"]} stream {key}')
+        if self.frame_cache is not None and self.goal_source == 'episode_last':
+            path = self.video_path(ep, key)
+            return self.frame_cache.read(path, int(self.frame_cache.positions(path, [target])[0]))
         image = self._decode(self.video_path(ep, key), target)
         return quantize_image(preprocess_image(image, self.image_size))
 
@@ -638,6 +647,9 @@ class B1KDataset(torch.utils.data.Dataset):
         One stored goal per episode with a batch-time lookup: workers receive the table through pickling and
         never decode goal frames themselves. 400 episodes x 240x240 x 3 views is ~200 MB.
         """
+        if self.frame_cache is not None and self.goal_source == 'episode_last':
+            self.goal_table = CachedGoals(self)
+            return
         started = time.perf_counter()
         table = np.empty((len(self.episodes), len(self.goal_views), *self.image_size, 3), dtype=np.uint8)
         for position, ep in enumerate(self.episodes):
@@ -685,6 +697,13 @@ class B1KDataset(torch.utils.data.Dataset):
                          chunk_index=ep[f'videos/{key}/chunk_index'], file_index=ep[f'videos/{key}/file_index'])
 
     def fingerprint(self):
+        if getattr(self, '_worker_fingerprint', None) is not None:
+            return self._worker_fingerprint
+        from b1k_data_core import fingerprint
+        return fingerprint(self.root, self.episodes, [self.data_path(ep) for ep in self.episodes],
+                           gripper_state=self.gripper_state, state_indices=STATE_INDICES)
+
+    def legacy_fingerprint(self):
         files = sorted({self.data_path(ep) for ep in self.episodes})
         payload = {'root': str(self.root), 'episodes': self.episodes,
                    'files': [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in files],
@@ -805,6 +824,29 @@ class B1KDataset(torch.utils.data.Dataset):
         return images, state, actions, is_pad, int(ep['task_index'])
 
     def _ensure_table(self):
+        if self._table is not None:
+            return self._table
+        if self.frame_cache is None:
+            return self._build_table()
+        import fcntl
+        from b1k_cache_v2 import atomic_array, atomic_json
+        directory = Path(str(self.frame_cache.cache_root) + '-tables') / self.fingerprint()
+        directory.mkdir(parents=True, exist_ok=True)
+        with (directory / 'lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            manifest = directory / 'complete.json'
+            if not manifest.is_file():
+                self._build_table(directory)
+                for values in (*self._table.values(), self._frame_rows, self._goal_timestamps):
+                    values.flush()
+                atomic_json(manifest, {'fingerprint': self.fingerprint(), 'frames': len(self)})
+            self._table = {name: np.load(directory / (name+'.npy'), mmap_mode='r')
+                           for name in ('timestamp','state','action')}
+            self._frame_rows = np.load(directory / 'frame_rows.npy', mmap_mode='r')
+            self._goal_timestamps = np.load(directory / 'goal_timestamps.npy', mmap_mode='r')
+        return self._table
+
+    def _build_table(self, directory=None):
         """Load timestamp/state/action for every selected frame once per process (~350 bytes per frame).
 
         Applies the same episode/frame/task/absolute-index consistency checks as `_read_rows`, to every row.
@@ -812,10 +854,14 @@ class B1KDataset(torch.utils.data.Dataset):
         if self._table is not None:
             return self._table
         count = len(self)
-        timestamp = np.full(count, np.nan, dtype=np.float64)
-        state = np.empty((count, 61), dtype=np.float32)
-        action = np.empty((count, 23), dtype=np.float32)
-        filled = np.zeros(count, dtype=bool)
+        def allocate(name, shape, dtype):
+            return (np.empty(shape, dtype=dtype) if directory is None else
+                    np.lib.format.open_memmap(directory / (name+'.npy'), mode='w+', dtype=dtype, shape=shape))
+        timestamp = allocate('timestamp', (count,), np.float64)
+        state = allocate('state', (count, 61), np.float32)
+        action = allocate('action', (count, 23), np.float32)
+        filled = np.zeros(len(self.episodes), dtype=bool)
+        self._goal_timestamps = allocate('goal_timestamps', (len(self.episodes),), np.float64)
         by_file = {}
         for position, ep in enumerate(self.episodes):
             by_file.setdefault(self.data_path(ep), []).append(position)
@@ -830,30 +876,33 @@ class B1KDataset(torch.utils.data.Dataset):
             timestamps = table['timestamp'].to_numpy()
             states = _matrix(table['observation.state'])
             actions = _matrix(table['action'])
+            if not np.isfinite(states).all() or not np.isfinite(actions).all() or not np.isfinite(timestamps).all():
+                raise ValueError('Non-finite dataset values')
+            order = np.lexsort((index_column, episode_column))
+            sorted_ids = episode_column[order]
             for position in positions:
                 ep = self.episodes[position]
                 recorded = self.recorded_lengths[int(ep['episode_index'])]
-                rows = np.flatnonzero(episode_column == ep['episode_index'])
-                rows = rows[np.argsort(index_column[rows], kind='stable')]
+                lo, hi = np.searchsorted(sorted_ids, ep['episode_index'], side='left'), np.searchsorted(sorted_ids, ep['episode_index'], side='right')
+                rows = order[lo:hi]
                 if (len(rows) != recorded or
                         not np.array_equal(index_column[rows], np.arange(ep['dataset_from_index'],
                                                                          ep['dataset_from_index'] + recorded)) or
                         not np.array_equal(frame_column[rows], np.arange(recorded)) or
                         not np.all(task_column[rows] == ep['task_index'])):
                     raise ValueError(f'Corrupt episode/frame bounds for episode {ep["episode_index"]} in {path}')
+                self._goal_timestamps[position] = timestamps[rows[-1]]
                 rows = rows[:ep['length']]
                 target = slice(int(self.starts[position]), int(self.ends[position]))
                 timestamp[target] = timestamps[rows]
                 state[target] = states[rows]
                 action[target] = actions[rows]
-                filled[target] = True
+                filled[position] = True
         if not filled.all():
             raise ValueError('Selected episodes missing from their Parquet files')
-        if not (np.isfinite(action).all() and np.isfinite(state).all()):
-            raise ValueError('Non-finite actions or states in dataset')
         self._table = {'timestamp': timestamp, 'state': state, 'action': action}
         if self.frame_cache is not None:
-            rows = np.empty((count, len(VIDEO_KEYS)), dtype=np.int64)
+            rows = allocate('frame_rows', (count, len(VIDEO_KEYS)), np.int64)
             for position, ep in enumerate(self.episodes):
                 target = slice(int(self.starts[position]), int(self.ends[position]))
                 for camera, key in enumerate(VIDEO_KEYS):
@@ -938,7 +987,17 @@ class B1KDataset(torch.utils.data.Dataset):
     def __getstate__(self):
         # Loader workers reopen files and reload the in-memory table themselves.
         state = self.__dict__.copy()
-        state.update(_groups=OrderedDict(), _footers=OrderedDict(), _videos=OrderedDict(), _table=None, _frame_rows=None)
+        state.update(_groups=OrderedDict(), _footers=OrderedDict(), _videos=OrderedDict(), _table=None, _frame_rows=None, _goal_timestamps=None)
+        if self.frame_cache is not None:
+            from b1k_selection import compact_worker_state
+            # This dataset selection is immutable during a loader's lifetime. Compute
+            # its spawn identity once, not once per worker (108k episodes at scale).
+            if not hasattr(self, '_spawn_fingerprint'):
+                self._spawn_fingerprint = self.fingerprint()
+            directory = Path(str(self.frame_cache.cache_root) + '-tables') / self._spawn_fingerprint
+            state['_worker_fingerprint'] = self._spawn_fingerprint
+            state = compact_worker_state(state, directory, ('starts','ends','lengths','program_lengths'),
+                                         ('positions','recorded_lengths'))
         return state
 
     def close(self):
@@ -1002,7 +1061,8 @@ class B1KDataset(torch.utils.data.Dataset):
                 'approximate': count != len(self), 'fingerprint': self.fingerprint()}
 
     def compute_normalization_stats(self, normalization='zscore', action_representation='absolute', max_frames=None,
-                                    min_range=QUANTILE_MIN_RANGE):
+                                    min_range=QUANTILE_MIN_RANGE, *, estimator='legacy',
+                                    gripper_action='delta', sample_size=10_000_000):
         """Statistics of `normalization` for `action_representation` over the selected episodes (a run's training
         episodes), from the low-dim Parquet rows (never the images); absolute z-score is `compute_stats`.
 
@@ -1014,6 +1074,9 @@ class B1KDataset(torch.utils.data.Dataset):
         """
         if normalization not in NORMALIZATIONS or action_representation not in ACTION_REPRESENTATIONS:
             raise ValueError(f'Unknown normalization {normalization!r} or action representation {action_representation!r}')
+        if estimator != 'legacy':
+            return self._compute_stats_v2(normalization, action_representation, max_frames,
+                                          estimator, gripper_action, sample_size)
         if (normalization, action_representation) == ('zscore', 'absolute'):
             return self.compute_stats(max_frames)
         relative = action_representation == 'relative'
@@ -1067,6 +1130,72 @@ class B1KDataset(torch.utils.data.Dataset):
         LOGGER.info('%s statistics of %s actions: %d frames, %d valid chunk steps in %.1fs', normalization,
                     action_representation, count, stats['action_count'], time.perf_counter() - started)
         return stats
+
+
+    def _compute_stats_v2(self, method, representation, max_frames, estimator, gripper_action, sample_size):
+        from b1k_data_core import StreamingStats
+        if gripper_action not in ('absolute', 'delta'):
+            raise ValueError('gripper_action must be absolute or delta')
+        if representation == 'relative' and self.gripper_state != 'sum':
+            raise ValueError('relative actions require gripper_state=sum')
+        table = self._ensure_table()
+        count = min(len(self), max_frames) if max_frames else len(self)
+        delta = json.loads(json.dumps(ACTION_DELTA))
+        if gripper_action == 'absolute':
+            delta['gripper_action_dims'] = []
+            delta['gripper_state_dims'] = []
+        horizon = self.chunk_size
+        selected_lengths = np.minimum(self.lengths, np.maximum(0, count-self.starts))
+        total_steps = int(sum(np.minimum(selected_lengths, np.maximum(0, self.lengths-k)).sum()
+                              for k in range(horizon)))
+        with StreamingStats(proprio_dim(self.gripper_state), count, estimator=estimator,
+                            sample_size=sample_size, quantiles=method=='quantile') as qs, \
+             StreamingStats(23, total_steps, estimator=estimator, sample_size=sample_size,
+                            quantiles=method=='quantile') as ac:
+            for position, ep in enumerate(self.episodes):
+                start, end = int(self.starts[position]), int(self.ends[position])
+                selected = min(end, count) - start
+                if selected <= 0:
+                    break
+                for lo in range(0, selected, 2048):
+                    hi = min(selected, lo+2048)
+                    state = extract_state(table['state'][start+lo:start+hi], self.gripper_state)
+                    qs.update(state)
+                    query = np.arange(lo,hi)[:,None] + np.arange(horizon)[None,:]
+                    valid = query < end-start
+                    actions = table['action'][start + np.minimum(query, end-start-1)].astype(np.float64)
+                    if representation == 'relative':
+                        actions -= action_reference(state, delta)[:,None,:]
+                    ac.update(actions[valid])
+            q, a = qs.finish(), ac.finish()
+            stats = {'method': method, 'action_representation': representation, 'gripper_action': gripper_action,
+                     'count': count, 'action_count': total_steps, 'chunk_size': horizon,
+                     'approximate': count != len(self), 'quantiles_approximate': ac.estimator != 'exact',
+                     'estimator': estimator, 'sample_size': sample_size, 'stats_version': 2,
+                     'std_eps': 1e-6, 'std_correction': 0, 'std_floor': 0.0, 'quantile_eps': 1e-6,
+                     'min_range': 0.0, 'fingerprint': self.fingerprint(),
+                     'estimator_metadata': {'qpos': qs.metadata(), 'action': ac.metadata()}}
+            for name, values in (('qpos',q),('action',a)):
+                for key, value in values.items():
+                    stats[f'{name}_{key}'] = value.tolist()
+            if representation == 'relative':
+                stats['action_delta'] = delta
+            return stats
+
+
+class CachedGoals:
+    """Array-like on-demand last-recorded goals; no decoded table to pickle."""
+    def __init__(self, dataset):
+        self.dataset = dataset
+        self.shape = (len(dataset.episodes), len(dataset.goal_views), *dataset.image_size, 3)
+
+    def __getitem__(self, key):
+        position, rest = (key[0], key[1:]) if isinstance(key, tuple) else (key, ())
+        d = self.dataset
+        def read(i):
+            return np.stack([d._goal_frame(d.episodes[int(i)], camera) for camera in d.goal_camera_indices])
+        value = read(position) if np.isscalar(position) else np.stack([read(i) for i in np.arange(len(d.episodes))[position]])
+        return value[(slice(None),)+rest] if rest and not np.isscalar(position) else (value[rest] if rest else value)
 
 
 class SplitBatchSampler:

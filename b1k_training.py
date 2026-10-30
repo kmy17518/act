@@ -45,7 +45,7 @@ WRIST_CAMERAS = ['realsense' in camera for camera in CAMERAS]
 CHECKPOINT_VERSION = 1
 # Rank 0 alone validates and saves (and under --compile first compiles the validation shapes) while the other ranks
 # wait in their next collective; NCCL's default watchdog (10 min) would abort them on a slow first validation.
-DISTRIBUTED_TIMEOUT = timedelta(minutes=30)
+DISTRIBUTED_TIMEOUT = timedelta(hours=4)
 # Conditioning regimes (b1k.md "Goal-image conditioning"): which task-specifying modalities the policy receives.
 #   none           N  observation/proprioception only (no task id, no language, no goal)
 #   language       L  task-dependent language (mt_act or clip_film), no goal
@@ -381,6 +381,8 @@ def verify_resynced_dataset(dataset, stats, fingerprint):
     and requiring equality with the checkpoint (plus the same frame count) proves the selected rows
     are unchanged. Approximate (smoke) statistics cannot be verified this way and still fail.
     """
+    if stats.get('stats_version') == 2:
+        raise ValueError('portable statistics revision/selection mismatch; recompute for this dataset')
     if stats.get('approximate'):
         raise ValueError('Resume dataset metadata/files differ from checkpoint; use the same local subset')
     recomputed = dataset.compute_normalization_stats(stats.get('method', 'zscore'),
@@ -476,7 +478,7 @@ def consume_batch(batch, stream=None, channels_last=True):
             timings)
 
 
-def resolve_val_split(dataset_path, task_names, episode_split, val_fraction, seed):
+def resolve_val_split(dataset_path, task_names, episode_split, val_fraction, seed, *, lowdim_only=False):
     """Per-task train/val episode split (isg-val-split/v1) when `val_fraction > 0`, or None when disabled.
 
     Each task's candidate episodes (from `episode_split` when given, else every complete local episode of the task)
@@ -487,7 +489,7 @@ def resolve_val_split(dataset_path, task_names, episode_split, val_fraction, see
         return None
     if not 0.0 < val_fraction < 1.0:
         raise ValueError(f'--val-fraction must be in [0, 1); got {val_fraction}')
-    catalog = B1KDataset(dataset_path, task_names, episodes=episode_split['episodes'] if episode_split else None)
+    catalog = B1KDataset(dataset_path, task_names, episodes=episode_split['episodes'] if episode_split else None, lowdim_only=lowdim_only)
     try:
         by_task = {}
         for task_id, task_name in sorted(catalog.task_map.items()):
@@ -974,6 +976,11 @@ def parser():
                         'recorded frame), a number of frames (0 keeps the program only) or a decimal fraction of the '
                         'program length (0.2), capped at the recorded window. Goal images stay the last recorded frame. '
                         'Resume reuses the checkpoint\'s value; an explicit SPEC must equal it')
+    p.add_argument('--frame-selection', choices=('pi', 'legacy'), default='pi', action=ExplicitOption)
+    p.add_argument('--gripper-action', choices=('absolute', 'delta'), default='absolute', action=ExplicitOption)
+    p.add_argument('--stats-estimator', choices=('auto', 'exact', 'sampled', 'legacy'), default='exact', action=ExplicitOption)
+    p.add_argument('--stats-sample-size', type=int, default=10_000_000)
+    p.add_argument('--stats-file', type=Path, help='Precomputed portable normalization JSON')
     p.add_argument('--action-representation', choices=ACTION_REPRESENTATIONS, default='absolute', action=ExplicitOption,
                    help='absolute (default): the dataset\'s commands; relative: as openpi pi05_b1k with gripper deltas, '
                         'every chunk step minus the state at the sample\'s frame on the torso 3:7 and arm 7:14 / 15:22 '
@@ -1297,7 +1304,8 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                              ('goal_pos', 'sine'), ('goal_content', 'goal'), ('goal_entry', 'encoder'),
                              ('goal_stem_gain', None), ('goal_stem_diff', False), ('goal_fusion_depth', 0),
                              ('goal_detach_views', []), ('action_representation', 'absolute'),
-                             ('normalization', 'zscore'), ('image_augment', 'none'), ('stop_dims', False)]:
+                             ('normalization', 'zscore'), ('image_augment', 'none'), ('stop_dims', False),
+                             ('frame_selection', 'legacy'), ('gripper_action', 'delta'), ('stats_estimator', 'legacy')]:
             saved_value = model_config.get(key, default)
             if getattr(args, f'_{key}_explicit', False) and getattr(args, key) != saved_value:
                 raise ValueError(f'--{key.replace("_", "-")} differs from checkpoint')
@@ -1397,7 +1405,8 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                         'dilation': False, 'masks': False, 'action_dim': 23 + (2 if args.stop_dims else 0),
                         # older checkpoints: absolute / zscore; the statistics record the delta mapping
                         'action_representation': args.action_representation, 'normalization': args.normalization,
-                        'image_augment': args.image_augment}
+                        'image_augment': args.image_augment, 'frame_selection': args.frame_selection,
+                        'gripper_action': args.gripper_action, 'stats_estimator': args.stats_estimator}
         if args.stop_dims:
             if args.policy_class != 'ACT':
                 raise ValueError('--stop-dims extends the ACT action chunk; CNNMLP predicts one action')
@@ -1485,7 +1494,7 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
         output.mkdir(parents=True, exist_ok=True)
     if checkpoint:
         stats = dict(checkpoint['normalization'])
-        if stats['fingerprint'] != fingerprint:
+        if stats['fingerprint'] not in (fingerprint, dataset.legacy_fingerprint()):
             if is_main:
                 verify_resynced_dataset(dataset, stats, fingerprint)
             if distributed:
@@ -1495,13 +1504,24 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
         representation = model_config.get('action_representation', 'absolute')
         method = model_config.get('normalization', 'zscore')
         mode = '' if (representation, method) == ('absolute', 'zscore') else f'_{representation}_{method}'
-        stats_path = output / f'stats_{fingerprint[:16]}_{args.stats_max_frames or "all"}{mode}.json'
+        mode += f'_{args.gripper_action}_{args.stats_estimator}_{args.stats_sample_size}_h{dataset.chunk_size}'
+        stats_path = args.stats_file or output / f'stats_{fingerprint[:16]}_{args.stats_max_frames or "all"}{mode}.json'
+        if args.stats_file and not stats_path.is_file():
+            raise FileNotFoundError(stats_path)
         if is_main and not stats_path.exists():
-            stats = dataset.compute_normalization_stats(method, representation, args.stats_max_frames)
+            stats = dataset.compute_normalization_stats(method, representation, args.stats_max_frames,
+                                                         estimator=args.stats_estimator, gripper_action=args.gripper_action,
+                                                         sample_size=args.stats_sample_size)
             atomic_json(stats, stats_path)
         if distributed:
             dist.barrier()
         stats = json.loads(stats_path.read_text())
+        if stats['fingerprint'] != fingerprint:
+            raise ValueError('precomputed statistics do not match the dataset revision/selection')
+        if stats.get('stats_version') == 2 and (stats['gripper_action'] != args.gripper_action
+                or stats['chunk_size'] != dataset.chunk_size or stats['method'] != method
+                or stats['action_representation'] != representation):
+            raise ValueError('precomputed statistics representation/horizon does not match this run')
     if args.stats_max_frames is None and (stats['approximate'] or stats['count'] != len(dataset)):
         raise ValueError('Full-task statistics required; approximate checkpoint statistics need explicit '
                          '--stats-max-frames for smoke runs only')
@@ -1557,6 +1577,7 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
         train_config['per_rank_batch_size'] = args.batch_size // world_size
     train_config['resume'] = str(args.resume) if args.resume else None
     train_config['frame_cache'] = str(args.frame_cache) if args.frame_cache else None
+    train_config['stats_file'] = str(args.stats_file) if args.stats_file else None
     if args.stop_file is not None:
         train_config['stop_file'] = str(args.stop_file)
     else:
@@ -1580,6 +1601,12 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
     sampler = StepBatchSampler(dataset, args.batch_size, start, args.max_steps, args.seed,
                                tag=bool(dataset.goal_mismatch_slots), rank=rank, world_size=world_size,
                                end_window=model_config['num_queries'], end_fraction=args.stop_oversample)
+    if args.frame_selection == 'pi':
+        if args.stop_oversample:
+            raise ValueError('stop oversampling requires --frame-selection legacy')
+        from b1k_data_core import PiFrameBatchSampler
+        sampler = PiFrameBatchSampler(len(dataset), args.batch_size, start, args.max_steps, args.seed,
+                                      tag=bool(dataset.goal_mismatch_slots), rank=rank, world_size=world_size)
     if is_main and args.stop_oversample:
         LOGGER.info('Stop oversampling: %.0f%% of every batch from the last %d frames of their episodes',
                     100 * args.stop_oversample, model_config['num_queries'])
@@ -1640,8 +1667,9 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
         LOGGER.info('Image augmentation: %s', model_config.get('image_augment', 'none'))
         LOGGER.info('Actions %s, normalization %s%s', model_config.get('action_representation', 'absolute'),
                     model_config.get('normalization', 'zscore'),
-                    f' (q99 - q01 widened to {stats["min_range"]} on qpos dims {stats["guarded"]["qpos"]} and action '
-                    f'dims {stats["guarded"]["action"]})' if stats.get('method') == 'quantile' else '')
+                    (f' (legacy quantile floor {stats["min_range"]}, guarded {stats["guarded"]})'
+                     if 'guarded' in stats else ' (raw q99 - q01 + 1e-6)')
+                    if stats.get('method') == 'quantile' else '')
         if goal['goal_fusion'] != 'none':
             LOGGER.info('Goal mechanism: tag init %s, stem init %s (gain %s, diff %s, fusion depth %s), tokens %s, '
                         'positions %s, content %s, entry %s, goal LR %s (%d goal-group parameters)',

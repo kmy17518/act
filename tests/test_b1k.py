@@ -702,9 +702,15 @@ def test_frame_cache_matches_native_decoding_and_detects_stale_entries(tiny_root
     video = videos[0]
     import os
     os.utime(video, ns=(video.stat().st_atime_ns, video.stat().st_mtime_ns + 1))
-    assert not entry_is_valid(cache / video.relative_to(tiny_root).with_suffix(''), video, (16, 16))
-    with pytest.raises(ValueError, match='Stale or mismatched'):
-        FrameCacheReader(cache, tiny_root, (16, 16)).open(video)
+    assert entry_is_valid(cache / video.relative_to(tiny_root).with_suffix(''), video, (16, 16))
+    portable_reader = FrameCacheReader(cache, tiny_root, (16,16))
+    portable_reader.open(video)  # moving/copying the immutable revision does not invalidate it
+    portable_reader.close()
+    manifest_path = cache / video.relative_to(tiny_root).with_suffix('.json')
+    manifest = json.loads(manifest_path.read_text())
+    manifest['source_size'] += 1
+    manifest_path.write_text(json.dumps(manifest))
+    assert not entry_is_valid(manifest_path.with_suffix(''), video, (16,16))
     reader = FrameCacheReader(cache, tiny_root, (16, 16))
     other = videos[1]
     _, pts = reader.open(other)
@@ -760,29 +766,28 @@ def test_resume_accepts_resynced_files_but_not_changed_data(tiny_root, tmp_path)
     old_fingerprint = checkpoint['normalization']['fingerprint']
     data = tiny_root / 'data/chunk-042/file-000.parquet'
     os.utime(data, ns=(data.stat().st_atime_ns, data.stat().st_mtime_ns + 10 ** 9))  # re-synced copy: new mtime
-    assert B1KDataset(tiny_root, chunk_size=4).fingerprint() != old_fingerprint
+    assert B1KDataset(tiny_root, chunk_size=4).fingerprint() == old_fingerprint
     resumed_path = train(parser().parse_args(common + ['--output-dir', str(split), '--max-steps', '3',
                                                        '--resume', str(split / 'step_00000002.pt')]))
     resumed, expected = load_checkpoint(resumed_path), load_checkpoint(full / 'step_00000003.pt')
     for key in expected['model']:
         torch.testing.assert_close(expected['model'][key], resumed['model'][key], atol=0, rtol=0)
-    assert resumed['normalization']['fingerprint'] == B1KDataset(tiny_root, chunk_size=4).fingerprint() != old_fingerprint
+    assert resumed['normalization']['fingerprint'] == B1KDataset(tiny_root, chunk_size=4).fingerprint() == old_fingerprint
     for key in ('qpos_mean', 'qpos_std', 'action_mean', 'action_std', 'count'):
         assert resumed['normalization'][key] == checkpoint['normalization'][key]
     # Genuinely different data (one action value) is still refused.
     rows = pq.read_table(data).to_pylist()
     rows[3]['action'][5] += 1.0
     pq.write_table(pa.Table.from_pylist(rows), data)
-    with pytest.raises(ValueError, match='differ from checkpoint'):
+    with pytest.raises(ValueError, match='(differ from checkpoint|portable|revision|fingerprint)'):
         train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'changed'), '--max-steps', '4',
                                            '--resume', str(resumed_path)]))
-    # Approximate smoke statistics cannot be verified and are refused when the fingerprint changed.
+    # Approximate stats also survive a pure mtime change; source size/revision changes remain rejected.
     smoke = tmp_path / 'smoke'
     train(parser().parse_args(common + ['--output-dir', str(smoke), '--max-steps', '1', '--stats-max-frames', '2']))
     os.utime(data, ns=(data.stat().st_atime_ns, data.stat().st_mtime_ns + 10 ** 9))
-    with pytest.raises(ValueError, match='differ from checkpoint'):
-        train(parser().parse_args(common + ['--output-dir', str(smoke), '--max-steps', '2', '--stats-max-frames', '2',
-                                           '--resume', str(smoke / 'step_00000001.pt')]))
+    train(parser().parse_args(common + ['--output-dir', str(smoke), '--max-steps', '2', '--stats-max-frames', '2',
+                                       '--resume', str(smoke / 'step_00000001.pt')]))
 
 
 def add_episode(root, episode_id=50, begin=200):
@@ -954,10 +959,10 @@ def test_a_task_group_trains_on_its_split_episodes_with_their_own_statistics(tin
     assert run['train_config']['task_names'] == ['firsts'] and run['task_map'] == {'7': 'first'}
     assert run['episode_split']['tasks'] == ['first'] and run['episode_split']['episodes'] == [50]
     # Statistics cover the group's split episodes alone: episode 50, not episode 42 of the same task.
-    stats = B1KDataset(tiny_root, ['first'], episodes=[50]).compute_stats()
+    stats = B1KDataset(tiny_root, ['first'], episodes=[50]).compute_normalization_stats(estimator='exact', gripper_action='absolute')
     assert stats['count'] == 5 and stats != B1KDataset(tiny_root, ['first']).compute_stats()
     assert load_checkpoint(first)['normalization'] == stats
-    assert (run_dir / f'stats_{stats["fingerprint"][:16]}_all.json').is_file()
+    assert len(list(run_dir.glob(f'stats_{stats["fingerprint"][:16]}_all_absolute_exact_10000000_h100.json'))) == 1
     mixed = train(parser().parse_args(common + ['--output-dir', str(tmp_path / 'mixed'), '--max-steps', '1',
                                                 '--task-names', 'second', 'pair']))
     assert load_checkpoint(mixed)['episode_split']['episodes'] == [50, 99]
@@ -1158,7 +1163,7 @@ def test_summed_gripper_state_statistics_samples_and_legacy_fingerprint(tiny_roo
     legacy = {'root': str(fingers.root), 'episodes': fingers.episodes,
               'files': [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in files],
               'state_indices': STATE_INDICES, 'std_correction': 1}
-    assert fingers.fingerprint() == hashlib.sha256(json.dumps(legacy, sort_keys=True).encode()).hexdigest()
+    assert fingers.legacy_fingerprint() == hashlib.sha256(json.dumps(legacy, sort_keys=True).encode()).hexdigest()
     assert summed.fingerprint() != fingers.fingerprint()
     with pytest.raises(ValueError, match="Unknown gripper_state 'both'"):
         B1KDataset(tiny_root, gripper_state='both')
@@ -1871,7 +1876,7 @@ def test_val_split_logs_val_metrics_isolates_rng_and_resumes_exactly(tiny_root, 
         torch.testing.assert_close(ckpt_1['model'][key], ckpt_3['model'][key], atol=0, rtol=0)
         torch.testing.assert_close(ckpt_1['model'][key], ckpt_resumed['model'][key], atol=0, rtol=0)
     # Normalization statistics are computed exclusively over the 9 training episodes (45 frames, not 50).
-    train_only_stats = B1KDataset(tiny_root, ['first'], episodes=split['train_episodes']).compute_stats()
+    train_only_stats = B1KDataset(tiny_root, ['first'], chunk_size=4, episodes=split['train_episodes']).compute_normalization_stats(estimator='exact', gripper_action='absolute')
     assert ckpt_1['normalization'] == train_only_stats and train_only_stats['count'] == 45
     assert ckpt_1['val_split'] == ckpt_resumed['val_split'] == split
     run_meta = json.loads((every_1 / 'run.json').read_text())
