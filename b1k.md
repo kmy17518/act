@@ -513,3 +513,41 @@ Pass the generated file to training with `--stats-file`; recipe/selection mismat
 uses torchvision's CPU decoder by default; `B1K_JPEG_DECODER=pillow` selects the byte-identical measured alternative.
 The measured full-cache NFS restore including verification took 5.49 minutes. Four loaders on svl5's 36 physical cores
 reached 8.58k cold / 9.43k warm samples/s, below the 10k cold target; the coordination report records this limitation.
+
+### Exact statistics at larger scale
+
+All three repositories use the same estimator and lossless scratch implementation.
+Exact statistics remain the new recipes' default. Temporary column files now use
+Zstandard level 1 through PyArrow, preserving every original float64 bit. Moments
+retain the previous batch/reduction order, and quantiles retain NumPy's `linear`
+interpolation. Existing JSON statistics and checkpoint assets require no conversion.
+
+Storage/computation controls do not enter the selection fingerprint because they
+produce identical statistics:
+
+```bash
+export B1K_STATS_STORAGE=zstd             # default; float64 restores raw scratch
+export B1K_STATS_QUANTILE_WORKERS=2        # default 1; requires sufficient RAM
+export B1K_STATS_ASYNC_WRITE=1             # default 0; measured ACT optimization
+export TMPDIR=/path/to/node-local/scratch
+```
+
+For the measured 20× ACT H=100 workload, two quantile workers need roughly 76 GB
+just for the two float64 action columns; allocate at least 96 GiB for the process
+and its file cache. One worker reduces this memory requirement. DP and Pi benefit
+from two quantile workers but did not benefit from the asynchronous writer in the
+1× comparison, so leave `B1K_STATS_ASYNC_WRITE=0` for them. Scratch compression ratios
+are data-dependent; do not assume the measured ratio for unrelated datasets.
+Precompute once from low-dimensional data and reuse the small JSON assets on other
+machines with the same revision, selection, horizon and representation.
+
+The coordination repository's `docs/cache_scale_20261030.md` records actual 20×
+computations, cold-scratch conditions, byte comparisons and provider restore tests.
+The benchmark repeats real episodes with preserved boundaries; it is not a claim
+that an unseen dataset will have identical complexity or compression.
+
+Actual repeated-real-data 20× computations (four logical CPU slots, 96 GiB per job)
+completed in 50.1 min for ACT, 18.0 min for DP and 36.9 min for Pi with the controls
+above. Every normalization array matched the corresponding raw-scratch exact run
+bit for bit; scratch footprints were 77.6, 17.2 and 28.4 GB respectively. These
+are computation measurements, not timings for loading an unseen future dataset.
