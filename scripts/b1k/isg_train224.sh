@@ -17,12 +17,13 @@
 # Environment (defaults in brackets):
 #   DATASET        LeRobot v3 root (required)                 FRAME_CACHE  [$DATASET-act-frame-cache-224x224]
 #   RUN            [act-isg224-relq-late-piaug-ddp4-bs1024-s$SEED]   OUT_ROOT [/tmp/dev/runs/train224]
-#   PY             [python]   GPUS [0,1,2,3]   NUM_WORKERS per rank [8]   CACHE_WORKERS [16]
+#   PY             [<checkout>/.venv/bin/python]   GPUS [0,1,2,3]   NUM_WORKERS per rank [8]   CACHE_WORKERS [16]
 #   MAX_STEPS      [200000]   SAVE [10000] (save = export = validate)   SEED [0]   VAL_FRACTION [0.05]
 #   SETTLE_STEPS   [all]: the dataset's own settle window (batched replay: max(ceil(0.2 A), 50) frames)
 #   TASK_NAMES     space-separated tasks / task groups [every task of the dataset]
 #   WANDB_ENTITY   [kmy17518]   WANDB_PROJECT [b1k-isg-train224]   WANDB_MODE [online] (needs WANDB_API_KEY)
 #   HF_REPO        [kmy17518/$RUN]   HF_PUBLIC [0]   HF_XET [1]   (needs HF_TOKEN with write access)
+#   UPLOAD         [1]; 0 trains without the upload monitor (smoke tests)
 #   B1K_DATASET_REVISION  the dataset's immutable revision (recommended; recorded in the statistics)
 set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -33,7 +34,7 @@ RUN=${RUN:-act-isg224-relq-late-piaug-ddp4-bs1024-s$SEED}
 OUT_ROOT=${OUT_ROOT:-/tmp/dev/runs/train224}
 OUT=$OUT_ROOT/$RUN
 STATS=$OUT_ROOT/stats/$RUN.json
-PY=${PY:-python}
+PY=${PY:-$HERE/.venv/bin/python}  # the venv of setup_venv.sh (ACT) / the b1k.md uv lines (DP)
 GPUS=${GPUS:-0,1,2,3}
 NPROC=$(( $(tr -cd ',' <<< "$GPUS" | wc -c) + 1 ))
 MAX_STEPS=${MAX_STEPS:-200000}
@@ -86,8 +87,8 @@ train() {
     newest=$(find "$OUT" -maxdepth 1 -name 'step_*.pt' | sort | tail -n 1)
     [[ -z $newest ]] || resume=(--resume "$newest")
     rm -f "$OUT_ROOT/$RUN.stop"
-    upload >> "$OUT_ROOT/upload/$RUN.log" 2>&1 &
-    local uploader=$!
+    local uploader=''
+    if [[ ${UPLOAD:-1} == 1 ]]; then upload >> "$OUT_ROOT/upload/$RUN.log" 2>&1 & uploader=$!; fi
     echo "[$(date -u +%FT%TZ)] $RUN: training on GPUs $GPUS (${resume[*]:-fresh start}); uploader pid $uploader -> $HF_REPO"
     local rc=0
     (cd "$HERE" && CUDA_VISIBLE_DEVICES=$GPUS OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
@@ -96,7 +97,7 @@ train() {
         scripts/b1k/train_b1k.py "${recipe[@]}" "${runtime[@]}" --require-prepared "${resume[@]}") || rc=$?
     if ((rc == 0)); then
         echo "[$(date -u +%FT%TZ)] $RUN: trainer finished; waiting for the uploader to publish the last checkpoints"
-        wait "$uploader" || echo "uploader exited with $?; restart it with '$0 upload'" >&2
+        [[ -z $uploader ]] || wait "$uploader" || echo "uploader exited with $?; restart it with '$0 upload'" >&2
     else
         echo "[$(date -u +%FT%TZ)] $RUN: trainer exited with $rc; the uploader (pid $uploader) keeps publishing what is" \
              "queued; '$0 train' resumes both" >&2

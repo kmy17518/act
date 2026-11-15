@@ -551,3 +551,27 @@ completed in 50.1 min for ACT, 18.0 min for DP and 36.9 min for Pi with the cont
 above. Every normalization array matched the corresponding raw-scratch exact run
 bit for bit; scratch footprints were 77.6, 17.2 and 28.4 GB respectively. These
 are computation measurements, not timings for loading an unseen future dataset.
+
+## isg-train224 (branch `isg-train224`)
+
+Training on the batched replay's native 224 x 224 LeRobot v3 datasets (`isg_meta/` sidecars; a chunk per task family is
+fine: every path comes from the episode's own `data/*` / `videos/*` chunk columns). `scripts/b1k/isg_train224.sh`
+runs it in three steps (`cache`, `prepare`, `train`; `all` does all three); its header lists the environment.
+
+- **Grippers**: absolute commands (`--gripper-action absolute`, the default), state = q1 + q2 in metres
+  (`--gripper-state sum`, about [0, 0.10]); the action stays the dataset's command in [-1, 1].
+- **Statistics before the run**: `--prepare-only` (same flags as the run, CPU, one process) writes the exact
+  padding-free statistics to `--stats-file`, and with `--frame-cache` builds the selection's mmap tables and the loader
+  worker sidecar. `--require-prepared` makes a training run refuse to compute any of them at startup.
+- **Frames**: Pi-style epochs (`--frame-selection pi`, the default): a fresh permutation of every training frame per
+  epoch, without replacement, incomplete last batch dropped. A frame cache at the videos' own size stores the decoded
+  frames unchanged (the resize is skipped; bytes identical to the resize path), in both the v1 and v2 builders.
+- **LR**: `--lr-schedule pi_cosine --lr-warmup-steps 1000 --lr-decay-steps N --lr-decay-ratio 0.1` = openpi pi05's
+  `CosineDecaySchedule` (`b1k_data_core.pi_lr_factor`, equal to optax's within float rounding) applied to every
+  parameter group as a multiple of its own LR (`--lr`, `--lr-backbone`, `--lr-goal`); `--lr_schedule.decay_steps` is an
+  alias of `--lr-decay-steps`. Saved in `model_config.lr_schedule` and restored on resume.
+- **Validation**: `--val-fraction 0.05` holds out the same episodes as openpi's `--data.val-fraction 0.05` and DP's for
+  the same seed (checked on `isg-evalprod-train-224-lerobot`: 120 episodes, identical lists).
+- **Uploads while training**: the launcher runs `scripts/b1k/upload_checkpoints.py` beside the trainer: every
+  `--export-every` eval checkpoint plus one full checkpoint for resuming; the previous full checkpoint's LFS objects
+  are permanently deleted once the new one is live (one resume file in the repo at any time).
