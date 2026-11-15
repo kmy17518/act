@@ -139,7 +139,10 @@ def build_entry(source, stem, image_size, dataset_root, torch_threads=1):
         for frame in container.decode(stream):
             if frame.pts is None:
                 continue
-            image = quantize_image(preprocess_image(frame.to_ndarray(format='rgb24'), image_size))
+            pixels = frame.to_ndarray(format='rgb24')
+            # Frames already at the cache size (ISG's native 224 x 224 renders) are stored as decoded: the
+            # resize is skipped and quantize(preprocess(x)) == x exactly for uint8 x, so the bytes are identical.
+            image = pixels if pixels.shape[:2] == image_size else quantize_image(preprocess_image(pixels, image_size))
             if count < len(frames):
                 frames[count] = image
             else:

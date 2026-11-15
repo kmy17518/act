@@ -175,9 +175,12 @@ def _build_group_unlocked(sources, cache_root, dataset_root, image_size=(224, 22
             def flush():
                 if not pending:
                     return
-                batch = torch.from_numpy(np.stack(pending)).to(device).permute(0, 3, 1, 2).float() / 255.
-                batch = F.interpolate(batch, size=tuple(image_size), mode='bilinear', align_corners=False, antialias=True)
-                batch = (batch * 255).round().clamp_(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
+                if tuple(pending[0].shape[:2]) == tuple(image_size):
+                    batch = np.stack(pending)  # native size: no resize (identical bytes to the round trip below)
+                else:
+                    batch = torch.from_numpy(np.stack(pending)).to(device).permute(0, 3, 1, 2).float() / 255.
+                    batch = F.interpolate(batch, size=tuple(image_size), mode='bilinear', align_corners=False, antialias=True)
+                    batch = (batch * 255).round().clamp_(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
                 for pixels, timestamp in zip(batch, pending_pts):
                     b = io.BytesIO()
                     Image.fromarray(pixels).save(b, format='JPEG', quality=quality, subsampling=subsampling)

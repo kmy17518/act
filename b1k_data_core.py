@@ -6,6 +6,7 @@ No model imports, source writes, padding inference, or quantile widening.
 """
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -362,3 +363,20 @@ class PiFrameBatchSampler:
 
     def __len__(self):
         return (self.max_steps - self.start_step) * ((self.batch_size + self.loader_batch_size - 1) // self.loader_batch_size)
+
+
+def pi_lr_factor(update, warmup_steps=1000, decay_steps=30000, end_ratio=0.1):
+    """openpi's CosineDecaySchedule (optax.warmup_cosine_decay_schedule) as a multiple of the peak LR.
+
+    `update` counts optimizer updates already applied (0 for the first update, as optax's step count). Linear warmup
+    from peak / (warmup_steps + 1) to the peak over `warmup_steps` updates, then cosine decay to `end_ratio` x peak at
+    update `decay_steps` (warmup included), constant afterwards. pi05_b1k: warmup 1000, end 2.5e-6 / 2.5e-5 = 0.1.
+    """
+    update, warmup_steps, decay_steps = int(update), int(warmup_steps), int(decay_steps)
+    if warmup_steps < 0 or decay_steps <= warmup_steps or not 0.0 <= end_ratio <= 1.0:
+        raise ValueError('need 0 <= warmup_steps < decay_steps and 0 <= end_ratio <= 1')
+    if update < warmup_steps:
+        init = 1.0 / (warmup_steps + 1)
+        return init + (1.0 - init) * update / warmup_steps
+    t = min(update - warmup_steps, decay_steps - warmup_steps) / (decay_steps - warmup_steps)
+    return end_ratio + (1.0 - end_ratio) * 0.5 * (1.0 + math.cos(math.pi * t))

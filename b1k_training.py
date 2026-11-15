@@ -478,6 +478,30 @@ def consume_batch(batch, stream=None, channels_last=True):
             timings)
 
 
+def lr_schedule_record(args):
+    """The run's LR schedule as saved in model_config (resume restores it)."""
+    if args.lr_schedule == 'constant':
+        for key in ('lr_warmup_steps', 'lr_decay_steps', 'lr_decay_ratio'):
+            if getattr(args, f'_{key}_explicit', False):
+                raise ValueError(f'--{key.replace("_", "-")} needs --lr-schedule pi_cosine')
+        return {'kind': 'constant'}
+    decay_steps = args.lr_decay_steps if args.lr_decay_steps is not None else args.max_steps
+    from b1k_data_core import pi_lr_factor
+    pi_lr_factor(0, args.lr_warmup_steps, decay_steps, args.lr_decay_ratio)  # validates the parameters
+    return {'kind': 'pi_cosine', 'warmup_steps': int(args.lr_warmup_steps), 'decay_steps': int(decay_steps),
+            'end_ratio': float(args.lr_decay_ratio)}
+
+
+def apply_lr_schedule(optimizer, schedule, update):
+    """Set every group's LR for optimizer update `update` (0-based, openpi/optax step count)."""
+    if schedule.get('kind', 'constant') == 'constant':
+        return
+    from b1k_data_core import pi_lr_factor
+    factor = pi_lr_factor(update, schedule['warmup_steps'], schedule['decay_steps'], schedule['end_ratio'])
+    for group in optimizer.param_groups:
+        group['lr'] = group['peak_lr'] * factor
+
+
 def resolve_val_split(dataset_path, task_names, episode_split, val_fraction, seed, *, lowdim_only=False):
     """Per-task train/val episode split (isg-val-split/v1) when `val_fraction > 0`, or None when disabled.
 
@@ -981,6 +1005,14 @@ def parser():
     p.add_argument('--stats-estimator', choices=('auto', 'exact', 'sampled', 'legacy'), default='exact', action=ExplicitOption)
     p.add_argument('--stats-sample-size', type=int, default=10_000_000)
     p.add_argument('--stats-file', type=Path, help='Precomputed portable normalization JSON')
+    p.add_argument('--prepare-only', action='store_true',
+                   help='Precompute everything this exact run reads, then exit without training (CPU, one process): the '
+                        'normalization statistics (written to --stats-file), and with --frame-cache the per-selection '
+                        'state/action/frame-row tables and loader-worker sidecars of the training and validation '
+                        'datasets. Same flags as the training run; no W&B, no run.json')
+    p.add_argument('--require-prepared', action='store_true',
+                   help='Refuse to compute anything at startup that --prepare-only precomputes: needs --stats-file, '
+                        'and with --frame-cache the completed tables of both datasets')
     p.add_argument('--action-representation', choices=ACTION_REPRESENTATIONS, default='absolute', action=ExplicitOption,
                    help='absolute (default): the dataset\'s commands; relative: as openpi pi05_b1k with gripper deltas, '
                         'every chunk step minus the state at the sample\'s frame on the torso 3:7 and arm 7:14 / 15:22 '
@@ -1137,6 +1169,16 @@ def parser():
     p.add_argument('--kl-weight', type=float, default=10)
     p.add_argument('--lr', type=float, default=1e-5)
     p.add_argument('--lr-backbone', type=float, default=1e-5)
+    p.add_argument('--lr-schedule', choices=('constant', 'pi_cosine'), default='constant', action=ExplicitOption,
+                   help="constant (upstream ACT), or pi_cosine: openpi pi05's CosineDecaySchedule applied to every "
+                        'parameter group as a multiple of its own LR (--lr, --lr-backbone, --lr-goal): linear warmup '
+                        'from LR / (warmup + 1) over --lr-warmup-steps, cosine decay to --lr-decay-ratio x LR at '
+                        '--lr-decay-steps (warmup included), constant afterwards')
+    p.add_argument('--lr-warmup-steps', type=int, default=1000, action=ExplicitOption)
+    p.add_argument('--lr-decay-steps', '--lr_schedule.decay_steps', dest='lr_decay_steps', type=int, default=None,
+                   action=ExplicitOption, help='pi_cosine decay length in optimizer steps (default: --max-steps)')
+    p.add_argument('--lr-decay-ratio', type=float, default=0.1, action=ExplicitOption,
+                   help="pi_cosine floor as a fraction of each group's LR (pi05: 2.5e-6 / 2.5e-5 = 0.1)")
     p.add_argument('--weight-decay', type=float, default=1e-4)
     p.add_argument('--pretrained-backbone', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--save-every', type=int, default=1000)
@@ -1313,6 +1355,15 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
         for key in ('stop_pos_weight', 'stop_loss_weight', 'progress_loss_weight'):
             if key in model_config:
                 setattr(args, key, model_config[key])
+        saved_schedule = model_config.get('lr_schedule') or {'kind': 'constant'}
+        for key, field in (('lr_schedule', 'kind'), ('lr_warmup_steps', 'warmup_steps'),
+                           ('lr_decay_steps', 'decay_steps'), ('lr_decay_ratio', 'end_ratio')):
+            if field in saved_schedule:
+                if getattr(args, f'_{key}_explicit', False) and getattr(args, key) != saved_schedule[field]:
+                    raise ValueError(f'--{key.replace("_", "-")} differs from checkpoint ({saved_schedule[field]})')
+                setattr(args, key, saved_schedule[field])
+            elif getattr(args, f'_{key}_explicit', False) and saved_schedule['kind'] == 'constant':
+                raise ValueError(f'--{key.replace("_", "-")} conflicts with the checkpoint\'s constant LR')
         saved_source = adapter.get('goal_source', 'episode_last')
         if getattr(args, '_goal_source_explicit', False) and args.goal_source != saved_source:
             raise ValueError('--goal-source differs from checkpoint')
@@ -1406,7 +1457,8 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
                         # older checkpoints: absolute / zscore; the statistics record the delta mapping
                         'action_representation': args.action_representation, 'normalization': args.normalization,
                         'image_augment': args.image_augment, 'frame_selection': args.frame_selection,
-                        'gripper_action': args.gripper_action, 'stats_estimator': args.stats_estimator}
+                        'gripper_action': args.gripper_action, 'stats_estimator': args.stats_estimator,
+                        'lr_schedule': lr_schedule_record(args)}
         if args.stop_dims:
             if args.policy_class != 'ACT':
                 raise ValueError('--stop-dims extends the ACT action chunk; CNNMLP predicts one action')
@@ -1438,7 +1490,7 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
         import torch.distributed as dist
         dist.barrier()
     tracked, wandb_identity = (resources.enter_context(wandb_run(args, output, checkpoint))
-                               if is_main else (None, None))
+                               if is_main and not args.prepare_only else (None, None))
     configure_cpu_threads(torch_threads=args.torch_threads or torch.get_num_threads(),
                           arrow_threads=args.arrow_threads, opencv_threads=args.opencv_threads)
     goal = goal_config(model_config)
@@ -1506,9 +1558,13 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
         mode = '' if (representation, method) == ('absolute', 'zscore') else f'_{representation}_{method}'
         mode += f'_{args.gripper_action}_{args.stats_estimator}_{args.stats_sample_size}_h{dataset.chunk_size}'
         stats_path = args.stats_file or output / f'stats_{fingerprint[:16]}_{args.stats_max_frames or "all"}{mode}.json'
-        if args.stats_file and not stats_path.is_file():
-            raise FileNotFoundError(stats_path)
+        if args.stats_file and not stats_path.is_file() and not args.prepare_only:
+            raise FileNotFoundError(f'{stats_path} (precompute it with --prepare-only)')
+        if args.require_prepared and not (args.stats_file and stats_path.is_file()):
+            raise FileNotFoundError('--require-prepared needs the precomputed --stats-file (run --prepare-only first)')
         if is_main and not stats_path.exists():
+            if args.prepare_only:
+                stats_path.parent.mkdir(parents=True, exist_ok=True)
             stats = dataset.compute_normalization_stats(method, representation, args.stats_max_frames,
                                                          estimator=args.stats_estimator, gripper_action=args.gripper_action,
                                                          sample_size=args.stats_sample_size)
@@ -1530,6 +1586,21 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
     dataset.stats = stats
     if val_dataset is not None:
         val_dataset.stats = stats
+    prepared = [('train', dataset)] + ([('val', val_dataset)] if val_dataset is not None else [])
+    if args.prepare_only:
+        for name, part in prepared:
+            begin = time.monotonic()
+            part.prepare_tables()
+            LOGGER.info('Prepared %s dataset: %d episodes, %d frames (%.1f s)', name, len(part.episodes), len(part),
+                        time.monotonic() - begin)
+        LOGGER.info('Prepared statistics %s; train with the same flags plus --stats-file %s --require-prepared',
+                    stats_path, stats_path)
+        return None
+    if args.require_prepared:
+        for name, part in prepared:
+            if not part.tables_prepared():
+                raise FileNotFoundError(f'--require-prepared: the {name} dataset\'s frame-cache tables are missing '
+                                        '(run --prepare-only with the same flags first)')
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1550,11 +1621,17 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
     if args.channels_last:
         policy.to(memory_format=torch.channels_last)  # only 4-D (convolution) weights change layout
     optimizer = policy.configure_optimizers()
+    lr_schedule = model_config.get('lr_schedule') or {'kind': 'constant'}
+    for group in optimizer.param_groups:
+        group.setdefault('peak_lr', group['lr'])  # each group's own LR (--lr / --lr-backbone / --lr-goal)
     zero_gradients = unused_gradients(policy)
     start = 0
     if checkpoint:
         policy.load_state_dict(checkpoint['model'])
+        peaks = [group['peak_lr'] for group in optimizer.param_groups]
         optimizer.load_state_dict(checkpoint['optimizer'])
+        for group, peak in zip(optimizer.param_groups, peaks):
+            group['peak_lr'] = peak  # the schedule multiplies the configured LR, never a scheduled value
         match_optimizer_state_layout(optimizer)
         start = checkpoint['step']
         torch.set_rng_state(checkpoint['torch_rng'])
@@ -1733,6 +1810,7 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
             if not torch.isfinite(loss_values).all():
                 raise FloatingPointError(f'Non-finite loss at step {step}')
             grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), float('inf'), error_if_nonfinite=True)
+            apply_lr_schedule(optimizer, lr_schedule, step - 1)
             optimizer.step()
             if cuda:
                 torch.cuda.synchronize(device)

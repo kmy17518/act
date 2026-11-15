@@ -846,6 +846,20 @@ class B1KDataset(torch.utils.data.Dataset):
             self._goal_timestamps = np.load(directory / 'goal_timestamps.npy', mmap_mode='r')
         return self._table
 
+    def tables_prepared(self):
+        """Whether the frame-cache tables of this selection exist (always True without a frame cache, which keeps
+        its table in memory)."""
+        if self.frame_cache is None:
+            return True
+        return (Path(str(self.frame_cache.cache_root) + '-tables') / self.fingerprint() / 'complete.json').is_file()
+
+    def prepare_tables(self):
+        """Build everything a training run's loader reads besides the frames: the selection's mmap tables (state,
+        action, timestamps, frame rows, goal timestamps) and the compact loader-worker sidecar."""
+        self._ensure_table()
+        if self.frame_cache is not None:
+            self.__getstate__()  # writes the worker-selection sidecar (episodes, index arrays, lookups) once
+
     def _build_table(self, directory=None):
         """Load timestamp/state/action for every selected frame once per process (~350 bytes per frame).
 
