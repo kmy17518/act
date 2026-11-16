@@ -190,8 +190,58 @@ def build_entry(source, stem, image_size, dataset_root, torch_threads=1):
     return manifest
 
 
+# How v1 entries' frames are read. `pread` (default): one os.preadv per frame on a descriptor opened with
+# POSIX_FADV_RANDOM, so the kernel reads exactly the requested frame. `mmap`: the earlier np.load(mmap_mode='r') path;
+# its page faults + readahead thrash the page cache once the cache is larger than RAM (DP on 4 x H200 with the
+# 5.9 TiB v2 cache and 1.7 TB RAM: 1.92 s/step with mmap, 0.23 s/step with pread).
+FRAME_READ = os.environ.get('B1K_FRAME_READ', 'pread')
+if FRAME_READ not in ('pread', 'mmap'):
+    raise ValueError(f'B1K_FRAME_READ must be pread or mmap, got {FRAME_READ!r}')
+
+
+class _PreadFrames:
+    """Frames of a v1 .frames.npy read with os.preadv (no mapping, no readahead); `frames[i]` like the memmap."""
+
+    def __init__(self, path, header):
+        self.shape, self.dtype, self.offset = header.shape, header.dtype, header.offset
+        self.row_bytes = int(np.prod(self.shape[1:])) * self.dtype.itemsize
+        self.fd = os.open(path, os.O_RDONLY)
+        if hasattr(os, 'posix_fadvise'):
+            os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_RANDOM)
+
+    def __len__(self):
+        return self.shape[0]
+
+    def read_into(self, position, out):
+        position = int(position)
+        if not 0 <= position < self.shape[0]:
+            raise IndexError(f'frame {position} out of range {self.shape[0]}')
+        direct = out.flags.c_contiguous and out.dtype == self.dtype and out.shape == self.shape[1:]
+        target = out if direct else np.empty(self.shape[1:], self.dtype)
+        got = os.preadv(self.fd, [memoryview(target.reshape(-1)).cast('B')], self.offset + position * self.row_bytes)
+        if got != self.row_bytes:
+            raise OSError(f'short read of frame {position}: {got} of {self.row_bytes} bytes')
+        if not direct:
+            np.copyto(out, target)
+        return out
+
+    def __getitem__(self, position):
+        return self.read_into(position, np.empty(self.shape[1:], self.dtype))
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 class FrameCacheReader:
-    """Random access to built entries; memory maps lazily so it pickles into loader workers cheaply."""
+    """Random access to built entries; opens lazily so it pickles into loader workers cheaply."""
 
     def __init__(self, cache_root, dataset_root, image_size, tolerance=0.008):
         self.cache_root = Path(cache_root).resolve()
@@ -206,6 +256,9 @@ class FrameCacheReader:
         return dict(self.__dict__, entries=OrderedDict(), _v2=None)
 
     def close(self):
+        for frames, _ in self.entries.values():
+            if isinstance(frames, _PreadFrames):
+                frames.close()
         self.entries.clear()
         if self._v2 is not None:
             self._v2.close()
@@ -233,9 +286,13 @@ class FrameCacheReader:
             if (frames.shape != (manifest['frames'], *self.image_size, 3) or frames.dtype != np.uint8
                     or pts.shape != (manifest['frames'],) or np.any(np.diff(pts) <= 0)):
                 raise ValueError(f'Corrupt frame cache entry for {path}; rebuild it')
+            if FRAME_READ == 'pread':
+                frames = _PreadFrames(frames_path, frames)  # the memmap was only the validated header
             entry = self.entries[path] = (frames, pts)
             while len(self.entries) > 16:
-                self.entries.popitem(last=False)
+                old, _ = self.entries.popitem(last=False)[1]
+                if isinstance(old, _PreadFrames):
+                    old.close()
         self.entries.move_to_end(path)
         return entry
 
@@ -262,10 +319,12 @@ class FrameCacheReader:
         return chosen
 
     def read(self, path, position, out=None):
-        """One cached frame as a uint8 HWC array (copied out of the memory map, into `out` if given)."""
+        """One cached frame as a uint8 HWC array (read or copied out of the entry, into `out` if given)."""
         frames, _ = self.open(path)
         if self._v2 is not None and frames is None:
             return self._v2.read(path, position, out)
+        if isinstance(frames, _PreadFrames):
+            return frames[position] if out is None else frames.read_into(position, out)
         if out is None:
             return np.array(frames[position])
         np.copyto(out, frames[position])
