@@ -85,7 +85,7 @@ upload() {
 
 train() {
     [[ -f $STATS ]] || { echo "no prepared statistics $STATS: run '$0 prepare' first" >&2; exit 1; }
-    mkdir -p "$OUT"
+    mkdir -p "$OUT" "$OUT_ROOT/upload"   # the uploader log below is opened before upload() runs its mkdir
     local resume=() newest
     newest=$(find "$OUT" -maxdepth 1 -name 'step_*.pt' | sort | tail -n 1)
     [[ -z $newest ]] || resume=(--resume "$newest")
