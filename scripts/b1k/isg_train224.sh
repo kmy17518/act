@@ -19,6 +19,8 @@
 #   RUN            [act-isg224-relq-late-piaug-ddp4-bs1024-s$SEED]   OUT_ROOT [/tmp/dev/runs/train224]
 #   PY             [<checkout>/.venv/bin/python]   GPUS [0,1,2,3]   NUM_WORKERS per rank [8]   CACHE_WORKERS [16]
 #   MAX_STEPS      [200000]   SAVE [10000] (save = export = validate)   SEED [0]   VAL_FRACTION [0.05]
+#   LR [1e-5] (transformer)   LR_BACKBONE [1e-5]   LR_GOAL [1e-4]: each group's peak learning rate
+#   LR_WARMUP_STEPS [1000]   LR_DECAY_STEPS [MAX_STEPS]   LR_DECAY_RATIO final / peak LR of the cosine decay [0.1]
 #   SETTLE_STEPS   [all]: the dataset's own settle window (batched replay: max(ceil(0.2 A), 50) frames)
 #   TASK_NAMES     space-separated tasks / task groups [every task of the dataset]
 #   WANDB_ENTITY   [kmy17518]   WANDB_PROJECT [b1k-isg-train224]   WANDB_MODE [online] (needs WANDB_API_KEY)
@@ -45,8 +47,9 @@ WANDB_PROJECT=${WANDB_PROJECT:-b1k-isg-train224}
 recipe=(--dataset-path "$DATASET" --frame-cache "$FRAME_CACHE" --episode-split auto --settle-steps "${SETTLE_STEPS:-all}"
     --gripper-state sum --gripper-action absolute --image-size 224 224 --regime image --goal-views zed_link
     --goal-source episode_last --goal-fusion late --goal-tokens grid --goal-encoder shared_base --goal-tag-init zero
-    --lr-goal 1e-4 --lr 1e-5 --lr-backbone 1e-5 --weight-decay 1e-4
-    --lr-schedule pi_cosine --lr-warmup-steps 1000 --lr-decay-steps "$MAX_STEPS" --lr-decay-ratio 0.1
+    --lr-goal "${LR_GOAL:-1e-4}" --lr "${LR:-1e-5}" --lr-backbone "${LR_BACKBONE:-1e-5}" --weight-decay 1e-4
+    --lr-schedule pi_cosine --lr-warmup-steps "${LR_WARMUP_STEPS:-1000}" --lr-decay-steps "${LR_DECAY_STEPS:-$MAX_STEPS}"
+    --lr-decay-ratio "${LR_DECAY_RATIO:-0.1}"
     --policy-class ACT --hidden-dim 512 --dim-feedforward 3200 --enc-layers 4 --dec-layers 7 --nheads 8
     --chunk-size 100 --kl-weight 10 --dropout 0.1 --position-embedding sine --no-pre-norm
     --action-representation relative --normalization quantile --stats-estimator exact --image-augment pi05
