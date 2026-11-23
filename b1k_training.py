@@ -1744,7 +1744,7 @@ def _train(args, output, root, resources, rank=0, local_rank=0, world_size=1):
         LOGGER.info('Image augmentation: %s', model_config.get('image_augment', 'none'))
         LOGGER.info('Actions %s, normalization %s%s', model_config.get('action_representation', 'absolute'),
                     model_config.get('normalization', 'zscore'),
-                    (f' (legacy quantile floor {stats["min_range"]}, guarded {stats["guarded"]})'
+                    (f' (quantile floor {stats["min_range"]}, guarded {stats["guarded"]})'
                      if 'guarded' in stats else ' (raw q99 - q01 + 1e-6)')
                     if stats.get('method') == 'quantile' else '')
         if goal['goal_fusion'] != 'none':

@@ -1192,6 +1192,21 @@ class B1KDataset(torch.utils.data.Dataset):
             for name, values in (('qpos',q),('action',a)):
                 for key, value in values.items():
                     stats[f'{name}_{key}'] = value.tolist()
+            if method == 'quantile':
+                # Floor each dim's q99 - q01 at QUANTILE_MIN_RANGE, as the legacy path does: a near-constant dim (the
+                # relative torso joint 4 command is +-5e-5) would otherwise scale its rare real values to hundreds.
+                stats.update(min_range=QUANTILE_MIN_RANGE, guarded={})
+                for name, values in (('qpos',q),('action',a)):
+                    q01, q99 = np.asarray(values['q01'], np.float64), np.asarray(values['q99'], np.float64)
+                    g01, g99, guarded = guard_quantiles(q01, q99, QUANTILE_MIN_RANGE)
+                    stats.update({f'{name}_q01': g01.tolist(), f'{name}_q99': g99.tolist(),
+                                  f'{name}_q01_raw': q01.tolist(), f'{name}_q99_raw': q99.tolist()})
+                    stats['guarded'][name] = guarded
+                    if guarded:
+                        LOGGER.warning('Quantile statistics: %s dims %s have q99 - q01 %s < %g; normalized over %g '
+                                       'around their centers', name, guarded,
+                                       [float(f'{q99[d] - q01[d]:.3g}') for d in guarded],
+                                       QUANTILE_MIN_RANGE, QUANTILE_MIN_RANGE)
             if representation == 'relative':
                 stats['action_delta'] = delta
             return stats

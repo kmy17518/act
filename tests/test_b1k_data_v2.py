@@ -3,7 +3,8 @@ import numpy as np
 import pytest
 import torch
 from test_b1k import tiny_root
-from b1k_dataset import B1KDataset, action_reference, extract_state, encode_actions, decode_actions
+from b1k_dataset import (B1KDataset, QUANTILE_MIN_RANGE, action_reference, decode_actions, encode_actions, extract_state,
+                         guard_quantiles)
 from b1k_cache_v2 import build_group
 from b1k_frame_cache import selected_videos, verify_frame_cache
 
@@ -21,7 +22,11 @@ def test_exact_padding_exclusion_absolute_grippers(tiny_root):
                 all_values.extend(table['action'][start+anchor:min(start+anchor+3,end)].astype(np.float64)-reference[anchor])
         values=np.asarray(all_values)
         assert stats['action_count']==24
-        np.testing.assert_array_equal(stats['action_q01'],np.quantile(values,.01,axis=0))
+        np.testing.assert_array_equal(stats['action_q01_raw'],np.quantile(values,.01,axis=0))
+        g01,g99,guarded=guard_quantiles(stats['action_q01_raw'],stats['action_q99_raw'],QUANTILE_MIN_RANGE)
+        np.testing.assert_array_equal(stats['action_q01'],g01);np.testing.assert_array_equal(stats['action_q99'],g99)
+        assert stats['min_range']==QUANTILE_MIN_RANGE and stats['guarded']['action']==guarded
+        assert (np.subtract(stats['qpos_q99'],stats['qpos_q01'])>=QUANTILE_MIN_RANGE-1e-12).all()
         np.testing.assert_allclose(stats['action_std'],values.std(0),atol=1e-12)
         assert stats['action_delta']['gripper_action_dims']==[] and stats['std_eps']==1e-6
         state=extract_state(table['state'][:2],'sum')
